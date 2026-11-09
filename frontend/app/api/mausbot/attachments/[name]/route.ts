@@ -4,12 +4,33 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const UPSTREAM = process.env.MAUSBOT_PROXY_URL || "http://127.0.0.1:18800";
-const SAFE = /^[\w.-]+$/;
+
+function isSafeAttachmentName(name: string): boolean {
+  if (!name || name.length > 180) return false;
+  if (name === "." || name === ".." || name.includes("..")) return false;
+  if (/[\\/\0\s<>:"|?*]/.test(name)) return false;
+  return true;
+}
+
+function imageTypeFor(name: string): string | null {
+  const lower = name.toLowerCase();
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+  if (lower.endsWith(".gif")) return "image/gif";
+  if (lower.endsWith(".webp")) return "image/webp";
+  if (lower.endsWith(".svg")) return "image/svg+xml";
+  return null;
+}
 
 export async function GET(_req: NextRequest, ctx: { params: Promise<{ name: string }> | { name: string } }) {
   const resolved = await Promise.resolve(ctx.params);
-  const name = String(resolved?.name || "");
-  if (!SAFE.test(name)) {
+  let name = String(resolved?.name || "");
+  try {
+    name = decodeURIComponent(name);
+  } catch {
+    /* already decoded */
+  }
+  if (!isSafeAttachmentName(name)) {
     return new Response(JSON.stringify({ ok: false, detail: "invalid attachment name" }), {
       status: 400,
       headers: { "Content-Type": "application/json" },
@@ -30,10 +51,17 @@ export async function GET(_req: NextRequest, ctx: { params: Promise<{ name: stri
       });
     }
     const headers = new Headers();
-    const ct = upstream.headers.get("content-type");
-    if (ct) headers.set("Content-Type", ct);
-    const cd = upstream.headers.get("content-disposition");
-    if (cd) headers.set("Content-Disposition", cd);
+    const upstreamType = upstream.headers.get("content-type") || "";
+    const sniffed = imageTypeFor(name);
+    const type = !upstreamType || upstreamType.startsWith("application/octet-stream")
+      ? (sniffed || upstreamType || "application/octet-stream")
+      : upstreamType;
+    headers.set("Content-Type", type);
+    if (type.startsWith("image/")) headers.set("Content-Disposition", "inline");
+    else {
+      const cd = upstream.headers.get("content-disposition");
+      if (cd) headers.set("Content-Disposition", cd);
+    }
     headers.set("Cache-Control", "private, max-age=300");
     return new Response(upstream.body, { status: 200, headers });
   } catch (error) {

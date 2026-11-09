@@ -1,0 +1,222 @@
+/* css-parts/05-copy-shell.css — Designing Grok Bot isomorphic three-column shell */
+/* Hard layout + messaging aesthetic. Product remains Financial Bot. */
+
+.shell[data-copy-shell="true"],
+.botLayout[data-copy-shell="true"] {
+  /* marker for evidence scripts */
+}
+
+.botLayout {
+  display: grid !important;
+  grid-template-columns: 280px minmax(0, 1fr) 340px !important;
+  min-height: 0;
+  flex: 1;
+  background: #f4f4f5;
+}
+
+.botLayoutPanelClosed {
+  grid-template-columns: 280px minmax(0, 1fr) !important;
+}
+
+.botLayoutStatus {
+  grid-template-columns: 280px minmax(0, 1fr) 88px !important;
+}
+
+.botLayoutTakeover {
+  grid-template-columns: 0 minmax(0, 0.01fr) minmax(0, 1fr) !important;
+}
+
+.botLayoutTakeover .rosterRail,
+.botLayoutTakeover .stageColumn {
+  opacity: 0;
+  pointer-events: none;
+  overflow: hidden;
+  width: 0;
+  min-width: 0;
+  padding: 0;
+  border: none;
+}
+
+.rosterRail {
+  background: #f3f3f4 !important;
+  border-right: 1px solid #e6e6e8 !important;
+  color: #1d1d1f !important;
+  padding: 10px 10px 12px !important;
+  gap: 8px !important;
+}
+
+.rosterBrand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px 8px;
+  font-size: 12px;
+  font-weight: 650;
+  color: #111 !important;
+}
+
+.rosterSearch {
+  background: rgba(60, 60, 67, 0.08) !important;
+  border: none !important;
+  border-radius: 12px !important;
+  padding: 8px 10px !important;
+  margin: 0 2px 6px !important;
+}
+
+/* Only the Bot card itself is a 3-column grid; the nested chat-history rows are
+   plain flex rows and were being turned into grids (title squeezed, counter wide). */
+.botRoster > .botRosterGroup > button {
+  display: grid !important;
+  grid-template-columns: 40px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 10px !important;
+  border-radius: 14px !important;
+  border: none !important;
+  background: transparent;
+  text-align: left;
+}
+
+.botRoster .botRosterActive {
+  background: rgba(120, 120, 128, 0.16) !important;
+  box-shadow: none !important;
+  border: none !important;
+}
+
+.botRosterText {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.botRosterText strong {
+  font-size: 13.5px !important;
+  font-weight: 650;
+  color: #111 !important;
+}
+
+.botRosterText small {
+  font-size: 11.5px !important;
+  color: #8e8e93 !important;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.botRosterTime {
+  font-size: 10.5px;
+  color: #8e8e93 !important;
+  align-self: start;
+  padding-top: 2px;
+}
+
+/* Keep the chevron: it is the only affordance that a Bot card expands its chats. */
+
+.stageColumn {
+  background: #fafafa !important;
+  border: none !important;
+}
+
+.stageColumn .chat {
+  background: #fafafa !important;
+  padding: 18px 22px 12px !important;
+}
+
+.botStageHeader {
+  background: rgba(250, 250, 250, 0.92) !important;
+  border-bottom: 1px solid #ececee !important;
+  backdrop-filter: blur(10px);
+  padding: 10px 16px !important;
+}
+
+.userBubble {
+  background: #111 !important;
+  color: #fff !important;
+  border-radius: 18px 18px 6px 18px !important;
+  box-shadow: none !important;
+}
+
+.agentBubble {
+  background: #ececee !important;
+  border: none !important;
+  border-radius: 18px !important;
+  color: #111 !important;
+  box-shadow: none !important;
+}
+
+.stageColumn .composerWrap {
+  background: linear-gradient(180deg, rgba(250,250,250,0), #fafafa 40%) !important;
+  border-top: none !important;
+}
+
+.stageColumn .composer {
+  background: #fff !important;
+  border: 1px solid #e4e4e7 !important;
+  border-radius: 999px !important;
+  box-shadow: 0 8px 24px rgba(0,0,0,.04) !important;
+  padding: 8px 10px 8px 14px !important;
+}
+
+.contextRail {
+  background: #f3f3f4 !important;
+  border-left: 1px solid #e6e6e8 !important;
+  padding: 10px 12px 16px !important;
+  overflow: auto;
+}
+
+.contextRailClosed {
+  display: none !important;
+}
+
+.contextRailStatus {
+  padding: 10px 8px !important;
+}
+
+.contextRailStatus .botScreenPreview,
+.contextRailStatus .routinesPanel,
+.contextRailStatus .sideTabs,
+.contextRailStatus .workspaceBody,
+.contextRailStatus .workspaceLevelSwitch,
+.contextRailStatus .botScreenCaption,
+.contextRailStatus .reasoningRail {
+  display: none !important;
+}
+
+.botScreenPreview {
+  border-radius: 18px !important;
+  overflow: hidden;
+  background: linear-gradient(160deg, #2a2a2e, #121214) !important;
+  min-height: 210px;
+  border: none !important;
+  box-shadow: 0 10px 30px rgba(0,0,0,.18) !important;
+}
+
+.botScreenCaption {
+  margin: 10px 4px 14px !important;
+  font-size: 12px !important;
+  color: #6e6e73 !important;
+}
+
+.shell[data-theme="dark"] .botLayout { background: #0f0f10; }
+.shell[data-theme="dark"] .rosterRail,
+.shell[data-theme="dark"] .contextRail { background: #161618 !important; border-color: #2a2a2e !important; color: #f5f5f7 !important; }
+.shell[data-theme="dark"] .stageColumn,
+.shell[data-theme="dark"] .stageColumn .chat { background: #111113 !important; }
+.shell[data-theme="dark"] .botStageHeader { background: rgba(17,17,19,.92) !important; border-bottom-color: #2a2a2e !important; }
+.shell[data-theme="dark"] .agentBubble { background: #2a2a2e !important; color: #f5f5f7 !important; }
+.shell[data-theme="dark"] .botRoster .botRosterActive { background: rgba(255,255,255,.08) !important; }
+.shell[data-theme="dark"] .botRosterText strong { color: #f5f5f7 !important; }
+.shell[data-theme="dark"] .rosterSearch { background: rgba(255,255,255,.08) !important; }
+
+@media (max-width: 1100px) {
+  .botLayout { grid-template-columns: 250px minmax(0, 1fr) 300px !important; }
+}
+@media (max-width: 980px) {
+  .botLayout,
+  .botLayoutStatus {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+  .rosterRail { display: none; }
+  .contextRail:not(.contextRailMobileOpen) { display: none !important; }
+}

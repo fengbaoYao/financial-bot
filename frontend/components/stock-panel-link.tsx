@@ -1,0 +1,85 @@
+"use client";
+
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { useEffect, useState, type MouseEvent, type ReactNode } from "react";
+
+import { useLanguage } from "@/components/language-provider";
+
+type StockPanelLinkProps = {
+  stockCode: string;
+  panel: "overview" | "ai" | "news";
+  className?: string;
+  children: ReactNode;
+  compactLoading?: boolean;
+};
+
+export function StockPanelLink({ stockCode, panel, className, children, compactLoading = false }: StockPanelLinkProps) {
+  const { locale } = useLanguage();
+  const en = locale === "en";
+  const router = useRouter();
+  const fallbackHref = `/work?symbol=${encodeURIComponent(stockCode)}`;
+  const [isNavigating, setIsNavigating] = useState(false);
+  const [stepIndex, setStepIndex] = useState(0);
+  const openingSteps = panel === "news" ? NEWS_OPENING_STEPS[locale] : AI_OPENING_STEPS[locale];
+
+  useEffect(() => {
+    if (!isNavigating || (panel !== "ai" && panel !== "news")) {
+      setStepIndex(0);
+      return;
+    }
+    const timer = window.setInterval(() => {
+      setStepIndex((current) => (current + 1) % openingSteps.length);
+    }, 700);
+    return () => window.clearInterval(timer);
+  }, [isNavigating, openingSteps, panel]);
+
+  function handleClick(event: MouseEvent<HTMLAnchorElement>) {
+    if (panel !== "ai" && panel !== "news") {
+      return;
+    }
+    event.preventDefault();
+    if (isNavigating) {
+      return;
+    }
+    setIsNavigating(true);
+    const requestId = crypto.randomUUID();
+    router.push(`/work?symbol=${encodeURIComponent(stockCode)}&request_id=${encodeURIComponent(requestId)}`);
+  }
+
+  return (
+    <Link
+      href={fallbackHref}
+      prefetch={false}
+      className={`${className ?? ""}${isNavigating ? (compactLoading ? " is-loading" : " is-loading is-loading-steps") : ""}`}
+      onClick={handleClick}
+      aria-busy={isNavigating}
+    >
+      {isNavigating && compactLoading ? (
+        en ? "Opening…" : "打开中..."
+      ) : isNavigating && (panel === "ai" || panel === "news") ? (
+        <span className="button-loading-copy button-loading-copy--panel">
+          <span className="button-loading-kicker">{panel === "ai" ? (en ? "AI research" : "AI 分析") : (en ? "Company news" : "相关新闻")}</span>
+          <strong>{openingSteps[stepIndex]}</strong>
+          <span className="button-loading-stage">
+            {panel === "ai" ? (en ? "Preparing context" : "正在准备上下文") : (en ? "Gathering related news" : "正在整理相关消息")}
+          </span>
+          <span className={`button-loading-track ${panel}`} aria-hidden="true">
+            <span style={{ width: `${((stepIndex + 1) / openingSteps.length) * 100}%` }} />
+          </span>
+        </span>
+      ) : (
+        children
+      )}
+    </Link>
+  );
+}
+
+const AI_OPENING_STEPS = {
+  en: ["Prepare context", "Build the research request", "Open the research panel"],
+  zh: ["准备上下文", "建立分析请求", "打开 AI 面板"],
+};
+const NEWS_OPENING_STEPS = {
+  en: ["Identify the company", "Retrieve related news", "Open the news panel"],
+  zh: ["锁定相关标的", "拉取关联新闻", "打开新闻面板"],
+};

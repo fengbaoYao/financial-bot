@@ -1,0 +1,116 @@
+# Environment variables
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# API Keys and sensitive data
+config.py
+!ashare/config.py
+secrets.json
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Local runtime data
+data/*.db
+data/agent_memory/
+data/strategy_analysis_cache.json
+data/last-good-cache.json
+data/user_settings.json
+data/sec_cache/
+data/financial_bot/
+output/
+info
+
+# Local UI verification captures
+reports/financial-bot/
+
+# Local captures and source media (use curated assets from public/marketing/)
+assets/screenshots/Screen Recording *
+assets/screenshots/Screenshot *.png
+assets/screenshots/*.mov
+assets/screenshots/demo.mp4
+assets/fonts/微软雅黑.ttf
+
+# Temporary files
+*.tmp
+*.temp
+.codex-skill-build/
+.codex/
+.agents/
+
+# Next.js
+.next/
+.next-dev/
+.next.bak-*/
+node_modules/
+tsconfig.tsbuildinfo
+
+# Test caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage/
+htmlcov/
+coverage.xml
+playwright-report/
+test-results/
+
+# Local service and deployment state
+*.pid
+*.pid.lock
+.turbo/
+.vercel/

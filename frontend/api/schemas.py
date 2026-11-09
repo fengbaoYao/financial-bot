@@ -1,0 +1,492 @@
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Dict, List, Literal, Optional
+
+from pydantic import BaseModel, ConfigDict, Field
+
+AgentUIComponent = Literal["chart", "table", "comparison", "actions"]
+
+
+class StockSearchResult(BaseModel):
+    name: str
+    code: str
+    market: str
+    category: str = ""
+    score: int = 0
+    match_type: str = ""
+
+
+class QuoteSnapshot(BaseModel):
+    stock_name: str
+    stock_code: str
+    current_price: float
+    change: float
+    change_pct: float
+    open_price: float
+    high_price: float
+    low_price: float
+    volume: float
+    amplitude_pct: float
+    timestamp: datetime
+
+
+class SignalSummary(BaseModel):
+    overall_score: int
+    overall_signal: str
+    categories: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AIInsight(BaseModel):
+    enabled: bool
+    content: Optional[str] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    error: Optional[str] = None
+
+
+class StockAnalysisResponse(BaseModel):
+    stock_name: str
+    stock_code: str
+    market: str
+    quote: QuoteSnapshot
+    technical_indicators: Dict[str, Optional[float]]
+    signal_summary: SignalSummary
+    technical_commentary: List[str]
+    ai_insight: AIInsight
+    chart_series: List[Dict[str, Any]]
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AnalysisProgressResponse(BaseModel):
+    request_id: str
+    status: Literal["pending", "completed", "error", "unknown"] = "unknown"
+    stage: str = "unknown"
+    progress_pct: int = 0
+    message: str = ""
+    stock_code: Optional[str] = None
+    include_ai: bool = False
+    updated_at: Optional[datetime] = None
+
+
+class NewsItem(BaseModel):
+    id: str
+    stock_code: str
+    stock_name: str
+    source: str
+    published_at: str
+    title: str
+    summary: str
+    relation_type: str = "direct"
+    sentiment: Literal["bullish", "bearish", "neutral"] = "neutral"
+    impact_level: int = 1
+    ai_takeaway: Optional[str] = None
+    url: Optional[str] = None
+    raw_payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+class GlobalNewsItem(BaseModel):
+    id: str
+    title: str
+    summary: str
+    source: str
+    published_at: str
+    category: str
+    topic: str
+    region: str = "global"
+    sentiment: Literal["bullish", "bearish", "neutral"] = "neutral"
+    impact_level: int = 1
+    url: Optional[str] = None
+    related_symbols: List[str] = Field(default_factory=list)
+    raw_payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+class WebSearchResult(BaseModel):
+    id: str
+    title: str
+    snippet: str
+    url: str
+    source: str
+    published_at: Optional[str] = None
+    provider: str
+    query: str
+
+
+class HotspotRelatedStock(BaseModel):
+    stock_name: str
+    stock_code: str
+    reason: str
+
+
+class HotspotHeatBreakdown(BaseModel):
+    trading_activity: float = 0
+    discussion_heat: float = 0
+    news_heat: float = 0
+    alert_count: int = 0
+    rank_hits: int = 0
+    attention_level: Literal["focus", "caution", "watch"] = "watch"
+    basis: List[str] = Field(default_factory=list)
+
+
+class HotspotItem(BaseModel):
+    topic_name: str
+    heat_score: float
+    reason: str
+    related_stocks: List[HotspotRelatedStock] = Field(default_factory=list)
+    trend_direction: Literal["up", "down", "flat"] = "flat"
+    ai_summary: Optional[str] = None
+    source: str = "derived"
+    heat_breakdown: HotspotHeatBreakdown = Field(default_factory=HotspotHeatBreakdown)
+
+
+class HotspotHistoryPoint(BaseModel):
+    date: str
+    score: float
+    count: int
+
+
+class HotspotDetailResponse(BaseModel):
+    topic: HotspotItem
+    related_news: List[NewsItem] = Field(default_factory=list)
+    history: List[HotspotHistoryPoint] = Field(default_factory=list)
+
+
+class MarketIndexSnapshot(BaseModel):
+    stock_code: str
+    stock_name: str
+    current_price: float
+    change_pct: float
+    above_ma20: bool = False
+    above_ma60: bool = False
+    trend_score: float = 0
+    currency: str = "CNY"
+    data_as_of: Optional[str] = None
+    provider: Optional[str] = None
+    is_proxy: bool = False
+
+
+class MarketRegimeResponse(BaseModel):
+    regime: Literal["risk_on", "neutral", "risk_off"] = "neutral"
+    is_loading: bool = False
+    score: float = 50
+    action_bias: str = ""
+    position_guidance: str = ""
+    summary: str = ""
+    notes: List[str] = Field(default_factory=list)
+    indices: List[MarketIndexSnapshot] = Field(default_factory=list)
+    updated_at: Optional[datetime] = None
+    market: Literal["a_share", "us", "hk"] = "a_share"
+    status: Literal["ready", "partial", "loading", "unavailable"] = "ready"
+    data_gaps: List[str] = Field(default_factory=list)
+
+
+class PortfolioPosition(BaseModel):
+    id: Optional[int] = None
+    stock_code: str
+    stock_name: str
+    cost_price: float
+    quantity: float
+    weight_pct: Optional[float] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class PositionAnalysis(BaseModel):
+    position: PortfolioPosition
+    current_price: float
+    market_value: float
+    pnl: float
+    pnl_pct: float
+    risk_level: Literal["low", "medium", "high"]
+    signal_summary: SignalSummary
+    suggestion: str
+    currency: str = "CNY"
+    data_as_of: Optional[str] = None
+
+
+class PortfolioAnalysisResponse(BaseModel):
+    total_cost: float
+    total_market_value: float
+    total_pnl: float
+    total_pnl_pct: float
+    concentration_risk: str
+    technical_risk: str
+    rebalance_suggestions: List[str]
+    positions: List[PositionAnalysis]
+    currency: Optional[str] = None
+    aggregation_available: bool = True
+    data_gaps: List[str] = Field(default_factory=list)
+
+
+class StrategyScoreBreakdown(BaseModel):
+    c: float = 0
+    a: float = 0
+    n: float = 0
+    s: float = 0
+    l: float = 0
+    i: float = 0
+    m: float = 0
+    total: float = 0
+
+
+class StrategyCandidate(BaseModel):
+    strategy_key: str
+    stock_code: str
+    stock_name: str
+    market: str
+    score: StrategyScoreBreakdown
+    factor_notes: Dict[str, str] = Field(default_factory=dict)
+    reasons: List[str] = Field(default_factory=list)
+    risks: List[str] = Field(default_factory=list)
+    source_scope: Literal["hotspot", "market"] = "hotspot"
+    source_topic: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class StrategyScreenResponse(BaseModel):
+    strategy_key: str
+    scope: Literal["hotspot", "market"]
+    topic: Optional[str] = None
+    generated_at: datetime
+    candidates: List[StrategyCandidate] = Field(default_factory=list)
+
+
+class StrategyHolding(BaseModel):
+    id: Optional[int] = None
+    strategy_key: str
+    stock_code: str
+    stock_name: str
+    entry_price: float
+    quantity: float
+    entry_date: Optional[str] = None
+    exit_price: Optional[float] = None
+    exit_date: Optional[str] = None
+    source_topic: Optional[str] = None
+    plan_reason: Optional[str] = None
+    plan_entry_trigger: Optional[str] = None
+    plan_entry_zone: Optional[str] = None
+    plan_stop_loss: Optional[float] = None
+    plan_take_profit: Optional[float] = None
+    plan_max_position_pct: Optional[float] = None
+    notes: Optional[str] = None
+    status: Literal["watching", "planned", "holding", "weakening", "exited", "invalidated"] = "planned"
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class StrategyHoldingAnalysis(BaseModel):
+    holding: StrategyHolding
+    current_price: float
+    market_value: float
+    pnl: float
+    pnl_pct: float
+    realized_pnl: float = 0
+    realized_pnl_pct: float = 0
+    strategy_score: StrategyScoreBreakdown
+    thesis_status: Literal["active", "weakening", "broken"]
+    factor_notes: Dict[str, str] = Field(default_factory=dict)
+    invalidation_reason: Optional[str] = None
+    action_label: str = "继续持有"
+    action_reason: str = ""
+    trigger_hits: List[str] = Field(default_factory=list)
+    alerts: List[str] = Field(default_factory=list)
+    analysis_status: Literal["live", "cached", "degraded", "local"] = "live"
+
+
+class StrategyTodoItem(BaseModel):
+    holding_id: Optional[int] = None
+    stock_code: str
+    stock_name: str
+    status: str
+    action_label: str
+    action_reason: str
+    priority: int = 0
+
+
+class StrategyReviewItem(BaseModel):
+    holding_id: Optional[int] = None
+    stock_code: str
+    stock_name: str
+    status: str
+    summary: str
+    outcome_label: str
+
+
+class StrategyHoldingAnalysisResponse(BaseModel):
+    total_cost: float
+    total_market_value: float
+    total_pnl: float
+    total_pnl_pct: float
+    total_realized_pnl: float = 0
+    holding_count: int = 0
+    active_count: int = 0
+    watching_count: int = 0
+    planned_count: int = 0
+    weakening_count: int = 0
+    exited_count: int = 0
+    invalidated_count: int = 0
+    win_rate_pct: float = 0
+    average_score: float = 0
+    todo_items: List[StrategyTodoItem] = Field(default_factory=list)
+    review_items: List[StrategyReviewItem] = Field(default_factory=list)
+    holdings: List[StrategyHoldingAnalysis] = Field(default_factory=list)
+
+
+class AgentHistoryTurn(BaseModel):
+    role: Literal["user", "agent"]
+    content: str
+    intent: Optional[str] = None
+    stock_code: Optional[str] = None
+    stock_name: Optional[str] = None
+
+
+class AgentQuery(BaseModel):
+    query: str
+    session_id: Optional[str] = None
+    bot_id: Optional[str] = None
+    bot_name: Optional[str] = None
+    bot_instructions: Optional[str] = None
+    bot_prompt: Optional[str] = None
+    bot_capabilities: Optional[Dict[str, bool]] = None
+    ui_context: Optional[Dict[str, Any]] = None
+    model_approved: bool = False
+    request_id: Optional[str] = None
+    history: List[AgentHistoryTurn] = Field(default_factory=list)
+    language: Literal["auto", "en-US", "zh-CN"] = "auto"
+    research_mode: Literal["quick", "deep"] = "quick"
+    model_provider: Literal["deepseek", "chatgpt"] = "deepseek"
+
+
+class AgentResearchCapabilities(BaseModel):
+    quick_available: bool = True
+    deep_available: bool
+    deep_unavailable_reason: Optional[str] = None
+    deep_unavailable_message: Optional[str] = None
+
+
+class WatchlistItem(BaseModel):
+    code: str = Field(min_length=1, max_length=40)
+    name: str = Field(default="", max_length=120)
+
+
+class WatchlistSnapshot(BaseModel):
+    initialized: bool
+    items: List[WatchlistItem]
+
+
+class WatchlistInitialize(BaseModel):
+    items: List[WatchlistItem] = Field(max_length=200)
+
+
+class WatchlistMutation(BaseModel):
+    action: Literal["add", "remove"]
+    code: str = Field(min_length=1, max_length=40)
+
+
+class WatchlistResult(WatchlistSnapshot):
+    action: Literal["add", "remove", "list"]
+    stock_code: str = ""
+    stock_name: str = ""
+    changed: bool = False
+
+
+class ResearchStep(BaseModel):
+    tool: str
+    status: Literal["completed", "unavailable"]
+    retrieved_at: str
+    evidence_count: int = 0
+    reason_code: Optional[str] = None
+    endpoint: Optional[str] = None
+
+
+class ResearchEvidence(BaseModel):
+    id: str
+    source: str
+    url: Optional[str] = None
+    retrieved_at: str
+    data_as_of: Optional[str] = None
+    freshness: str = "unknown"
+    title: Optional[str] = None
+    excerpts: List[Dict[str, str]] = Field(default_factory=list)
+    # Provenance fields required when a tool mixes providers or periods.
+    provider_endpoint: Optional[str] = None
+    currency: Optional[str] = None
+    adjustment: Optional[str] = None
+    raw_ref: Optional[str] = None
+    raw_sha256: Optional[str] = None
+    record_key: Optional[str] = None
+
+
+class AgentClarification(BaseModel):
+    question: str = Field(min_length=2, max_length=240)
+    options: List[str] = Field(min_length=2, max_length=4)
+    allow_free_text: bool = True
+
+
+class AgentResponse(BaseModel):
+    intent: str
+    summary: str
+    actions: List[str] = Field(default_factory=list)
+    ui_components: List[Literal["chart", "table", "comparison", "actions"]] = Field(default_factory=list)
+    clarification: Optional[AgentClarification] = None
+    citations: List[str] = Field(default_factory=list)
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    research_steps: List[ResearchStep] = Field(default_factory=list)
+    evidence: List[ResearchEvidence] = Field(default_factory=list)
+    data_gaps: List[str] = Field(default_factory=list)
+
+
+class CreditBalanceResponse(BaseModel):
+    balance: Optional[int] = None
+    lifetime_granted: int = 0
+    lifetime_purchased: int = 0
+    lifetime_used: int = 0
+    unlimited: bool = False
+
+
+class ProgressEventBase(BaseModel):
+    kind: Literal["start", "progress", "token", "result", "error", "done"]
+    flow: Literal["stock_analysis", "agent_query"]
+    stage: str
+    progress_pct: int = Field(ge=0, le=100)
+    message: Optional[str] = None
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class StockAnalysisProgressEvent(ProgressEventBase):
+    flow: Literal["stock_analysis"] = "stock_analysis"
+    stock_code: Optional[str] = None
+    payload: Optional[StockAnalysisResponse] = None
+
+
+class AgentProgressEvent(ProgressEventBase):
+    flow: Literal["agent_query"] = "agent_query"
+    payload: Optional[AgentResponse] = None
+
+
+class ProgressErrorEvent(ProgressEventBase):
+    kind: Literal["error"] = "error"
+
+
+class ProgressDoneEvent(ProgressEventBase):
+    kind: Literal["done"] = "done"
+    progress_pct: int = 100
+
+
+class UserSettingsResponse(BaseModel):
+    llm_model: str
+    llm_model_source: Literal["env"] = "env"
+    llm_base_url: Optional[str] = None
+    llm_configured: bool = False
+    updated_at: Optional[str] = None
+
+
+class UserSettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    llm_base_url: Optional[str] = Field(None, max_length=512)
+    llm_api_key: Optional[str] = Field(
+        None,
+        max_length=512,
+        description="New API key. It is never returned by the API and is only used to update server configuration.",
+    )

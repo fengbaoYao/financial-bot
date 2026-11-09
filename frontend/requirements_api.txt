@@ -1,0 +1,23 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+# PydanticAI + OpenAI-compatible client (DeepSeek/OpenAI/etc.)
+# Keep this aligned with the installed pydantic-ai version to avoid resolver downgrades.
+pydantic-ai-slim[openai]==2.55.0
+# V2 uses the OpenAI 3.x client for DeepSeek's compatible Chat Completions API.
+openai>=3.26.0,<4
+pandas>=2.2.0
+requests>=2.32.0
+beautifulsoup4>=4.13.0
+pypdf>=6.0.0,<7
+python-dotenv>=1.0.0
+numpy>=2.2.0
+plotly>=5.24.0
+matplotlib>=3.10.0
+pytz>=2025.1
+
+# Data sources (Ashare.py imports yfinance; akshare is used as fallback)
+yfinance>=0.2.36
+akshare>=1.17.24
+
+# Pin upstream research role behavior to the reviewed TradingAgents release.
+tradingagents @ https://github.com/TauricResearch/TradingAgents/archive/c4544913a14ed3df5f1ed7b9e8483270ce20682a.tar.gz

@@ -1,0 +1,4929 @@
+from __future__ import annotations
+
+import copy
+import hashlib
+import html
+import json
+import sqlite3
+import time
+import re
+from threading import Lock, Thread
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout, wait
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlparse, parse_qs, urljoin
+from xml.etree import ElementTree
+
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+
+from api.schemas import (
+    AIInsight,
+    AnalysisProgressResponse,
+    AgentClarification,
+    AgentResponse,
+    AgentHistoryTurn,
+    GlobalNewsItem,
+    HotspotHeatBreakdown,
+    HotspotDetailResponse,
+    HotspotHistoryPoint,
+    HotspotItem,
+    HotspotRelatedStock,
+    MarketIndexSnapshot,
+    MarketRegimeResponse,
+    NewsItem,
+    PortfolioAnalysisResponse,
+    PortfolioPosition,
+    PositionAnalysis,
+    QuoteSnapshot,
+    SignalSummary,
+    StrategyCandidate,
+    StrategyHolding,
+    StrategyHoldingAnalysis,
+    StrategyHoldingAnalysisResponse,
+    StrategyReviewItem,
+    StrategyScoreBreakdown,
+    StrategyScreenResponse,
+    StrategyTodoItem,
+    StockAnalysisResponse,
+    StockSearchResult,
+    WebSearchResult,
+)
+from api.settings_store import UserSettingsStore
+from ashare.analyzer import StockAnalyzer
+from ashare.config import Config, PROJECT_ROOT
+from ashare.monitor import HkHotRankTracker, MonitorStateStore, NewsTracker, normalize_text
+from ashare.search import stock_searcher
+from ashare.signals import SignalAnalyzer
+from ashare.stock_pool import (
+    extract_symbol,
+    get_base_stock_catalog,
+    infer_market,
+    is_a_share_individual_stock,
+    load_stock_pool,
+    load_stock_topics,
+    normalize_stock_code,
+)
+
+ProgressCallback = Callable[[str, int, str, Optional[Dict[str, Any]]], None]
+
+
+class NotFoundError(ValueError):
+    """Raised when a requested persisted resource does not exist."""
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    try:
+        if value is None or pd.isna(value):
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _parse_number(value: Any) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace("%", "").replace(",", "")
+    if not text:
+        return 0.0
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
+
+
+def _sentiment_from_summary(text: str) -> str:
+    lowered = text.lower()
+    if any(token in lowered for token in ["利好", "看多", "上涨", "增持", "回购", "突破"]):
+        return "bullish"
+    if any(token in lowered for token in ["利空", "看空", "下跌", "减持", "风险", "回撤"]):
+        return "bearish"
+    return "neutral"
+
+
+GLOBAL_TOPIC_RULES: List[Dict[str, Any]] = [
+    {
+        "topic": "AI与科技巨头",
+        "category": "technology",
+        "region": "global",
+        "keywords": ["openai", "amazon", "microsoft", "nvidia", "meta", "google", "ai", "chip", "cloud"],
+        "major_keywords": ["订单", "合作", "融资", "发布", "算力", "模型", "数据中心", "芯片"],
+    },
+    {
+        "topic": "中东局势与战争",
+        "category": "geopolitics",
+        "region": "middle_east",
+        "keywords": ["iran", "israel", "中东", "伊朗", "以色列", "红海", "war", "strike", "missile"],
+        "major_keywords": ["战争", "冲突", "停火", "袭击", "制裁", "军事"],
+    },
+    {
+        "topic": "全球宏观与央行",
+        "category": "macro",
+        "region": "global",
+        "keywords": ["fed", "ecb", "boj", "cpi", "inflation", "rate", "美联储", "通胀", "降息", "加息"],
+        "major_keywords": ["非农", "失业", "利率决议", "经济衰退", "关税", "财政刺激"],
+    },
+    {
+        "topic": "能源与大宗商品",
+        "category": "energy",
+        "region": "global",
+        "keywords": ["oil", "gas", "opec", "原油", "天然气", "煤炭", "航运"],
+        "major_keywords": ["减产", "增产", "供应中断", "油价", "运价"],
+    },
+]
+
+_NEWS_DIGEST_HEAD_PATTERN = re.compile(r"主要内容\s*有\s*[:：]\s*1\.")
+
+
+def _is_domestic_news_digest(title: str, summary: str) -> bool:
+    """Long-form CCTV / bulletin headlines: classify by lead story, not trailing intl items."""
+    blob = f"{title} {summary}".lower()
+    if "新闻联播" in blob:
+        return True
+    combined = f"{title} {summary}"
+    return bool(_NEWS_DIGEST_HEAD_PATTERN.search(combined))
+
+
+def _extract_primary_digest_line(text: str) -> Optional[str]:
+    """First numbered item after a digest header (e.g. 1.【栏目】要点；)."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    m = re.search(r"1\.\s*【([^】]+)】\s*([^；]+?)(?=；|$)", t)
+    if m:
+        head, tail = m.group(1).strip(), m.group(2).strip()
+        pick = tail if len(tail) >= 4 else head
+        pick = re.sub(r"\s+", " ", pick).strip()
+        return pick or None
+    m2 = re.search(r"1\.\s*([^；]+?)(?=；|$)", t)
+    if m2:
+        return re.sub(r"\s+", " ", m2.group(1).strip())
+    return None
+
+
+def _short_digest_topic_label(value: str, max_len: int = 32) -> str:
+    v = value.strip()
+    if len(v) <= max_len:
+        return v
+    return v[: max_len - 1].rstrip() + "…"
+
+
+HOTSPOT_SECTOR_TEMPLATES: Dict[str, Dict[str, Any]] = {
+    "科技": {
+        "aliases": [
+            "科技",
+            "ai",
+            "人工智能",
+            "算力",
+            "芯片",
+            "半导体",
+            "云",
+            "cloud",
+            "openai",
+            "nvidia",
+            "amazon",
+            "microsoft",
+            "数字中国",
+            "数字经济",
+        ],
+        "categories": ["科技", "通信"],
+    },
+    "金融": {
+        "aliases": ["金融", "银行", "保险", "利率", "加息", "降息", "央行", "通胀", "fed", "ecb", "boj", "cpi"],
+        "categories": ["银行", "保险"],
+    },
+    "能源": {
+        "aliases": ["能源", "原油", "油气", "石油", "天然气", "煤炭", "opec", "oil", "gas", "石油石化"],
+        "categories": ["石油石化"],
+    },
+    "新能源": {
+        "aliases": ["新能源", "光伏", "储能", "锂电", "电池", "风电", "太阳能", "新能源车"],
+        "categories": ["新能源", "新能源车"],
+    },
+    "医药": {
+        "aliases": ["医药", "创新药", "医疗", "制药"],
+        "categories": ["医药"],
+    },
+    "消费": {
+        "aliases": ["消费", "白酒", "家电", "电商", "免税"],
+        "categories": ["白酒", "家电", "消费", "电商"],
+    },
+}
+
+HOTSPOT_TOPIC_ALIASES: Dict[str, str] = {
+    "原油": "能源",
+    "油气": "能源",
+    "石油": "能源",
+    "石油石化": "能源",
+    "银行": "金融",
+    "保险": "金融",
+    "ai与科技巨头": "科技",
+    "半导体": "科技",
+    "算力": "科技",
+}
+
+STOCK_NAME_ALIASES: Dict[str, str] = {
+    "中国海洋石油": "中国海油",
+    "中国石油天然气": "中国石油",
+    "中国石油化工": "中国石化",
+    "长鑫存储": "长鑫科技",
+}
+
+MARKET_REGIME_INDEXES: List[Tuple[str, str]] = [
+    ("sh000001", "上证指数"),
+    ("sh000300", "沪深300"),
+    ("sz399001", "深证成指"),
+    ("sz399006", "创业板指"),
+]
+MARKET_REGIME_UNIVERSES = {
+    "a_share": MARKET_REGIME_INDEXES,
+    # ETFs are explicit, liquid proxies, not exchange index quotes.
+    "us": [("US.SPY", "S&P 500 · SPY"), ("US.QQQ", "Nasdaq-100 · QQQ"), ("US.DIA", "Dow Jones · DIA")],
+    "hk": [("HK.HSI", "恒生指数")],
+}
+
+
+@dataclass
+class AnalyzerBundle:
+    analyzer: StockAnalyzer
+    analysis: Dict[str, Any]
+    signals: Dict[str, Any]
+    dataframe: pd.DataFrame
+    ai_text: Optional[str]
+    ai_requested: bool = False
+    ai_provider: Optional[str] = None
+    ai_model: Optional[str] = None
+
+
+@dataclass
+class IntentRewriteResult:
+    intent: str
+    rewritten_query: str
+    target_stock: Optional[Dict[str, str]]
+    wants_live_web: bool
+    include_context: bool
+    follow_up: bool
+    comparison_mode: Optional[str] = None
+
+
+@dataclass
+class ContextSlots:
+    current_stock: Optional[Dict[str, str]]
+    current_topic: Optional[str]
+    current_market_scope: str
+    requested_action: str
+    comparison_mode: Optional[str]
+    time_horizon: str
+    follow_up: bool
+
+
+@dataclass
+class StockResolution:
+    target: Optional[Dict[str, str]]
+    confidence: float
+    source: str
+    candidates: List[Dict[str, Any]]
+
+
+class TTLCacheStore:
+    def __init__(self):
+        self._entries: Dict[str, Tuple[float, Any]] = {}
+
+    def get(self, key: str) -> Optional[Any]:
+        entry = self._entries.get(key)
+        now = time.time()
+        if not entry:
+            return None
+        expires_at, value = entry
+        if expires_at <= now:
+            self._entries.pop(key, None)
+            return None
+        return copy.deepcopy(value)
+
+    def set(self, key: str, value: Any, ttl_seconds: int) -> Any:
+        self._entries[key] = (time.time() + ttl_seconds, copy.deepcopy(value))
+        return value
+
+    def get_or_set(self, key: str, ttl_seconds: int, factory):
+        cached = self.get(key)
+        if cached is not None:
+            return cached, True
+        value = factory()
+        self.set(key, value, ttl_seconds)
+        return value, False
+
+    def clear(self) -> None:
+        self._entries.clear()
+
+
+class AnalysisProgressStore:
+    def __init__(self, ttl_seconds: int = 900):
+        self.ttl_seconds = ttl_seconds
+        self._entries: Dict[str, Tuple[float, AnalysisProgressResponse]] = {}
+        self._lock = Lock()
+
+    def _cleanup_locked(self) -> None:
+        now = time.time()
+        expired = [key for key, (expires_at, _) in self._entries.items() if expires_at <= now]
+        for key in expired:
+            self._entries.pop(key, None)
+
+    def update(
+        self,
+        request_id: Optional[str],
+        *,
+        status: str,
+        stage: str,
+        progress_pct: int,
+        message: str,
+        stock_code: Optional[str] = None,
+        include_ai: bool = False,
+    ) -> None:
+        if not request_id:
+            return
+        payload = AnalysisProgressResponse(
+            request_id=request_id,
+            status=status,  # type: ignore[arg-type]
+            stage=stage,
+            progress_pct=max(0, min(int(progress_pct), 100)),
+            message=message,
+            stock_code=stock_code,
+            include_ai=include_ai,
+            updated_at=_now_utc(),
+        )
+        with self._lock:
+            self._cleanup_locked()
+            self._entries[request_id] = (time.time() + self.ttl_seconds, payload)
+
+    def get(self, request_id: str) -> AnalysisProgressResponse:
+        with self._lock:
+            self._cleanup_locked()
+            entry = self._entries.get(request_id)
+            if not entry:
+                return AnalysisProgressResponse(
+                    request_id=request_id,
+                    status="unknown",
+                    stage="unknown",
+                    progress_pct=0,
+                    message="等待后端开始处理分析请求",
+                    updated_at=_now_utc(),
+                )
+            _, payload = entry
+            return payload.model_copy(deep=True)
+
+
+class StockAnalysisService:
+    def __init__(self, config: Optional[Config] = None, settings_store: Optional[UserSettingsStore] = None):
+        self.config = config or Config()
+        self.settings_store = settings_store
+        self.signal_analyzer = SignalAnalyzer()
+        self._response_cache = TTLCacheStore()
+        self.progress_store = AnalysisProgressStore()
+
+    def _runtime_config(self) -> Config:
+        if self.settings_store is None:
+            return self.config
+        return self.settings_store.build_runtime_config(self.config)
+
+    def search_stocks(self, query: str, max_results: int = 10, request_id: Optional[str] = None) -> List[StockSearchResult]:
+        self.progress_store.update(
+            request_id,
+            status="pending",
+            stage="searching",
+            progress_pct=8,
+            message="正在识别股票代码、名称和所属市场",
+        )
+        results = stock_searcher.search_stocks(query, max_results=max_results)
+        self.progress_store.update(
+            request_id,
+            status="pending",
+            stage="search_done",
+            progress_pct=18,
+            message=f"已完成标的识别，匹配到 {len(results)} 个候选结果",
+        )
+        return [StockSearchResult(**item) for item in results]
+
+    def build_analysis_bundle(
+        self,
+        stock_code: str,
+        include_ai: bool = True,
+        progress_callback: Optional[ProgressCallback] = None,
+        request_id: Optional[str] = None,
+        token_callback: Optional[Callable[[str], None]] = None,
+    ) -> AnalyzerBundle:
+        normalized = normalize_stock_code(stock_code)
+        if progress_callback:
+            progress_callback("resolve_stock", 15, f"已确认标的 {normalized}", {"stock_code": normalized})
+        info = stock_searcher.get_stock_info(normalized)
+        stock_name = info["name"] if info else normalized
+        runtime_config = self._runtime_config()
+        analyzer = StockAnalyzer(
+            stock_info={stock_name: normalized},
+            count=runtime_config.data_count,
+            config=runtime_config,
+            enable_push=False,
+        )
+        if progress_callback:
+            progress_callback("fetch_data", 25, "正在拉取行情数据", {"stock_code": normalized})
+        self.progress_store.update(
+            request_id,
+            status="pending",
+            stage="fetch_data",
+            progress_pct=30,
+            message=f"已锁定 {stock_name}，正在拉取行情数据",
+            stock_code=normalized,
+            include_ai=include_ai,
+        )
+        if not analyzer.fetch_data():
+            raise ValueError(f"Unable to fetch stock data for {normalized}")
+        if progress_callback:
+            progress_callback("fetch_data", 35, "行情数据已加载完成", {"stock_code": normalized})
+        self.progress_store.update(
+            request_id,
+            status="pending",
+            stage="calculate_indicators",
+            progress_pct=44,
+            message="行情数据已返回，正在计算技术指标",
+            stock_code=normalized,
+            include_ai=include_ai,
+        )
+        if not analyzer.calculate_indicators():
+            raise ValueError(f"Unable to calculate indicators for {normalized}")
+        if progress_callback:
+            progress_callback("calculate_indicators", 50, "技术指标计算完成", {"stock_code": normalized})
+
+        analysis = analyzer.analyze_single_stock(normalized)
+        dataframe = analysis["processed_data"]
+        signals = self.signal_analyzer.analyze_all_signals(dataframe)
+        if progress_callback:
+            progress_callback("build_analysis", 65, "技术分析结果已整理完成", {"stock_code": normalized})
+        self.progress_store.update(
+            request_id,
+            status="pending",
+            stage="summarize",
+            progress_pct=62,
+            message="技术指标计算完成，正在整理交易信号与结论",
+            stock_code=normalized,
+            include_ai=include_ai,
+        )
+        ai_text: Optional[str] = None
+        ai_requested = bool(include_ai and analyzer.llm)
+        ai_provider = analyzer.llm_base_url if ai_requested else None
+        ai_model = analyzer.llm_model if ai_requested else None
+        if include_ai and analyzer.llm and progress_callback:
+            progress_callback("generate_ai_report", 85, "正在生成 AI 分析报告", {"stock_code": normalized})
+
+            def report_ai(progress: int, message: str) -> None:
+                progress_callback(
+                    "generate_ai_report",
+                    max(85, min(99, progress)),
+                    message,
+                    {"stock_code": normalized},
+                )
+
+            ai_text = analyzer.generate_single_stock_analysis(
+                stock_name,
+                analysis,
+                "深度分析",
+                progress_callback=report_ai,
+                token_callback=token_callback,
+            )
+            analyzer.llm = None
+        if include_ai and analyzer.llm:
+
+            def report_ai_progress(progress: int, message: str) -> None:
+                self.progress_store.update(
+                    request_id,
+                    status="pending",
+                    stage="ai_analysis",
+                    progress_pct=progress,
+                    message=message,
+                    stock_code=normalized,
+                    include_ai=True,
+                )
+
+            ai_text = analyzer.generate_single_stock_analysis(stock_name, analysis, "深度分析", progress_callback=report_ai_progress)
+        return AnalyzerBundle(
+            analyzer=analyzer,
+            analysis=analysis,
+            signals=signals,
+            dataframe=dataframe,
+            ai_text=ai_text,
+            ai_requested=ai_requested,
+            ai_provider=ai_provider,
+            ai_model=ai_model,
+        )
+
+    def get_analysis_progress(self, request_id: str) -> AnalysisProgressResponse:
+        return self.progress_store.get(request_id)
+    def get_stock_analysis(
+        self,
+        stock_code: str,
+        include_ai: bool = True,
+        progress_callback: Optional[ProgressCallback] = None,
+        request_id: Optional[str] = None,
+        token_callback: Optional[Callable[[str], None]] = None,
+    ) -> StockAnalysisResponse:
+        normalized = normalize_stock_code(stock_code)
+        runtime_config = self._runtime_config()
+        model_cache_key = runtime_config.llm_model if include_ai and runtime_config.llm_api_key else "no-ai"
+        cache_key = f"analysis:{normalized}:{int(include_ai)}:{model_cache_key}"
+        ttl = 300 if include_ai else 180
+        cached = self._response_cache.get(cache_key)
+        if cached is not None:
+            if progress_callback:
+                progress_callback("completed", 100, "命中缓存，分析结果已就绪", {"stock_code": normalized, "cached": True})
+            self.progress_store.update(
+                request_id,
+                status="completed",
+                stage="cached",
+                progress_pct=100,
+                message="命中缓存，分析结果已直接返回",
+                stock_code=normalized,
+                include_ai=include_ai,
+            )
+            return cached
+
+        bundle = self.build_analysis_bundle(
+            normalized,
+            include_ai=include_ai,
+            progress_callback=progress_callback,
+            request_id=request_id,
+            token_callback=token_callback,
+        )
+        basic_data = bundle.analysis.get("基础数据", {})
+        latest = bundle.dataframe.iloc[-1]
+        # K 线图默认展示最近约 5 年日 K（~250 交易日 * 5），方便观察中长期趋势
+        # 按列向量化提取，避免对上千行使用 DataFrame.iterrows（每行构造 Series，开销大）。
+        chart_df = bundle.dataframe.tail(1250)
+        chart_dates = [str(idx)[:10] for idx in chart_df.index]
+
+        def _column_values(name: str) -> list:
+            if name not in chart_df.columns:
+                return [None] * len(chart_df)
+            return [_safe_float(value) for value in chart_df[name].to_numpy()]
+
+        chart_series = [
+            {
+                "date": date,
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": volume,
+            }
+            for date, open_, high, low, close, volume in zip(
+                chart_dates,
+                _column_values("open"),
+                _column_values("high"),
+                _column_values("low"),
+                _column_values("close"),
+                _column_values("volume"),
+            )
+        ]
+        indicators = {
+            key: _safe_float(latest.get(key))
+            for key in [
+                "MA5",
+                "MA10",
+                "MA20",
+                "MA60",
+                "RSI",
+                "MACD",
+                "DIF",
+                "DEA",
+                "K",
+                "D",
+                "J",
+                "BOLL_UP",
+                "BOLL_MID",
+                "BOLL_LOW",
+            ]
+        }
+        quote = QuoteSnapshot(
+            stock_name=bundle.analysis.get("股票名称", normalize_stock_code(stock_code)),
+            stock_code=bundle.analysis.get("股票代码", normalize_stock_code(stock_code)),
+            current_price=_parse_number(basic_data.get("最新价格")),
+            change=_parse_number(basic_data.get("涨跌")),
+            change_pct=_parse_number(basic_data.get("涨跌幅")),
+            open_price=_parse_number(basic_data.get("开盘价")),
+            high_price=_parse_number(basic_data.get("最高价")),
+            low_price=_parse_number(basic_data.get("最低价")),
+            volume=_parse_number(basic_data.get("成交量")),
+            amplitude_pct=_parse_number(basic_data.get("振幅")),
+            timestamp=_now_utc(),
+        )
+        ai_insight = AIInsight(
+            enabled=include_ai and (bundle.ai_requested or bool(bundle.ai_text)),
+            content=bundle.ai_text,
+            provider=bundle.ai_provider,
+            model=bundle.ai_model,
+            error=None if bundle.ai_text or not bundle.ai_requested or not include_ai else "AI analysis returned empty content",
+        )
+        market = infer_market(quote.stock_code)
+        # Provider provenance comes from the fetch that actually succeeded, not
+        # from the market. HK equities use Yahoo Finance; A-share may use the legacy adapter
+        # or the akshare fallback; US may use yfinance or Finnhub.
+        provider_info = {"provider": "unknown", "adjustment": "unknown"}
+        fetcher = getattr(getattr(bundle, "analyzer", None), "data_fetcher", None)
+        if fetcher is not None and hasattr(fetcher, "provider_info"):
+            try:
+                provider_info = fetcher.provider_info(quote.stock_code)
+            except Exception:
+                provider_info = {"provider": "unknown", "adjustment": "unknown"}
+        freshness_info = {"stale": False, "data_as_of": None}
+        if fetcher is not None and hasattr(fetcher, "freshness_info"):
+            try:
+                freshness_info = fetcher.freshness_info(quote.stock_code)
+            except Exception:
+                pass
+        currency = {"us": "USD", "hk": "HKD", "cn": "CNY", "sh": "CNY", "sz": "CNY", "bj": "CNY"}.get(market, "unknown")
+        # Work desk reuses the bot's IfindProvider for a live/delayed snapshot when
+        # history fell through to Fuyao/legacy (e.g. monthly history quota).
+        quote_provider = None
+        ifind_quote_meta = None
+        if market in {"cn", "sh", "sz", "bj", "hk"}:
+            try:
+                from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+                from api.datasources.ifind_work import try_quote
+
+                pool = ThreadPoolExecutor(max_workers=1)
+                try:
+                    ifind_quote = pool.submit(try_quote, quote.stock_code).result(timeout=5.0)
+                except FuturesTimeout:
+                    ifind_quote = None
+                finally:
+                    pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                ifind_quote = None
+            if ifind_quote and ifind_quote.get("price") is not None:
+                quote_provider = "ifind"
+                ifind_quote_meta = {
+                    "provider": "ifind",
+                    "thscode": ifind_quote.get("thscode"),
+                    "data_as_of": ifind_quote.get("data_as_of"),
+                    "price_status": ifind_quote.get("price_status") or "delayed_or_snapshot",
+                }
+                previous_close = ifind_quote.get("previous_close")
+                change = ifind_quote.get("change")
+                change_pct = ifind_quote.get("change_pct")
+                volume = ifind_quote.get("volume")
+                updates = {
+                    "current_price": float(ifind_quote["price"]),
+                }
+                if change is not None:
+                    updates["change"] = float(change)
+                if change_pct is not None:
+                    updates["change_pct"] = float(change_pct)
+                if volume is not None:
+                    updates["volume"] = float(volume)
+                if previous_close is not None and quote.open_price:
+                    # Keep OHLC from the history bar; only refresh last/change/volume.
+                    pass
+                quote = quote.model_copy(update=updates)
+        try:
+            from api.datasources.flags import yfinance_a_share_fallback, yfinance_primary_us_hk
+
+            if market == "us":
+                primary = "yfinance_adapter" if yfinance_primary_us_hk() else "yfinance_legacy"
+                fallbacks = ["Finnhub (if configured)"]
+            elif market == "hk":
+                primary = "ifind → yfinance"
+                fallbacks = []
+            else:
+                primary = "ifind → fuyao → sina → tencent(qfq) → akshare"
+                fallbacks = ["yfinance_adapter (only after all primary paths fail)"] if yfinance_a_share_fallback() else []
+            quota_note = None
+            try:
+                from api.datasources.ifind_work import history_quota_note
+
+                quota_note = history_quota_note(language="zh")
+            except Exception:
+                quota_note = None
+            policy = "same currency/period; no silent adjustment swap; quote may come from iFinD while history uses fallback"
+            if quota_note:
+                policy = f"{policy}; {quota_note}"
+            data_plan = {
+                "capability": "quote_history",
+                "market": market,
+                "used_provider": provider_info.get("provider", "unknown"),
+                "quote_provider": quote_provider or provider_info.get("provider", "unknown"),
+                "primary": primary,
+                "fallbacks": fallbacks,
+                "adjustment": provider_info.get("adjustment", "unknown"),
+                "stale": bool(freshness_info.get("stale")),
+                "policy": policy,
+                **({"notes": [quota_note]} if quota_note else {}),
+                **({"ifind_history_quota_exhausted": True} if quota_note else {}),
+            }
+        except Exception:
+            data_plan = None
+        response = StockAnalysisResponse(
+            stock_name=quote.stock_name,
+            stock_code=quote.stock_code,
+            market=market,
+            quote=quote,
+            technical_indicators=indicators,
+            signal_summary=SignalSummary(
+                overall_score=int(bundle.signals.get("overall_score", 2)),
+                overall_signal=str(bundle.signals.get("overall_signal", "中性")),
+                categories=bundle.signals,
+            ),
+            technical_commentary=bundle.analysis.get("技术分析建议", []),
+            ai_insight=ai_insight,
+            chart_series=chart_series,
+            metadata={
+                "data_points": len(bundle.dataframe),
+                "source": provider_info.get("provider", "unknown"),
+                "provider": provider_info.get("provider", "unknown"),
+                "quote_provider": quote_provider or provider_info.get("provider", "unknown"),
+                "adjustment": provider_info.get("adjustment", "unknown"),
+                "coverage": "single_symbol_history",
+                "generated_at": quote.timestamp.isoformat(),
+                "retrieved_at": quote.timestamp.isoformat(),
+                "currency": currency,
+                "data_as_of": (ifind_quote_meta or {}).get("data_as_of")
+                or freshness_info.get("data_as_of")
+                or (chart_series[-1].get("date") if chart_series else None),
+                "price_status": (
+                    "stale_cache"
+                    if freshness_info.get("stale")
+                    else ((ifind_quote_meta or {}).get("price_status") or "historical_or_delayed")
+                ),
+                "stale": bool(freshness_info.get("stale")),
+                **({"ifind_quote": ifind_quote_meta} if ifind_quote_meta else {}),
+                **({"data_plan": data_plan} if data_plan else {}),
+                **(
+                    {
+                        "user_note": (data_plan or {}).get("notes", [None])[0],
+                        "data_notes": (data_plan or {}).get("notes") or [],
+                    }
+                    if (data_plan or {}).get("notes")
+                    else {}
+                ),
+            },
+        )
+        self.progress_store.update(
+            request_id,
+            status="completed",
+            stage="completed",
+            progress_pct=100,
+            message="分析结果已完成，正在渲染页面",
+            stock_code=normalized,
+            include_ai=include_ai,
+        )
+        self._response_cache.set(cache_key, response, ttl)
+        # Phase 2 shadow only: compare with yfinance without changing the answer.
+        # Disabled by default; enable with YFINANCE_SHADOW=1 for local evaluation.
+        try:
+            from api.datasources.shadow import schedule_shadow
+
+            schedule_shadow(normalized, response)
+        except Exception:
+            pass
+        if progress_callback:
+            progress_callback("completed", 100, "分析结果已生成", {"stock_code": normalized})
+        return response
+
+
+class NewsService:
+    GLOBAL_NEWS_TIMEOUT_SEC = 3.2
+
+    def __init__(self, config: Optional[Config] = None):
+        self.config = config or Config()
+        self.state_store = MonitorStateStore(self.config.monitor_db_path)
+        self.tracker = NewsTracker(self.config)
+        self._response_cache = TTLCacheStore()
+
+    @staticmethod
+    def _call_with_timeout(factory: Callable[[], Any], timeout_sec: float) -> Any:
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            future = executor.submit(factory)
+            return future.result(timeout=timeout_sec)
+        except (FuturesTimeout, Exception):
+            return None
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def get_stock_news(self, stock_code: str, stock_name: Optional[str] = None, limit: int = 20) -> List[NewsItem]:
+        normalized = normalize_stock_code(stock_code)
+        search_info = stock_searcher.get_stock_info(normalized)
+        resolved_name = stock_name or (search_info["name"] if search_info else normalized)
+        cache_key = f"stock_news:{normalized}:{resolved_name}:{limit}"
+        cached = self._response_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        # 实时新闻为主（最新）：A/H 股先走 bot 同款 iFinD 公告，再补抓公开源。
+        fetched: list = []
+        market_hint = infer_market(normalized)
+        if market_hint in {"cn", "sh", "sz", "bj", "hk"}:
+            try:
+                from api.datasources.ifind_work import announcements_as_fetched_news
+
+                rows = self._call_with_timeout(
+                    lambda: announcements_as_fetched_news(normalized, limit=max(limit, 8)),
+                    5.0,
+                )
+                if rows:
+                    fetched.extend(rows)
+            except Exception:
+                pass
+        live = self._call_with_timeout(
+            lambda: self.tracker.fetch_stock_news(normalized, resolved_name),
+            6.0,
+        )
+        if live:
+            fetched.extend(live)
+        live_items = [self._map_fetched_news(normalized, resolved_name, item) for item in fetched]
+
+        # 监控存储为补充：去重后置于实时之后，避免旧告警挡住最新新闻。
+        stored_items = [
+            self._map_alert_to_news(item)
+            for item in self.state_store.get_recent_alerts(limit=limit * 5)
+            if item["stock_code"] == normalized and item["event_type"] == "news"
+        ]
+
+        merged = self._merge_stock_news(live_items, stored_items)
+        market = infer_market(normalized)
+        aliases = {"US.MU": ["Micron"], "US.AAPL": ["Apple"], "US.NVDA": ["NVIDIA"], "US.MSFT": ["Microsoft"]}
+        ticker = normalized.removeprefix("US.")
+        company_alias = re.sub(
+            r"[,，]?\s*(?:Inc\.?|Corp\.?|Corporation|Ltd\.?|Limited|Holdings?|控股|集团|股份有限公司)\s*$",
+            "",
+            resolved_name,
+            flags=re.I,
+        )
+        symbol = re.sub(r"^(?:US|HK|SH|SZ)\.?", "", normalized)
+        names = [*aliases.get(normalized, []), resolved_name, company_alias, symbol]
+
+        def _mentions(name: str) -> bool:
+            if not name or name == normalized:
+                return False
+            if re.search(r"[\u3400-\u9fff]", name):
+                # \b does not separate adjacent CJK characters.
+                return name in blob
+            return bool(re.search(rf"\b{re.escape(name)}\b", blob, re.I))
+
+        for item in merged:
+            blob = html.unescape(f"{item.title} {item.summary}")
+            # 'mRNA' is also a biological term. An uppercase ticker or a
+            # company-name mention is needed before calling this direct news.
+            mentioned = bool(re.search(rf"\b{re.escape(ticker)}\b", blob)) or any(
+                _mentions(name) for name in names
+            )
+            if market == "us":
+                item.relation_type = "direct" if mentioned else "market"
+                item.raw_payload["association_basis"] = (
+                    "Company mention in source title or summary"
+                    if mentioned
+                    else "Retrieved through ticker query; company association unconfirmed"
+                )
+            else:
+                # HK/A-share feeds often include broad market news. Only a
+                # company-name or code mention may be presented as direct
+                # company news; everything else is a topic fallback.
+                item.relation_type = "direct" if mentioned else "topic"
+                item.raw_payload["association_basis"] = (
+                    "Company mention in source title or summary"
+                    if mentioned
+                    else "Topic-level fallback; company association unverified"
+                )
+        result = self._prioritize_stock_news(merged, limit=limit)
+        self._response_cache.set(cache_key, result, 120)
+        return result
+
+    @staticmethod
+    def _news_dedupe_key(item: NewsItem) -> str:
+        return normalize_text(item.title).strip().lower()
+
+    def _merge_stock_news(
+        self, live_items: List[NewsItem], stored_items: List[NewsItem]
+    ) -> List[NewsItem]:
+        """实时新闻在前，监控存储去重后补充在后（按标题去重）。"""
+        merged: List[NewsItem] = []
+        seen: set[str] = set()
+        for item in [*live_items, *stored_items]:
+            key = self._news_dedupe_key(item)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+        return merged
+
+    def get_global_news(self, limit: int = 20, market: str = "global") -> List[GlobalNewsItem]:
+        if market == "us":
+            return self._get_us_headlines(limit)
+        cache_key = f"global_news:{limit}"
+        cached = self._response_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        records: List[Dict[str, Any]] = []
+        sources = [
+            ("财联社", lambda: self.tracker._fetch_ak_news("stock_info_global_cls")),
+            ("财联社快讯", lambda: self.tracker._fetch_ak_news("stock_news_main_cx")),
+            ("新浪财经", lambda: self.tracker._fetch_ak_news("stock_info_global_sina")),
+            ("同花顺", lambda: self.tracker._fetch_ak_news("stock_info_global_ths")),
+        ]
+
+        executor = ThreadPoolExecutor(max_workers=len(sources))
+        try:
+            future_sources = {executor.submit(fetch_fn): source_name for source_name, fetch_fn in sources}
+            done, pending = wait(future_sources, timeout=self.GLOBAL_NEWS_TIMEOUT_SEC)
+            for future in pending:
+                future.cancel()
+            for future in done:
+                source_name = future_sources[future]
+                try:
+                    records.extend(self._normalize_global_news_dataframe(future.result(), source_name))
+                except Exception:
+                    pass  # skip this source if fetching or normalization fails
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        if not records:
+            try:
+                records.extend(self._global_news_from_alerts(min_impact=2))
+            except Exception:
+                pass
+
+        deduped: List[Dict[str, Any]] = []
+        seen_keys: set[str] = set()
+        for item in sorted(records, key=self._global_news_sort_key, reverse=True):
+            title_key = re.sub(r"\W+", "", item.get("title", "").strip().lower())
+            url_key = str(item.get("url") or "").strip().lower()
+            dedupe_key = url_key or title_key
+            if not dedupe_key or dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+            deduped.append(item)
+
+        result: List[GlobalNewsItem] = []
+        for item in deduped[:limit]:
+            try:
+                result.append(GlobalNewsItem(**item))
+            except Exception:
+                pass  # skip invalid item
+        self._response_cache.set(cache_key, result, 90 if result else 15)
+        return result
+
+    def _get_us_headlines(self, limit: int) -> List[GlobalNewsItem]:
+        """Merge general market headlines with a small company-news basket."""
+        cached = self._response_cache.get("us_headlines")
+        if cached is not None:
+            return cached[:limit]
+        records: List[NewsItem] = []
+        general_records: List[Dict[str, Any]] = []
+        executor = ThreadPoolExecutor(max_workers=4)
+        try:
+            company_futures = [executor.submit(self.get_stock_news, code, limit=6) for code in ("US.AAPL", "US.MSFT", "US.NVDA")]
+            general_future = executor.submit(self.tracker._fetch_finnhub_general_news)
+            done, pending = wait([*company_futures, general_future], timeout=5)
+            for future in pending:
+                future.cancel()
+            for future in done:
+                try:
+                    fetched = future.result()
+                    if future is general_future:
+                        if fetched is not None and not fetched.empty:
+                            general_records = fetched.to_dict(orient="records")
+                    elif fetched:
+                        records.extend(fetched)
+                except Exception:
+                    pass
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        result: List[GlobalNewsItem] = []
+        seen = set()
+        catalog = get_base_stock_catalog()
+        aliases_by_symbol: Dict[str, set[str]] = defaultdict(set)
+        for name, info in catalog.items():
+            code = info.get("code", "")
+            if infer_market(code) == "us" and len(name.strip()) >= 2:
+                aliases_by_symbol[code].add(name.strip())
+
+        coverage = (
+            "Finnhub general market news plus selected-company queries; coverage is not comprehensive."
+            if general_records
+            else "Selected-company queries only; coverage is not comprehensive."
+        )
+
+        def to_global_item(item: NewsItem | Dict[str, Any], *, market_feed: bool) -> Optional[GlobalNewsItem]:
+            if isinstance(item, NewsItem):
+                title, summary, source = item.title, item.summary, item.source
+                published_at, url, item_id = item.published_at, item.url, item.id
+                provider_related = ""
+            else:
+                title = str(item.get("title") or "")
+                summary = str(item.get("content") or "")
+                source = str(item.get("source") or "Finnhub")
+                published_at = str(item.get("datetime") or "")
+                url = item.get("url")
+                item_id = str(item.get("id") or "")
+                provider_related = str(item.get("related") or "")
+            title, summary = html.unescape(title).strip(), html.unescape(summary).strip()
+            if not title:
+                return None
+            mention_text = f"{title} {summary}"
+            symbols: List[str] = []
+            for code, aliases in aliases_by_symbol.items():
+                mentioned = any(
+                    (re.search(rf"(?<![A-Za-z0-9]){re.escape(alias)}(?![A-Za-z0-9])", mention_text, re.I)
+                     if re.search(r"[A-Za-z]", alias) else alias in mention_text)
+                    for alias in aliases
+                )
+                ticker = code.removeprefix("US.")
+                ticker_mentioned = len(ticker) >= 2 and bool(re.search(
+                    rf"(?<![A-Za-z0-9]){re.escape(ticker)}(?![A-Za-z0-9])", mention_text
+                ))
+                if mentioned or ticker_mentioned:
+                    symbols.append(code)
+            return GlobalNewsItem(
+                id=item_id or str(url or title.casefold()),
+                title=title,
+                summary=summary,
+                source=source,
+                published_at=published_at,
+                category="company" if symbols else "market",
+                topic="Company mentions" if symbols else "Market news",
+                region="global" if market_feed else "US",
+                sentiment=(item.sentiment if isinstance(item, NewsItem) else _sentiment_from_summary(f"{title} {summary}")),
+                impact_level=item.impact_level if isinstance(item, NewsItem) else 1,
+                url=url,
+                related_symbols=symbols,
+                raw_payload={
+                    "coverage": coverage,
+                    "market_feed": market_feed,
+                    "general_feed_available": bool(general_records),
+                    "provider_related": provider_related or None,
+                    "association_basis": "Company mention in source title or summary" if symbols else "No company association confirmed",
+                },
+            )
+
+        candidates: List[tuple[NewsItem | Dict[str, Any], bool]] = [
+            *((item, False) for item in records),
+            *((item, True) for item in general_records),
+        ]
+        candidates.sort(key=lambda pair: (
+            pair[0].published_at if isinstance(pair[0], NewsItem) else str(pair[0].get("datetime") or "")
+        ), reverse=True)
+        for item, market_feed in candidates:
+            key = (
+                item.url or item.title.casefold()
+                if isinstance(item, NewsItem)
+                else item.get("url") or str(item.get("title") or "").casefold()
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized = to_global_item(item, market_feed=market_feed)
+            if normalized is not None:
+                result.append(normalized)
+        self._response_cache.set("us_headlines", result, 120 if result else 15)
+        return result[:limit]
+
+    def get_context_news_for_query(self, query: str, limit: int = 6) -> List[GlobalNewsItem]:
+        cache_key = f"context_news:{query.strip().lower()}:{limit}"
+        cached = self._response_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        lowered = query.lower()
+        news = self.get_global_news(limit=30)
+        matched = [
+            item
+            for item in news
+            if any(token in lowered for token in self._build_global_query_tokens(item))
+        ]
+        result = (matched or news)[:limit]
+        self._response_cache.set(cache_key, result, 60)
+        return result
+
+    def _map_alert_to_news(self, item: Dict[str, Any]) -> NewsItem:
+        payload = item.get("raw_payload", {})
+        url = payload.get("url") or payload.get("网址")
+        return NewsItem(
+            id=item["dedupe_key"],
+            stock_code=item["stock_code"],
+            stock_name=item["stock_name"],
+            source=item["source"] or "monitor",
+            published_at=item["occurred_at"],
+            title=item["title"],
+            summary=item["summary"],
+            relation_type=payload.get("relation_type", "direct"),
+            sentiment=_sentiment_from_summary(item["summary"]),
+            impact_level=int(item["priority"]),
+            ai_takeaway=item["summary"],
+            url=url,
+            raw_payload=payload,
+        )
+
+    def _map_fetched_news(self, stock_code: str, stock_name: str, item: Dict[str, Any]) -> NewsItem:
+        from api.datasources.announcement_text import sanitize_announcement_title
+
+        raw = dict(item)
+        title = sanitize_announcement_title(item.get("title") or "")
+        summary_raw = item.get("content") or item.get("summary") or title or ""
+        summary = sanitize_announcement_title(summary_raw) if summary_raw == item.get("title") else str(summary_raw)
+        return NewsItem(
+            id=f"{stock_code}:{item.get('occurred_at', '')}:{title}",
+            stock_code=stock_code,
+            stock_name=stock_name,
+            source=item.get("source", "live"),
+            published_at=str(item.get("occurred_at", "")),
+            title=title,
+            summary=summary[:280],
+            relation_type=item.get("relation_type", "direct"),
+            sentiment=_sentiment_from_summary(summary),
+            impact_level=3 if item.get("relation_type") == "direct" else 2,
+            ai_takeaway=summary[:160] if summary else None,
+            url=item.get("url"),
+            raw_payload=raw,
+        )
+
+    def _prioritize_stock_news(self, items: List[NewsItem], limit: int) -> List[NewsItem]:
+        if not items:
+            return []
+
+        direct_items = [item for item in items if item.relation_type == "direct"]
+        if len(direct_items) >= limit:
+            return direct_items[:limit]
+
+        # Only use topic-level items as sparse fallback when direct mentions are insufficient.
+        topic_items = [item for item in items if item.relation_type != "direct"]
+        fallback_limit = min(max(limit - len(direct_items), 0), 3)
+        return [*direct_items, *topic_items[:fallback_limit]][:limit]
+
+    def _normalize_global_news_dataframe(self, data_frame: Optional[pd.DataFrame], source_name: str) -> List[Dict[str, Any]]:
+        if data_frame is None or data_frame.empty:
+            return []
+
+        normalized: List[Dict[str, Any]] = []
+        for row in data_frame.to_dict(orient="records"):
+            title = normalize_text(
+                self._get_first_available(row, ["标题", "新闻标题", "title", "内容", "新闻内容"])
+            )
+            summary = normalize_text(
+                self._get_first_available(row, ["摘要", "内容", "新闻内容", "content"])
+            ) or title
+            published_at = normalize_text(
+                self._get_first_available(row, ["发布时间", "日期", "时间", "datetime"])
+            ) or _now_utc().isoformat()
+            url = normalize_text(self._get_first_available(row, ["链接", "网址", "url", "新闻链接"]))
+            if not title:
+                continue
+            topic_meta = self._classify_global_topic(title, summary, source_name)
+            normalized.append(
+                {
+                    "id": f"{source_name}:{published_at}:{title}",
+                    "title": title,
+                    "summary": summary[:280],
+                    "source": source_name,
+                    "published_at": published_at,
+                    "category": topic_meta["category"],
+                    "topic": topic_meta["topic"],
+                    "region": topic_meta["region"],
+                    "sentiment": _sentiment_from_summary(summary),
+                    "impact_level": topic_meta["impact_level"],
+                    "url": url,
+                    "related_symbols": topic_meta["related_symbols"],
+                    "raw_payload": dict(row),
+                }
+            )
+        return normalized
+
+    def _global_news_from_alerts(self, min_impact: int = 3) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        for alert in self.state_store.get_recent_alerts(limit=120):
+            title = alert.get("title", "")
+            if alert.get("event_type") == "fund_flow" or title.startswith("资金流追踪"):
+                continue
+            summary = alert.get("summary", "")
+            topic_meta = self._classify_global_topic(title, summary, alert.get("source") or "monitor")
+            impact_level = max(int(topic_meta["impact_level"]), int(alert.get("priority", 1)))
+            if impact_level < min_impact:
+                continue
+            items.append(
+                {
+                    "id": alert["dedupe_key"],
+                    "title": title,
+                    "summary": summary[:280],
+                    "source": alert.get("source") or "monitor",
+                    "published_at": alert.get("occurred_at") or _now_utc().isoformat(),
+                    "category": topic_meta["category"],
+                    "topic": topic_meta["topic"],
+                    "region": topic_meta["region"],
+                    "sentiment": _sentiment_from_summary(summary),
+                    "impact_level": min(impact_level, 5),
+                    "url": alert.get("raw_payload", {}).get("url"),
+                    "related_symbols": topic_meta["related_symbols"],
+                    "raw_payload": alert.get("raw_payload", {}),
+                }
+            )
+        return items
+
+    def _classify_global_topic(self, title: str, summary: str, source_name: str) -> Dict[str, Any]:
+        haystack = f"{title} {summary}".lower()
+        default_rule = {"topic": "全球市场动态", "category": "general", "region": "global"}
+
+        if _is_domestic_news_digest(title, summary):
+            primary = _extract_primary_digest_line(title) or _extract_primary_digest_line(summary)
+            label = _short_digest_topic_label(primary) if primary else ""
+            topic_label = f"国内时政 · {label}" if label else "国内时政与产业要闻"
+            best_rule = {"topic": topic_label, "category": "domestic", "region": "asia"}
+            best_score = 100
+        else:
+            best_rule = default_rule
+            best_score = 0
+            for rule in GLOBAL_TOPIC_RULES:
+                score = sum(2 for token in rule["keywords"] if token in haystack)
+                score += sum(3 for token in rule["major_keywords"] if token in haystack)
+                if score > best_score:
+                    best_score = score
+                    best_rule = rule
+
+        impact_level = 2
+        if any(token in haystack for token in ["breaking", "突发", "订单", "战争", "停火", "制裁", "加息", "降息"]):
+            impact_level += 1
+        if best_score >= 4:
+            impact_level += 1
+        if best_score >= 7:
+            impact_level += 1
+
+        related_symbols = []
+        for symbol in ["OpenAI", "Amazon", "Microsoft", "NVIDIA", "Iran", "Israel", "OPEC", "Fed"]:
+            if symbol.lower() in haystack:
+                related_symbols.append(symbol)
+
+        return {
+            "topic": best_rule["topic"],
+            "category": best_rule["category"],
+            "region": best_rule["region"],
+            "impact_level": min(impact_level, 5),
+            "related_symbols": related_symbols,
+            "source_name": source_name,
+        }
+
+    def _global_news_sort_key(self, item: Dict[str, Any]) -> tuple:
+        return (int(item.get("impact_level", 1)), str(item.get("published_at", "")))
+
+    def _build_global_query_tokens(self, item: GlobalNewsItem) -> List[str]:
+        tokens = [item.category.lower(), item.topic.lower(), item.region.lower(), item.title.lower()]
+        tokens.extend(symbol.lower() for symbol in item.related_symbols)
+        return tokens
+
+    @staticmethod
+    def _get_first_available(row: Dict[str, Any], keys: List[str]) -> Any:
+        for key in keys:
+            value = row.get(key)
+            if value is not None and not pd.isna(value) and str(value).strip():
+                return value
+        return None
+
+
+class WebSearchService:
+    GOOGLE_NEWS_RSS = "https://news.google.com/rss/search"
+    DDG_HTML = "https://html.duckduckgo.com/html/"
+    BRAVE_WEB_SEARCH = "https://api.search.brave.com/res/v1/web/search"
+    SOURCE_ONLY_TITLES = {"财富号", "百家号", "搜狐号", "腾讯新闻", "网易号", "头条号", "雪球", "股吧"}
+
+    def __init__(self, config: Optional[Config] = None):
+        self.config = config or Config()
+        self.timeout = self.config.web_search_timeout
+        self.session = requests.Session()
+        self._response_cache = TTLCacheStore()
+        self.session.headers.update(
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                )
+            }
+        )
+
+    def search(self, query: str, limit: int = 8, language: str = "auto", market: str = "auto") -> List[WebSearchResult]:
+        return [WebSearchResult(**row) for row in self.search_report(query, limit, language, market)["results"]]
+
+    def search_report(self, query: str, limit: int = 8, language: str = "auto", market: str = "auto") -> dict:
+        if not self.config.web_search_enabled:
+            return {"results": [], "data_gaps": ["Public web search is disabled in configuration."]}
+        limit = min(8, max(1, limit))
+        english = market == "us" or language == "en-US" or (market == "auto" and not re.search(r"[\u4e00-\u9fff]", query))
+        cache_key = f"web_search:{query.strip().lower()}:{limit}:{english}"
+        cached = self._response_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        records, gaps = [], []
+        brave_key = getattr(self.config, "brave_search_api_key", None)
+        if brave_key:
+            try:
+                records.extend(self._search_brave(query, limit, english, market, brave_key))
+            except Exception as exc:
+                # Never persist provider response bodies: they may contain private
+                # request details. Keep only the exception class for diagnostics.
+                gaps.append(f"Brave Search unavailable ({type(exc).__name__}).")
+
+        if not records:
+            executor = ThreadPoolExecutor(max_workers=3)
+            futures = {}
+            if re.search(r"\bFCC\b", query, re.I):
+                futures[executor.submit(self._search_federal_register, query, limit)] = "Federal Register"
+            futures.update({
+                executor.submit(self._search_google_news, query, limit, english): "Google News RSS",
+                executor.submit(self._search_duckduckgo, query, limit): "DuckDuckGo",
+            })
+            try:
+                done, pending = wait(futures, timeout=min(20, self.timeout + 1))
+                for future in pending:
+                    future.cancel()
+                    gaps.append(f"{futures[future]} search timed out.")
+                for future in done:
+                    try:
+                        records.extend(future.result())
+                    except Exception as exc:
+                        gaps.append(f"{futures[future]} unavailable ({type(exc).__name__}).")
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+        if not any(row.provider != "google_news_rss" for row in records):
+            try:
+                records.extend(self._search_bing_rss(query, limit))
+            except Exception as exc:
+                gaps.append(f"Bing RSS unavailable ({type(exc).__name__}).")
+
+        deduped: List[WebSearchResult] = []
+        seen_urls: set[str] = set()
+        # Topic relevance comes before provider preference: an unrelated
+        # fallback result must not crowd out relevant aggregator results.
+        from api.relevance import web_result_is_relevant
+        records.sort(key=lambda row: (not web_result_is_relevant(row.model_dump(), query),
+                                      row.provider == "google_news_rss",
+                                      not (urlparse(row.url).hostname or "").endswith((".gov", ".edu"))))
+        for item in records:
+            normalized_url = item.url.strip()
+            if not normalized_url or normalized_url in seen_urls or self._is_source_only_title(item.title):
+                continue
+            seen_urls.add(normalized_url)
+            deduped.append(item)
+        result = {"results": [row.model_dump() for row in deduped[:limit]], "data_gaps": gaps}
+        if not records:
+            result["data_gaps"].append("No usable search results returned; absence of results is not evidence of absence.")
+        self._response_cache.set(cache_key, result, 120 if records else 30)
+        return result
+
+    def _search_brave(self, query: str, limit: int, english: bool, market: str, api_key: str) -> List[WebSearchResult]:
+        """Use Brave's authenticated web endpoint when a server-side key is configured."""
+        country = {"us": "US", "cn": "CN", "sz": "CN", "sh": "CN", "hk": "HK"}.get(market, "US" if english else "CN")
+        search_lang = "en" if english else "zh-hans"
+        response = self.session.get(
+            self.BRAVE_WEB_SEARCH,
+            params={"q": query, "count": min(20, max(1, limit)), "country": country,
+                    "search_lang": search_lang, "ui_lang": "en-US" if english else "zh-CN"},
+            headers={"Accept": "application/json", "Accept-Encoding": "gzip",
+                     "X-Subscription-Token": api_key},
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        web_results = payload.get("web", {}).get("results", []) if isinstance(payload, dict) else []
+        results = []
+        for row in web_results:
+            if not isinstance(row, dict):
+                continue
+            title = str(row.get("title") or "").strip()
+            url = str(row.get("url") or "").strip()
+            if not title or urlparse(url).scheme not in {"https", "http"}:
+                continue
+            snippet = str(row.get("description") or title).strip()
+            extra = row.get("extra_snippets")
+            if isinstance(extra, list):
+                snippet = " ".join([snippet, *(str(value).strip() for value in extra if value)])
+            digest = hashlib.sha256(f"{query}\n{url}".encode("utf-8")).hexdigest()[:20]
+            results.append(WebSearchResult(
+                id=f"brave:{digest}", title=title, snippet=snippet[:1200], url=url,
+                source=self._domain_from_url(url), published_at=None,
+                provider="brave_search", query=query,
+            ))
+        return results
+
+    def _search_google_news(self, query: str, limit: int, english: bool = False) -> List[WebSearchResult]:
+        params = {
+            "q": query,
+            "hl": "en-US" if english else "zh-CN",
+            "gl": "US" if english else "CN",
+            "ceid": "US:en" if english else "CN:zh-Hans",
+        }
+        try:
+            response = self.session.get(self.GOOGLE_NEWS_RSS, params=params, timeout=self.timeout)
+            response.raise_for_status()
+            root = ElementTree.fromstring(response.text)
+        except Exception:
+            raise
+
+        results: List[WebSearchResult] = []
+        for item in root.findall("./channel/item")[:limit]:
+            title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            pub_date = (item.findtext("pubDate") or "").strip() or None
+            source = (item.findtext("source") or "Google News").strip()
+            description = self._strip_html(item.findtext("description") or "")
+            if not title or not link:
+                continue
+            results.append(
+                WebSearchResult(
+                    id=f"gnews:{query}:{link}",
+                    title=title,
+                    snippet=description[:280] or title,
+                    url=link,
+                    source=source,
+                    published_at=pub_date,
+                    provider="google_news_rss",
+                    query=query,
+                )
+            )
+        return results
+
+    def _search_duckduckgo(self, query: str, limit: int) -> List[WebSearchResult]:
+        try:
+            response = self.session.get(self.DDG_HTML, params={"q": query}, timeout=self.timeout)
+            response.raise_for_status()
+        except Exception:
+            raise
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        if soup.select_one("#challenge-form, form[action*='anomaly']"):
+            raise ValueError("Search provider requires an interactive challenge.")
+        results: List[WebSearchResult] = []
+        for node in soup.select(".result")[: limit * 2]:
+            title_node = node.select_one(".result__title a")
+            snippet_node = node.select_one(".result__snippet")
+            if title_node is None:
+                continue
+            title = title_node.get_text(" ", strip=True)
+            href = (title_node.get("href") or "").strip()
+            href = urljoin(self.DDG_HTML, href)
+            href = parse_qs(urlparse(href).query).get("uddg", [href])[0]
+            if urlparse(href).scheme not in {"https", "http"}:
+                continue
+            snippet = snippet_node.get_text(" ", strip=True) if snippet_node else title
+            if not title or not href:
+                continue
+            source = self._domain_from_url(href)
+            results.append(
+                WebSearchResult(
+                    id=f"ddg:{query}:{href}",
+                    title=title,
+                    snippet=snippet[:280],
+                    url=href,
+                    source=source,
+                    published_at=None,
+                    provider="duckduckgo_html",
+                    query=query,
+                )
+            )
+            if len(results) >= limit:
+                break
+        return results
+
+    def _search_bing_rss(self, query: str, limit: int) -> List[WebSearchResult]:
+        response = self.session.get("https://www.bing.com/search", params={"q": query, "format": "rss"}, timeout=self.timeout)
+        response.raise_for_status()
+        root = ElementTree.fromstring(response.text)
+        return [WebSearchResult(id=f"bing:{item.findtext('link')}", title=item.findtext("title") or "",
+            snippet=(item.findtext("description") or "")[:500], url=item.findtext("link") or "",
+            source=self._domain_from_url(item.findtext("link") or ""), published_at=None,
+            provider="bing_rss", query=query) for item in root.findall("./channel/item")[:limit] if item.findtext("link")]
+
+    def _search_federal_register(self, query: str, limit: int) -> List[WebSearchResult]:
+        # Official public discovery is more dependable than scraped search for
+        # FCC rules. Returned document type is not a legal-status inference.
+        labs = bool(re.search(r"lab|testing|certification|实验室|认证", query, re.I))
+        term = '"telecommunications certification bodies"' if labs else re.sub(r"\bFCC\b|site:\S+", "", query, flags=re.I).strip()
+        response = self.session.get("https://www.federalregister.gov/api/v1/documents.json", params={
+            "conditions[term]": term, "conditions[agencies][]": "federal-communications-commission",
+            "order": "newest", "per_page": 15 if labs else limit}, timeout=self.timeout)
+        response.raise_for_status()
+        rows = response.json().get("results", [])
+        if labs:
+            rows = [row for row in rows if re.search(r"certification bodies|test(?:ing)? (?:labs|laboratories)|measurement facilities", row.get("title", ""), re.I)]
+        return [WebSearchResult(id=f"fr:{row['document_number']}", title=row["title"],
+            snippet=(f"Document type: {row.get('type', 'unknown')}. Publication: {row.get('publication_date', 'unknown')}. " + (row.get("abstract") or ""))[:1200],
+            url=row["html_url"], source="Federal Register / FCC", published_at=row.get("publication_date"),
+            provider="federal_register", query=query) for row in rows[:limit] if row.get("html_url")]
+
+    @staticmethod
+    def _strip_html(value: str) -> str:
+        return BeautifulSoup(value, "html.parser").get_text(" ", strip=True)
+
+    @staticmethod
+    def _is_source_only_title(title: str) -> bool:
+        normalized = re.sub(r"\s+", "", title or "")
+        return normalized in WebSearchService.SOURCE_ONLY_TITLES
+
+    @staticmethod
+    def _domain_from_url(value: str) -> str:
+        try:
+            return urlparse(value).netloc or "web"
+        except Exception:
+            return "web"
+
+
+_HOTSPOTS_CACHE: Optional[List[HotspotItem]] = None
+_HOTSPOTS_CACHE_TIME: float = 0
+_HOTSPOTS_CACHE_TTL_SEC = 45
+_HK_RANK_DISABLED_UNTIL: float = 0.0
+_HK_RANK_COOLDOWN_SEC = 600  # 10 min after a connection failure
+
+
+class HotspotService:
+    def __init__(self, config: Optional[Config] = None, news_service: Optional[NewsService] = None):
+        self.config = config or Config()
+        self.state_store = MonitorStateStore(self.config.monitor_db_path)
+        self.hk_tracker = HkHotRankTracker()
+        self.news_service = news_service or NewsService(self.config)
+        self._response_cache = TTLCacheStore()
+
+    def _fetch_hk_rankings_with_timeout(self, timeout_sec: float = 4.0) -> List[Dict[str, Any]]:
+        global _HK_RANK_DISABLED_UNTIL
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            fut = executor.submit(self.hk_tracker.fetch_hot_rankings)
+            return fut.result(timeout=timeout_sec)[:10]
+        except (FuturesTimeout, Exception):
+            _HK_RANK_DISABLED_UNTIL = time.monotonic() + _HK_RANK_COOLDOWN_SEC
+            return []
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def _build_sector_map(self) -> Dict[str, Dict[str, Any]]:
+        stock_pool = load_stock_pool(self.config.stock_pool_path)
+        stock_topics = load_stock_topics(self.config.stock_topics_path)
+        sectors: Dict[str, Dict[str, Any]] = {}
+
+        for sector_name, template in HOTSPOT_SECTOR_TEMPLATES.items():
+            sector = sectors.setdefault(
+                sector_name,
+                {
+                    "keywords": {sector_name.lower()},
+                    "stock_codes": set(),
+                    "stock_names": set(),
+                    "stocks": [],
+                },
+            )
+            sector["keywords"].update(alias.lower() for alias in template.get("aliases", []))
+            for stock_name, info in stock_searcher.base_stock_db.items():
+                category = str(info.get("category") or "").strip()
+                if category not in template.get("categories", []):
+                    continue
+                stock_code = normalize_stock_code(str(info.get("code") or ""))
+                if not stock_code:
+                    continue
+                sector["keywords"].add(stock_name.lower())
+                sector["keywords"].add(stock_code.lower())
+                sector["stock_names"].add(stock_name.lower())
+                sector["stock_codes"].add(stock_code.lower())
+                sector["stocks"].append(
+                    HotspotRelatedStock(
+                        stock_name=stock_name,
+                        stock_code=stock_code,
+                        reason=f"属于 {sector_name} 代表股",
+                    )
+                )
+
+        for stock_name, keywords in stock_topics.items():
+            stock_code = stock_pool.get(stock_name, normalize_stock_code(stock_name))
+            for keyword in keywords:
+                sector_name = self._canonical_hotspot_name(str(keyword).strip())
+                if not sector_name:
+                    continue
+                sector = sectors.setdefault(
+                    sector_name,
+                    {
+                        "keywords": {sector_name.lower()},
+                        "stock_codes": set(),
+                        "stock_names": set(),
+                        "stocks": [],
+                    },
+                )
+                sector["keywords"].add(stock_name.lower())
+                sector["keywords"].add(stock_code.lower())
+                sector["stock_names"].add(stock_name.lower())
+                sector["stock_codes"].add(stock_code.lower())
+                sector["stocks"].append(
+                    HotspotRelatedStock(
+                        stock_name=stock_name,
+                        stock_code=stock_code,
+                        reason=f"属于 {sector_name} 板块配置",
+                    )
+                )
+
+        return sectors
+
+    @staticmethod
+    def _stock_belongs_to_sector(stock: HotspotRelatedStock, sector: Dict[str, Any]) -> bool:
+        code = normalize_stock_code(stock.stock_code).lower()
+        name = stock.stock_name.lower().strip()
+        if code and code in sector.get("stock_codes", set()):
+            return True
+        if name and name in sector.get("stock_names", set()):
+            return True
+        return False
+
+    def _filter_related_stocks_for_sector(
+        self,
+        stocks: List[HotspotRelatedStock],
+        sector: Dict[str, Any],
+        limit: int = 5,
+    ) -> List[HotspotRelatedStock]:
+        filtered = [stock for stock in stocks if self._stock_belongs_to_sector(stock, sector)]
+        if len(filtered) < limit:
+            known_codes = {normalize_stock_code(stock.stock_code).lower() for stock in filtered}
+            known_names = {self._canonical_stock_name(stock.stock_name) for stock in filtered if stock.stock_name}
+            for stock in sector.get("stocks", []):
+                code = normalize_stock_code(stock.stock_code).lower()
+                name = self._canonical_stock_name(stock.stock_name)
+                if code and code not in known_codes and (not name or name not in known_names):
+                    filtered.append(stock)
+                    known_codes.add(code)
+                    if name:
+                        known_names.add(name)
+                if len(filtered) >= limit:
+                    break
+        return self._dedupe_related_stocks(filtered, limit=limit)
+
+    @staticmethod
+    def _canonical_hotspot_name(name: str) -> str:
+        lowered = name.strip().lower()
+        if not lowered:
+            return ""
+        mapped = HOTSPOT_TOPIC_ALIASES.get(lowered)
+        if mapped:
+            return mapped
+        return name.strip()
+
+    @staticmethod
+    def _canonical_stock_name(value: str) -> str:
+        name = value.strip()
+        return STOCK_NAME_ALIASES.get(name, name).lower()
+
+    @staticmethod
+    def _dedupe_related_stocks(stocks: List[HotspotRelatedStock], limit: int = 5) -> List[HotspotRelatedStock]:
+        deduped: List[HotspotRelatedStock] = []
+        seen_codes = set()
+        seen_names = set()
+        for stock in stocks:
+            stock_code = normalize_stock_code(stock.stock_code).lower()
+            stock_name = HotspotService._canonical_stock_name(stock.stock_name)
+            if not stock_code or stock_code in seen_codes or (stock_name and stock_name in seen_names):
+                continue
+            deduped.append(stock)
+            seen_codes.add(stock_code)
+            if stock_name:
+                seen_names.add(stock_name)
+            if len(deduped) >= limit:
+                break
+        return deduped
+
+    @staticmethod
+    def _sector_keywords_match(keywords: set[str], *values: str) -> bool:
+        haystack = " ".join(value.lower() for value in values if value).strip()
+        if not haystack:
+            return False
+        return any(keyword in haystack for keyword in keywords)
+
+    def list_hotspots(self, limit: int = 10) -> List[HotspotItem]:
+        global _HOTSPOTS_CACHE, _HOTSPOTS_CACHE_TIME
+        now = time.monotonic()
+        if _HOTSPOTS_CACHE is not None and (now - _HOTSPOTS_CACHE_TIME) < _HOTSPOTS_CACHE_TTL_SEC:
+            return _HOTSPOTS_CACHE[:limit]
+
+        sectors = self._build_sector_map()
+        alerts = self.state_store.get_recent_alerts(limit=100)
+
+        topic_counter: Counter[str] = Counter()
+        topic_stocks: Dict[str, List[HotspotRelatedStock]] = defaultdict(list)
+        topic_reasons: Dict[str, List[str]] = defaultdict(list)
+        topic_breakdowns: Dict[str, Dict[str, float]] = defaultdict(
+            lambda: {
+                "trading_activity": 0.0,
+                "discussion_heat": 0.0,
+                "news_heat": 0.0,
+                "alert_count": 0.0,
+                "rank_hits": 0.0,
+            }
+        )
+
+        for alert in alerts:
+            title = alert.get("title", "")
+            summary = alert.get("summary", "")
+            stock_name = alert.get("stock_name", "")
+            stock_code = alert.get("stock_code", "")
+            priority = max(1, int(alert.get("priority", 1)))
+            event_type = str(alert.get("event_type") or "")
+            for sector_name, sector in sectors.items():
+                if not self._sector_keywords_match(sector["keywords"], title, summary, stock_name, stock_code):
+                    continue
+                breakdown = topic_breakdowns[sector_name]
+                breakdown["alert_count"] += 1
+                if event_type == "fund_flow" or any(token in title + summary for token in ["资金流", "净流入", "净流出", "放量", "成交"]):
+                    breakdown["trading_activity"] += priority * 1.8
+                    breakdown["discussion_heat"] += priority * 0.35
+                else:
+                    breakdown["discussion_heat"] += priority
+                    breakdown["news_heat"] += priority * 0.7
+                topic_counter[sector_name] = self._hotspot_total_score(breakdown)
+                topic_reasons[sector_name].append(title or summary)
+                topic_stocks[sector_name].append(
+                    HotspotRelatedStock(
+                        stock_name=stock_name,
+                        stock_code=stock_code,
+                        reason=f"最近消息触发: {title[:24]}",
+                    )
+                )
+
+        for global_news in self.news_service.get_global_news(limit=20):
+            for sector_name, sector in sectors.items():
+                if not self._sector_keywords_match(
+                    sector["keywords"],
+                    global_news.title,
+                    global_news.summary,
+                    global_news.topic,
+                    " ".join(global_news.related_symbols),
+                ):
+                    continue
+                impact = max(2, global_news.impact_level)
+                breakdown = topic_breakdowns[sector_name]
+                breakdown["discussion_heat"] += impact
+                breakdown["news_heat"] += impact * 1.2
+                topic_counter[sector_name] = self._hotspot_total_score(breakdown)
+                topic_reasons[sector_name].append(global_news.title)
+                topic_stocks[sector_name].extend(sector["stocks"][:2])
+
+        now_ts = time.monotonic()
+        if now_ts >= _HK_RANK_DISABLED_UNTIL:
+            for rank in self._fetch_hk_rankings_with_timeout():
+                rank_name = str(rank.get("stock_name") or "")
+                rank_code = str(rank.get("stock_code") or "")
+                for sector_name, sector in sectors.items():
+                    if not self._sector_keywords_match(sector["keywords"], rank_name, rank_code):
+                        continue
+                    rank_value = _safe_float(rank.get("rank")) or 50
+                    trading_boost = max(1.0, 6.0 - min(rank_value, 50.0) / 10.0)
+                    breakdown = topic_breakdowns[sector_name]
+                    breakdown["trading_activity"] += trading_boost
+                    breakdown["discussion_heat"] += 1
+                    breakdown["rank_hits"] += 1
+                    topic_counter[sector_name] = self._hotspot_total_score(breakdown)
+                    topic_reasons[sector_name].append(f"热度排名 {rank.get('rank', '未知')}")
+                    topic_stocks[sector_name].append(
+                        HotspotRelatedStock(
+                            stock_name=rank_name or rank_code,
+                            stock_code=rank_code,
+                            reason=f"热度排名 {rank.get('rank', '未知')}",
+                        )
+                    )
+
+        items: List[HotspotItem] = []
+        build_limit = max(limit, 50)
+        for topic_name, score in topic_counter.most_common(build_limit):
+            sector = sectors.get(topic_name)
+            if sector:
+                related_stocks = self._filter_related_stocks_for_sector(topic_stocks[topic_name], sector, limit=5)
+            else:
+                related_stocks = self._dedupe_related_stocks(topic_stocks[topic_name], limit=5)
+            if not related_stocks or score <= 0:
+                continue
+            top_reason = next((item for item in topic_reasons[topic_name] if item), f"{topic_name} 相关消息密度提升")
+            breakdown = topic_breakdowns[topic_name]
+            heat_breakdown = self._build_hotspot_breakdown(breakdown, topic_reasons[topic_name])
+            items.append(
+                HotspotItem(
+                    topic_name=topic_name,
+                    heat_score=float(score),
+                    reason=(
+                        f"{top_reason[:40]}，综合热度 {int(score)}"
+                        f"（交易 {breakdown['trading_activity']:.1f} / 讨论 {breakdown['discussion_heat']:.1f}）"
+                    ),
+                    related_stocks=related_stocks,
+                    trend_direction="up" if score >= 8 else "flat",
+                    ai_summary=self._build_hotspot_summary(topic_name, heat_breakdown),
+                    source="sector_config+monitor+news+hk_rank",
+                    heat_breakdown=heat_breakdown,
+                )
+            )
+        _HOTSPOTS_CACHE = items
+        _HOTSPOTS_CACHE_TIME = time.monotonic()
+        return items[: min(limit, len(items))]
+
+    @staticmethod
+    def _hotspot_total_score(breakdown: Dict[str, float]) -> float:
+        return round(
+            breakdown["trading_activity"] * 1.2
+            + breakdown["discussion_heat"]
+            + breakdown["news_heat"] * 0.8
+            + breakdown["rank_hits"] * 1.5,
+            1,
+        )
+
+    @staticmethod
+    def _build_hotspot_breakdown(
+        breakdown: Dict[str, float],
+        reasons: List[str],
+    ) -> HotspotHeatBreakdown:
+        reason_text = " ".join(reasons)
+        risk_tokens = ["减持", "净流出", "下跌", "监管", "处罚", "风险", "亏损", "警惕", "退市", "利空"]
+        has_risk_signal = any(token in reason_text for token in risk_tokens)
+        trading_activity = round(breakdown["trading_activity"], 1)
+        discussion_heat = round(breakdown["discussion_heat"], 1)
+        news_heat = round(breakdown["news_heat"], 1)
+        if has_risk_signal and (trading_activity >= 3 or discussion_heat >= 4):
+            attention_level = "caution"
+        elif trading_activity >= 4 and discussion_heat >= 4:
+            attention_level = "focus"
+        else:
+            attention_level = "watch"
+
+        basis: List[str] = []
+        if trading_activity:
+            basis.append("资金流/热榜/成交异动贡献交易活跃度")
+        if discussion_heat:
+            basis.append("新闻命中、主题词和热榜共同贡献讨论度")
+        if news_heat:
+            basis.append("高影响消息贡献催化强度")
+        if has_risk_signal:
+            basis.append("存在净流出、减持、监管或业绩风险词，需提高警惕")
+
+        return HotspotHeatBreakdown(
+            trading_activity=trading_activity,
+            discussion_heat=discussion_heat,
+            news_heat=news_heat,
+            alert_count=int(breakdown["alert_count"]),
+            rank_hits=int(breakdown["rank_hits"]),
+            attention_level=attention_level,
+            basis=basis[:4],
+        )
+
+    @staticmethod
+    def _build_hotspot_summary(topic_name: str, breakdown: HotspotHeatBreakdown) -> str:
+        level_text = {
+            "focus": "交易活跃和讨论度同时靠前，属于当前优先跟踪方向",
+            "caution": "热度较高但伴随风险信号，适合先警惕再确认",
+            "watch": "有消息或讨论触发，暂以观察和验证持续性为主",
+        }[breakdown.attention_level]
+        return (
+            f"{topic_name}：{level_text}。"
+            f"交易活跃 {breakdown.trading_activity:.1f}，讨论热度 {breakdown.discussion_heat:.1f}，"
+            f"消息催化 {breakdown.news_heat:.1f}。"
+        )
+
+    def get_hotspot_detail(self, topic_name: str) -> HotspotDetailResponse:
+        cache_key = f"hotspot_detail:{topic_name}"
+        cached = self._response_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        topic = next((item for item in self.list_hotspots(limit=50) if item.topic_name == topic_name), None)
+        if topic is None:
+            raise ValueError(f"Unknown hotspot topic: {topic_name}")
+
+        sectors = self._build_sector_map()
+        sector = sectors.get(topic_name, {"keywords": {topic_name.lower()}})
+        alerts = self.state_store.get_recent_alerts(limit=200)
+        related_codes = {stock.stock_code for stock in topic.related_stocks}
+        related_names = {stock.stock_name.lower() for stock in topic.related_stocks}
+        related_news: List[NewsItem] = []
+        history_bucket: Dict[str, Dict[str, float]] = defaultdict(lambda: {"score": 0.0, "count": 0})
+
+        for alert in alerts:
+            title = alert.get("title", "")
+            summary = alert.get("summary", "")
+            stock_code = alert.get("stock_code", "")
+            stock_name = alert.get("stock_name", "")
+            occurred_at = str(alert.get("occurred_at", ""))
+            day = occurred_at[:10] if occurred_at else "unknown"
+            matches_topic = (
+                stock_code in related_codes
+                or stock_name.lower() in related_names
+                or self._sector_keywords_match(sector["keywords"], title, summary, stock_name, stock_code)
+            )
+            if not matches_topic:
+                continue
+
+            related_news.append(
+                NewsItem(
+                    id=alert["dedupe_key"],
+                    stock_code=stock_code,
+                    stock_name=stock_name,
+                    source=alert.get("source") or "monitor",
+                    published_at=occurred_at,
+                    title=title,
+                    summary=summary,
+                    relation_type=alert.get("raw_payload", {}).get("relation_type", "sector"),
+                    sentiment=_sentiment_from_summary(summary),
+                    impact_level=int(alert.get("priority", 1)),
+                    ai_takeaway=summary,
+                    url=alert.get("raw_payload", {}).get("url"),
+                    raw_payload=alert.get("raw_payload", {}),
+                )
+            )
+            history_bucket[day]["score"] += float(alert.get("priority", 1))
+            history_bucket[day]["count"] += 1
+
+        history = [
+            HotspotHistoryPoint(date=day, score=value["score"], count=int(value["count"]))
+            for day, value in sorted(history_bucket.items(), key=lambda item: item[0], reverse=True)[:7]
+        ]
+
+        response = HotspotDetailResponse(
+            topic=topic,
+            related_news=related_news[:10],
+            history=list(reversed(history)),
+        )
+        self._response_cache.set(cache_key, response, 120)
+        return response
+
+
+class MarketService:
+    def __init__(self, stock_service: StockAnalysisService):
+        self.stock_service = stock_service
+        self._response_cache = TTLCacheStore()
+        self._refresh_lock = Lock()
+        self._refreshing: set[str] = set()
+        self._last_responses: Dict[str, MarketRegimeResponse] = {}
+
+    def _build_index_snapshot(self, stock_code: str, stock_name: str) -> Optional[MarketIndexSnapshot]:
+        try:
+            analysis = self.stock_service.get_stock_analysis(stock_code, include_ai=False)
+        except Exception:
+            return None
+        current_price = analysis.quote.current_price
+        ma20 = analysis.technical_indicators.get("MA20")
+        ma60 = analysis.technical_indicators.get("MA60")
+        if current_price <= 0 or ma20 is None or ma60 is None:
+            return None
+        return MarketIndexSnapshot(
+            stock_code=analysis.stock_code,
+            stock_name=stock_name,
+            current_price=current_price,
+            change_pct=analysis.quote.change_pct,
+            above_ma20=bool(ma20 and current_price >= ma20),
+            above_ma60=bool(ma60 and current_price >= ma60),
+            trend_score=self._score_index_trend(
+                current_price=current_price,
+                change_pct=analysis.quote.change_pct,
+                ma20=ma20,
+                ma60=ma60,
+            ),
+            currency=str(analysis.metadata.get("currency") or ("USD" if analysis.market == "us" else "HKD" if analysis.market == "hk" else "CNY")),
+            data_as_of=analysis.metadata.get("data_as_of") or (str(analysis.chart_series[-1].get("date")) if analysis.chart_series else None),
+            provider=analysis.metadata.get("source"),
+            is_proxy=stock_code in {"US.SPY", "US.QQQ", "US.DIA"},
+        )
+
+    def _compute_market_regime(self, market: str = "a_share") -> MarketRegimeResponse:
+        snapshots: List[MarketIndexSnapshot] = []
+        gaps = []
+        for stock_code, stock_name in MARKET_REGIME_UNIVERSES[market]:
+            snapshot = self._build_index_snapshot(stock_code, stock_name)
+            if snapshot is not None:
+                snapshots.append(snapshot)
+            else:
+                gaps.append(f"Source data unavailable for {stock_code}.")
+
+        if not snapshots:
+            return self._build_market_regime_fallback(market).model_copy(update={"is_loading": False, "status": "unavailable", "data_gaps": gaps, "summary": "数据不可用，无法判断市场状态。"})
+
+        average_trend = sum(item.trend_score for item in snapshots) / len(snapshots)
+        above_ma20_ratio = sum(1 for item in snapshots if item.above_ma20) / len(snapshots)
+        above_ma60_ratio = sum(1 for item in snapshots if item.above_ma60) / len(snapshots)
+        positive_ratio = sum(1 for item in snapshots if item.change_pct >= 0) / len(snapshots)
+        score = average_trend
+        score += (above_ma20_ratio - 0.5) * 14
+        score += (above_ma60_ratio - 0.5) * 18
+        score += (positive_ratio - 0.5) * 10
+        score = round(max(0, min(score, 100)), 1)
+
+        if score >= 67:
+            regime = "risk_on"
+            action_bias = "允许跟随主线做多，优先做强趋势与热点核心。"
+            position_guidance = "建议总仓 50%-70%，单票初始仓位控制在 10%-15%。"
+            summary = "大盘处于偏进攻环境，可以做主线强势股，但仍需纪律止损。"
+        elif score <= 40:
+            regime = "risk_off"
+            action_bias = "市场偏防守，减少追高，优先控仓和处理弱势持仓。"
+            position_guidance = "建议总仓 0%-30%，新开仓尽量暂停，保留观察仓。"
+            summary = "大盘风险偏高，策略以防守和观察为主。"
+        else:
+            regime = "neutral"
+            action_bias = "市场仍在分歧中，只轻仓试错最强主题。"
+            position_guidance = "建议总仓 20%-40%，单票不超过 10%。"
+            summary = "大盘处于震荡环境，只有最强板块和最强个股值得出手。"
+
+        response = MarketRegimeResponse(
+            regime=regime,
+            score=score,
+            action_bias=action_bias,
+            position_guidance=position_guidance,
+            summary=summary,
+            notes=self._build_market_notes(snapshots, regime),
+            indices=snapshots,
+            updated_at=_now_utc(),
+            market=market,
+            status="partial" if gaps else "ready",
+            data_gaps=gaps,
+        )
+        return response
+
+    def _start_background_refresh(self, market: str = "a_share") -> None:
+        with self._refresh_lock:
+            if market in self._refreshing:
+                return
+            self._refreshing.add(market)
+
+        def refresh() -> None:
+            try:
+                response = self._compute_market_regime(market)
+            except Exception:
+                response = self._build_market_regime_fallback(market).model_copy(update={"is_loading": False, "status": "unavailable", "data_gaps": ["Market provider retrieval failed."]})
+            try:
+                self._last_responses[market] = response
+                self._response_cache.set(f"market_regime:{market}", response, 120)
+            finally:
+                with self._refresh_lock:
+                    self._refreshing.discard(market)
+
+        Thread(target=refresh, name=f"market-regime-refresh-{market}", daemon=True).start()
+
+    @staticmethod
+    def _build_market_regime_fallback(market: str = "a_share") -> MarketRegimeResponse:
+        return MarketRegimeResponse(
+            regime="neutral",
+            is_loading=True,
+            score=50,
+            action_bias="指数数据正在加载，请稍候。",
+            position_guidance="",
+            summary="市场状态正在加载中，请稍候。",
+            notes=[],
+            indices=[],
+            updated_at=_now_utc(),
+            market=market,
+            status="loading",
+        )
+
+    def get_market_regime(self, market: str = "a_share") -> MarketRegimeResponse:
+        cache_key = f"market_regime:{market}"
+        cached = self._response_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        self._start_background_refresh(market)
+        previous = self._last_responses.get(market)
+        if previous is not None:
+            return previous
+        return self._build_market_regime_fallback(market)
+
+    @staticmethod
+    def _score_index_trend(
+        *,
+        current_price: float,
+        change_pct: float,
+        ma20: float,
+        ma60: float,
+    ) -> float:
+        score = 50.0
+        score += max(-15, min(change_pct * 3, 15))
+        score += 12 if current_price >= ma20 else -10
+        score += 18 if current_price >= ma60 else -16
+        score += 8 if ma20 >= ma60 else -6
+        return round(max(0, min(score, 100)), 1)
+
+    @staticmethod
+    def _build_market_notes(snapshots: List[MarketIndexSnapshot], regime: str) -> List[str]:
+        notes: List[str] = []
+        above_ma20_count = sum(1 for item in snapshots if item.above_ma20)
+        above_ma60_count = sum(1 for item in snapshots if item.above_ma60)
+        if above_ma20_count >= max(2, len(snapshots) - 1):
+            notes.append("主要指数大多站上 MA20，短线情绪仍有承接。")
+        else:
+            notes.append("主要指数多数仍在 MA20 下方，短线追涨要谨慎。")
+        if above_ma60_count >= max(2, len(snapshots) - 1):
+            notes.append("中期趋势仍保持稳定，可优先看强趋势主线。")
+        else:
+            notes.append("中期趋势并不牢靠，更适合轻仓试错或防守。")
+        if regime == "risk_on":
+            notes.append("可以优先跟踪热点龙头和突破结构。")
+        elif regime == "risk_off":
+            notes.append("弱势环境下先处理失效持仓，再考虑新机会。")
+        else:
+            notes.append("震荡市里只保留最强主题，不宜同时铺太多仓位。")
+        return notes[:3]
+
+
+class PortfolioStore:
+    def __init__(self, db_path: Optional[str] = None):
+        self.db_path = Path(db_path or PROJECT_ROOT / "data" / "portfolio.db")
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.db_path)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def _init_db(self) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS portfolio_positions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    stock_code TEXT NOT NULL,
+                    stock_name TEXT NOT NULL,
+                    cost_price REAL NOT NULL,
+                    quantity REAL NOT NULL,
+                    weight_pct REAL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+
+    def list_positions(self) -> List[PortfolioPosition]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, stock_code, stock_name, cost_price, quantity, weight_pct, created_at, updated_at
+                FROM portfolio_positions
+                ORDER BY updated_at DESC, id DESC
+                """
+            ).fetchall()
+        return [PortfolioPosition(**dict(row)) for row in rows]
+
+    def create_position(self, position: PortfolioPosition) -> PortfolioPosition:
+        now = _now_utc().isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO portfolio_positions (
+                    stock_code, stock_name, cost_price, quantity, weight_pct, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    normalize_stock_code(position.stock_code),
+                    position.stock_name,
+                    position.cost_price,
+                    position.quantity,
+                    position.weight_pct,
+                    now,
+                    now,
+                ),
+            )
+            position_id = cursor.lastrowid
+        return PortfolioPosition(
+            id=position_id,
+            stock_code=normalize_stock_code(position.stock_code),
+            stock_name=position.stock_name,
+            cost_price=position.cost_price,
+            quantity=position.quantity,
+            weight_pct=position.weight_pct,
+            created_at=now,
+            updated_at=now,
+        )
+
+    def update_position(self, position_id: int, position: PortfolioPosition) -> PortfolioPosition:
+        now = _now_utc().isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE portfolio_positions
+                SET stock_code = ?, stock_name = ?, cost_price = ?, quantity = ?, weight_pct = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    normalize_stock_code(position.stock_code),
+                    position.stock_name,
+                    position.cost_price,
+                    position.quantity,
+                    position.weight_pct,
+                    now,
+                    position_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise NotFoundError(f"Portfolio position {position_id} not found")
+        return PortfolioPosition(
+            id=position_id,
+            stock_code=normalize_stock_code(position.stock_code),
+            stock_name=position.stock_name,
+            cost_price=position.cost_price,
+            quantity=position.quantity,
+            weight_pct=position.weight_pct,
+            updated_at=now,
+        )
+
+    def delete_position(self, position_id: int) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute("DELETE FROM portfolio_positions WHERE id = ?", (position_id,))
+            if cursor.rowcount == 0:
+                raise NotFoundError(f"Portfolio position {position_id} not found")
+
+
+class StrategyHoldingStore:
+    def __init__(self, db_path: Optional[str] = None):
+        self.db_path = Path(db_path or PROJECT_ROOT / "data" / "portfolio.db")
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.db_path)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def _init_db(self) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS strategy_holdings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    strategy_key TEXT NOT NULL,
+                    stock_code TEXT NOT NULL,
+                    stock_name TEXT NOT NULL,
+                    entry_price REAL NOT NULL,
+                    quantity REAL NOT NULL,
+                    entry_date TEXT,
+                    exit_price REAL,
+                    exit_date TEXT,
+                    notes TEXT,
+                    status TEXT NOT NULL DEFAULT 'holding',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(strategy_holdings)").fetchall()
+            }
+            if "exit_price" not in columns:
+                connection.execute("ALTER TABLE strategy_holdings ADD COLUMN exit_price REAL")
+            if "exit_date" not in columns:
+                connection.execute("ALTER TABLE strategy_holdings ADD COLUMN exit_date TEXT")
+            if "source_topic" not in columns:
+                connection.execute("ALTER TABLE strategy_holdings ADD COLUMN source_topic TEXT")
+            if "plan_reason" not in columns:
+                connection.execute("ALTER TABLE strategy_holdings ADD COLUMN plan_reason TEXT")
+            if "plan_entry_trigger" not in columns:
+                connection.execute("ALTER TABLE strategy_holdings ADD COLUMN plan_entry_trigger TEXT")
+            if "plan_entry_zone" not in columns:
+                connection.execute("ALTER TABLE strategy_holdings ADD COLUMN plan_entry_zone TEXT")
+            if "plan_stop_loss" not in columns:
+                connection.execute("ALTER TABLE strategy_holdings ADD COLUMN plan_stop_loss REAL")
+            if "plan_take_profit" not in columns:
+                connection.execute("ALTER TABLE strategy_holdings ADD COLUMN plan_take_profit REAL")
+            if "plan_max_position_pct" not in columns:
+                connection.execute("ALTER TABLE strategy_holdings ADD COLUMN plan_max_position_pct REAL")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS strategy_analysis_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+
+    def list_holdings(self) -> List[StrategyHolding]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    id, strategy_key, stock_code, stock_name, entry_price, quantity,
+                    entry_date, exit_price, exit_date, source_topic, plan_reason, plan_entry_trigger,
+                    plan_entry_zone, plan_stop_loss, plan_take_profit, plan_max_position_pct,
+                    notes, status, created_at, updated_at
+                FROM strategy_holdings
+                ORDER BY updated_at DESC, id DESC
+                """
+            ).fetchall()
+        return [StrategyHolding(**dict(row)) for row in rows]
+
+    def create_holding(self, holding: StrategyHolding) -> StrategyHolding:
+        now = _now_utc().isoformat()
+        entry_date = holding.entry_date or now[:10]
+        exit_price, exit_date = self._normalize_exit_fields(holding, now)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO strategy_holdings (
+                    strategy_key, stock_code, stock_name, entry_price, quantity,
+                    entry_date, exit_price, exit_date, source_topic, plan_reason, plan_entry_trigger,
+                    plan_entry_zone, plan_stop_loss, plan_take_profit, plan_max_position_pct,
+                    notes, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    holding.strategy_key,
+                    normalize_stock_code(holding.stock_code),
+                    holding.stock_name,
+                    holding.entry_price,
+                    holding.quantity,
+                    entry_date,
+                    exit_price,
+                    exit_date,
+                    holding.source_topic,
+                    holding.plan_reason,
+                    holding.plan_entry_trigger,
+                    holding.plan_entry_zone,
+                    holding.plan_stop_loss,
+                    holding.plan_take_profit,
+                    holding.plan_max_position_pct,
+                    holding.notes,
+                    holding.status,
+                    now,
+                    now,
+                ),
+            )
+            holding_id = cursor.lastrowid
+        return StrategyHolding(
+            id=holding_id,
+            strategy_key=holding.strategy_key,
+            stock_code=normalize_stock_code(holding.stock_code),
+            stock_name=holding.stock_name,
+            entry_price=holding.entry_price,
+            quantity=holding.quantity,
+            entry_date=entry_date,
+            exit_price=exit_price,
+            exit_date=exit_date,
+            source_topic=holding.source_topic,
+            plan_reason=holding.plan_reason,
+            plan_entry_trigger=holding.plan_entry_trigger,
+            plan_entry_zone=holding.plan_entry_zone,
+            plan_stop_loss=holding.plan_stop_loss,
+            plan_take_profit=holding.plan_take_profit,
+            plan_max_position_pct=holding.plan_max_position_pct,
+            notes=holding.notes,
+            status=holding.status,
+            created_at=now,
+            updated_at=now,
+        )
+
+    def update_holding(self, holding_id: int, holding: StrategyHolding) -> StrategyHolding:
+        now = _now_utc().isoformat()
+        entry_date = holding.entry_date or now[:10]
+        exit_price, exit_date = self._normalize_exit_fields(holding, now)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE strategy_holdings
+                SET strategy_key = ?, stock_code = ?, stock_name = ?, entry_price = ?,
+                    quantity = ?, entry_date = ?, exit_price = ?, exit_date = ?, source_topic = ?, plan_reason = ?,
+                    plan_entry_trigger = ?, plan_entry_zone = ?, plan_stop_loss = ?, plan_take_profit = ?,
+                    plan_max_position_pct = ?, notes = ?, status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    holding.strategy_key,
+                    normalize_stock_code(holding.stock_code),
+                    holding.stock_name,
+                    holding.entry_price,
+                    holding.quantity,
+                    entry_date,
+                    exit_price,
+                    exit_date,
+                    holding.source_topic,
+                    holding.plan_reason,
+                    holding.plan_entry_trigger,
+                    holding.plan_entry_zone,
+                    holding.plan_stop_loss,
+                    holding.plan_take_profit,
+                    holding.plan_max_position_pct,
+                    holding.notes,
+                    holding.status,
+                    now,
+                    holding_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise NotFoundError(f"Strategy holding {holding_id} not found")
+        return StrategyHolding(
+            id=holding_id,
+            strategy_key=holding.strategy_key,
+            stock_code=normalize_stock_code(holding.stock_code),
+            stock_name=holding.stock_name,
+            entry_price=holding.entry_price,
+            quantity=holding.quantity,
+            entry_date=entry_date,
+            exit_price=exit_price,
+            exit_date=exit_date,
+            source_topic=holding.source_topic,
+            plan_reason=holding.plan_reason,
+            plan_entry_trigger=holding.plan_entry_trigger,
+            plan_entry_zone=holding.plan_entry_zone,
+            plan_stop_loss=holding.plan_stop_loss,
+            plan_take_profit=holding.plan_take_profit,
+            plan_max_position_pct=holding.plan_max_position_pct,
+            notes=holding.notes,
+            status=holding.status,
+            updated_at=now,
+        )
+
+    def get_holding(self, holding_id: int) -> Optional[StrategyHolding]:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    id, strategy_key, stock_code, stock_name, entry_price, quantity,
+                    entry_date, exit_price, exit_date, source_topic, plan_reason, plan_entry_trigger,
+                    plan_entry_zone, plan_stop_loss, plan_take_profit, plan_max_position_pct,
+                    notes, status, created_at, updated_at
+                FROM strategy_holdings
+                WHERE id = ?
+                """,
+                (holding_id,),
+            ).fetchone()
+        return StrategyHolding(**dict(row)) if row else None
+
+    def delete_holding(self, holding_id: int) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute("DELETE FROM strategy_holdings WHERE id = ?", (holding_id,))
+            if cursor.rowcount == 0:
+                raise NotFoundError(f"Strategy holding {holding_id} not found")
+
+    def get_analysis_cache(self, cache_key: str) -> Optional[str]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM strategy_analysis_cache WHERE cache_key = ?",
+                (cache_key,),
+            ).fetchone()
+        return str(row["payload"]) if row else None
+
+    def set_analysis_cache(self, cache_key: str, payload: str) -> None:
+        now = _now_utc().isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO strategy_analysis_cache (cache_key, payload, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    payload = excluded.payload,
+                    updated_at = excluded.updated_at
+                """,
+                (cache_key, payload, now),
+            )
+
+    def clear_analysis_cache(self, cache_key: str) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM strategy_analysis_cache WHERE cache_key = ?", (cache_key,))
+
+    def _normalize_exit_fields(self, holding: StrategyHolding, now: str) -> Tuple[Optional[float], Optional[str]]:
+        if holding.status != "exited":
+            return None, None
+        exit_price = holding.exit_price if holding.exit_price is not None else holding.entry_price
+        exit_date = holding.exit_date or now[:10]
+        return exit_price, exit_date
+
+
+class PortfolioService:
+    def __init__(
+        self,
+        config: Optional[Config] = None,
+        store: Optional[PortfolioStore] = None,
+        analysis_service: Optional[StockAnalysisService] = None,
+    ):
+        self.config = config or Config()
+        self.store = store or PortfolioStore()
+        self.analysis_service = analysis_service or StockAnalysisService(self.config)
+
+    def list_positions(self) -> List[PortfolioPosition]:
+        return self.store.list_positions()
+
+    def create_position(self, position: PortfolioPosition) -> PortfolioPosition:
+        return self.store.create_position(position)
+
+    def update_position(self, position_id: int, position: PortfolioPosition) -> PortfolioPosition:
+        return self.store.update_position(position_id, position)
+
+    def delete_position(self, position_id: int) -> None:
+        self.store.delete_position(position_id)
+
+    def analyze_portfolio(self) -> PortfolioAnalysisResponse:
+        positions = self.store.list_positions()
+        if not positions:
+            return PortfolioAnalysisResponse(
+                total_cost=0,
+                total_market_value=0,
+                total_pnl=0,
+                total_pnl_pct=0,
+                concentration_risk="no_positions",
+                technical_risk="no_positions",
+                rebalance_suggestions=["当前没有持仓，可先从单股分析页添加股票后再查看组合建议。"],
+                positions=[],
+            )
+
+        analyses: List[PositionAnalysis] = []
+        total_cost = 0.0
+        total_market_value = 0.0
+        high_risk_count = 0
+        currencies: set[str] = set()
+
+        for position in positions:
+            stock_analysis = self.analysis_service.get_stock_analysis(position.stock_code, include_ai=False)
+            currency = stock_analysis.metadata.get("currency") or {"us": "USD", "hk": "HKD"}.get(infer_market(position.stock_code), "CNY")
+            currencies.add(currency)
+            current_price = stock_analysis.quote.current_price
+            market_value = current_price * position.quantity
+            cost = position.cost_price * position.quantity
+            pnl = market_value - cost
+            pnl_pct = (pnl / cost * 100) if cost else 0
+            score = stock_analysis.signal_summary.overall_score
+            risk_level = "low" if score >= 4 else "medium" if score >= 2 else "high"
+            if risk_level == "high":
+                high_risk_count += 1
+            suggestion = "继续持有观察" if score >= 3 else "建议降低仓位或设置更紧止损"
+            analyses.append(
+                PositionAnalysis(
+                    position=position,
+                    current_price=current_price,
+                    market_value=market_value,
+                    pnl=pnl,
+                    pnl_pct=pnl_pct,
+                    risk_level=risk_level,
+                    signal_summary=stock_analysis.signal_summary,
+                    suggestion=suggestion,
+                    currency=currency,
+                    data_as_of=stock_analysis.metadata.get("data_as_of"),
+                )
+            )
+            total_cost += cost
+            total_market_value += market_value
+
+        concentration_risk = "high" if len(positions) <= 2 else "medium" if len(positions) <= 5 else "low"
+        technical_risk = "high" if high_risk_count >= max(1, len(positions) // 2) else "medium"
+        total_pnl = total_market_value - total_cost
+        total_pnl_pct = (total_pnl / total_cost * 100) if total_cost else 0
+        suggestions = []
+        if concentration_risk == "high":
+            suggestions.append("组合集中度偏高，建议分散至 3 只以上标的。")
+        if technical_risk == "high":
+            suggestions.append("高风险信号持仓占比较高，建议优先复核止损位。")
+        if not suggestions:
+            suggestions.append("当前组合风险可控，建议继续跟踪消息和技术面变化。")
+
+        return PortfolioAnalysisResponse(
+            total_cost=total_cost if len(currencies) == 1 else 0,
+            total_market_value=total_market_value if len(currencies) == 1 else 0,
+            total_pnl=total_pnl if len(currencies) == 1 else 0,
+            total_pnl_pct=total_pnl_pct if len(currencies) == 1 else 0,
+            concentration_risk=concentration_risk,
+            technical_risk=technical_risk,
+            rebalance_suggestions=suggestions,
+            positions=analyses,
+            currency=next(iter(currencies)) if len(currencies) == 1 else None,
+            aggregation_available=len(currencies) == 1,
+            data_gaps=[] if len(currencies) == 1 else ["Mixed currencies: aggregate value, P&L and return are unavailable without dated FX rates. Zero total fields are placeholders, not portfolio values."],
+        )
+
+
+class StrategyService:
+    def __init__(
+        self,
+        stock_service: StockAnalysisService,
+        news_service: NewsService,
+        hotspot_service: HotspotService,
+        market_service: Optional[MarketService] = None,
+        store: Optional[StrategyHoldingStore] = None,
+        portfolio_store: Optional[PortfolioStore] = None,
+    ):
+        self.stock_service = stock_service
+        self.news_service = news_service
+        self.hotspot_service = hotspot_service
+        self.market_service = market_service or MarketService(stock_service)
+        self.store = store or StrategyHoldingStore()
+        self.portfolio_store = portfolio_store or PortfolioStore()
+        self.analysis_cache_key = "strategy_holdings"
+        self._analysis_cache_lock = Lock()
+
+    def screen_can_slim(
+        self,
+        scope: str = "hotspot",
+        topic: Optional[str] = None,
+        limit: int = 8,
+    ) -> StrategyScreenResponse:
+        normalized_scope = "market" if scope == "market" else "hotspot"
+        candidates = self._build_candidates(normalized_scope, topic)
+        scored = [
+            self._score_candidate_quick(candidate, normalized_scope, topic)
+            for candidate in candidates[: max(limit * 2, limit)]
+        ]
+
+        scored.sort(key=lambda item: item.score.total, reverse=True)
+        return StrategyScreenResponse(
+            strategy_key="can_slim",
+            scope=normalized_scope,
+            topic=topic,
+            generated_at=_now_utc(),
+            candidates=scored[:limit],
+        )
+
+    def _score_candidate_quick(self, candidate: Dict[str, str], scope: str, topic: Optional[str]) -> StrategyCandidate:
+        code = normalize_stock_code(candidate["code"])
+        name = candidate["name"]
+        info = stock_searcher.base_stock_db.get(name, {})
+        category = str(info.get("category") or "")
+        is_hotspot = scope == "hotspot"
+        is_a_share = is_a_share_individual_stock(code)
+        category_bonus = 8 if topic and (topic in category or category in HOTSPOT_SECTOR_TEMPLATES.get(topic, {}).get("categories", [])) else 0
+        market_bonus = 6 if is_a_share else 2
+        base = 62 + (12 if is_hotspot else 4) + category_bonus + market_bonus
+        total = round(max(45, min(base, 86)), 1)
+        score = StrategyScoreBreakdown(
+            c=round(total - 4, 1),
+            a=round(total - 2, 1),
+            n=round(total + (4 if is_hotspot else 0), 1),
+            s=round(total - 6, 1),
+            l=round(total, 1),
+            i=round(total - 3, 1),
+            m=round(total + (3 if is_hotspot else 0), 1),
+            total=total,
+        )
+        return StrategyCandidate(
+            strategy_key="can_slim",
+            stock_code=code,
+            stock_name=name,
+            market=infer_market(code),
+            score=score,
+            factor_notes={
+                "c": "快速模式暂不拉取行情，按热点强度与板块归属估算当前动量。",
+                "a": "快速模式不阻塞页面，成长性需进入单股分析后确认。",
+                "n": f"{'来自热点主题，具备题材催化。' if is_hotspot else '按全市场候选池快速筛选。'}",
+                "s": "成交量与供需结构需在单股页进一步核验。",
+                "l": "领先性使用本地股票池与热点归属做代理判断。",
+                "i": "机构关注度未实时拉取，避免外部源阻塞页面。",
+                "m": "市场状态使用独立 Market Regime 卡片判断。",
+            },
+            reasons=[
+                f"该股来自“{topic}”热点主题。" if topic else "来自全市场快速候选池。",
+                "快速筛选优先保证页面响应，适合作为观察清单入口。",
+            ],
+            risks=[
+                "尚未拉取实时行情和均线结构，不能直接作为买卖依据。",
+                "请进入单股分析页确认量价、趋势和消息催化。",
+            ],
+            source_scope=scope,
+            source_topic=topic,
+            metadata={"mode": "quick", "category": category, "symbol": extract_symbol(code)},
+        )
+
+    def list_holdings(self) -> List[StrategyHolding]:
+        return self.store.list_holdings()
+
+    def create_holding(self, holding: StrategyHolding) -> StrategyHolding:
+        created = self.store.create_holding(holding)
+        self._sync_portfolio_position_for_code(created.stock_code)
+        self._clear_holdings_analysis_cache()
+        return created
+
+    def update_holding(self, holding_id: int, holding: StrategyHolding) -> StrategyHolding:
+        previous = self.store.get_holding(holding_id)
+        updated = self.store.update_holding(holding_id, holding)
+        codes_to_sync = {updated.stock_code}
+        if previous:
+            codes_to_sync.add(previous.stock_code)
+        for code in codes_to_sync:
+            self._sync_portfolio_position_for_code(code)
+        self._clear_holdings_analysis_cache()
+        return updated
+
+    def delete_holding(self, holding_id: int) -> None:
+        previous = self.store.get_holding(holding_id)
+        self.store.delete_holding(holding_id)
+        if previous:
+            self._sync_portfolio_position_for_code(previous.stock_code)
+        self._clear_holdings_analysis_cache()
+
+    def analyze_holdings(self) -> StrategyHoldingAnalysisResponse:
+        holdings = self.store.list_holdings()
+        if not holdings:
+            return self._empty_holdings_analysis()
+
+        cached = self._read_cached_holdings_analysis(holdings)
+        if cached:
+            return cached
+        return self._build_snapshot_holdings_analysis(holdings)
+
+    def refresh_holdings(self) -> StrategyHoldingAnalysisResponse:
+        holdings = self.store.list_holdings()
+        previous = self._read_cached_holdings_analysis(holdings) if holdings else None
+        analysis = self._compute_holdings_analysis()
+        if previous:
+            analysis = self._merge_refresh_analysis_with_previous(analysis, previous)
+        self._write_cached_holdings_analysis(analysis)
+        return analysis
+
+    def _compute_holdings_analysis(self) -> StrategyHoldingAnalysisResponse:
+        holdings = self.store.list_holdings()
+        if not holdings:
+            analysis = self._empty_holdings_analysis()
+            self._write_cached_holdings_analysis(analysis)
+            return analysis
+
+        try:
+            market_regime = self.market_service.get_market_regime()
+        except Exception:
+            market_regime = MarketRegimeResponse(
+                regime="neutral",
+                score=50,
+                action_bias="市场数据暂不可用，按中性环境处理。",
+                position_guidance="建议轻仓试错。",
+                summary="市场环境数据暂不可用。",
+                notes=[],
+                indices=[],
+                updated_at=_now_utc(),
+            )
+
+        analyses: List[StrategyHoldingAnalysis] = []
+        max_workers = min(4, len(holdings))
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        try:
+            future_by_holding = [
+                (holding, executor.submit(self._analyze_single_holding, holding, market_regime))
+                for holding in holdings
+            ]
+            done, _ = wait([future for _, future in future_by_holding], timeout=18)
+            for holding, future in future_by_holding:
+                if future not in done:
+                    future.cancel()
+                    analyses.append(
+                        self._build_unavailable_holding_analysis(
+                            holding,
+                            market_regime,
+                            TimeoutError("单股策略分析超过 18 秒，已降级为持仓快照"),
+                        )
+                    )
+                    continue
+                try:
+                    analyses.append(future.result())
+                except Exception as exc:
+                    analyses.append(self._build_unavailable_holding_analysis(holding, market_regime, exc))
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+        total_cost = 0.0
+        total_market_value = 0.0
+        total_realized_pnl = 0.0
+        active_count = 0
+        watching_count = 0
+        planned_count = 0
+        weakening_count = 0
+        exited_count = 0
+        invalidated_count = 0
+        exited_win_count = 0
+        scored_count = 0
+        total_score = 0.0
+        for item in analyses:
+            cost = item.holding.entry_price * item.holding.quantity
+            if item.holding.status not in {"watching", "planned"}:
+                total_cost += cost
+                total_market_value += item.market_value
+                total_realized_pnl += item.realized_pnl
+            if self._has_reusable_holding_analysis(item):
+                total_score += item.strategy_score.total
+                scored_count += 1
+            if item.holding.status == "holding":
+                active_count += 1
+            elif item.holding.status == "watching":
+                watching_count += 1
+            elif item.holding.status == "planned":
+                planned_count += 1
+            elif item.holding.status == "weakening":
+                active_count += 1
+                weakening_count += 1
+            elif item.holding.status == "exited":
+                exited_count += 1
+                if item.realized_pnl > 0:
+                    exited_win_count += 1
+            elif item.holding.status == "invalidated":
+                invalidated_count += 1
+
+        total_pnl = total_market_value - total_cost
+        total_pnl_pct = (total_pnl / total_cost * 100) if total_cost else 0
+        win_rate_pct = (exited_win_count / exited_count * 100) if exited_count else 0
+        average_score = (total_score / scored_count) if scored_count else 0
+        todo_items = self._build_todo_items(analyses)
+        review_items = self._build_review_items(analyses)
+        return StrategyHoldingAnalysisResponse(
+            total_cost=total_cost,
+            total_market_value=total_market_value,
+            total_pnl=total_pnl,
+            total_pnl_pct=total_pnl_pct,
+            total_realized_pnl=total_realized_pnl,
+            holding_count=len(holdings),
+            active_count=active_count,
+            watching_count=watching_count,
+            planned_count=planned_count,
+            weakening_count=weakening_count,
+            exited_count=exited_count,
+            invalidated_count=invalidated_count,
+            win_rate_pct=round(win_rate_pct, 2),
+            average_score=round(average_score, 2),
+            todo_items=todo_items,
+            review_items=review_items,
+            holdings=analyses,
+        )
+
+    @staticmethod
+    def _empty_holdings_analysis() -> StrategyHoldingAnalysisResponse:
+        return StrategyHoldingAnalysisResponse(
+            total_cost=0,
+            total_market_value=0,
+            total_pnl=0,
+            total_pnl_pct=0,
+            total_realized_pnl=0,
+            holding_count=0,
+            active_count=0,
+            watching_count=0,
+            planned_count=0,
+            weakening_count=0,
+            exited_count=0,
+            invalidated_count=0,
+            win_rate_pct=0,
+            average_score=0,
+            todo_items=[],
+            review_items=[],
+            holdings=[],
+        )
+
+    def _neutral_market_regime(self) -> MarketRegimeResponse:
+        return MarketRegimeResponse(
+            regime="neutral",
+            score=50,
+            action_bias="市场数据暂不可用，按中性环境处理。",
+            position_guidance="建议轻仓试错。",
+            summary="市场环境数据暂不可用。",
+            notes=[],
+            indices=[],
+            updated_at=_now_utc(),
+        )
+
+    def _build_snapshot_holdings_analysis(self, holdings: List[StrategyHolding]) -> StrategyHoldingAnalysisResponse:
+        market_regime = self._neutral_market_regime()
+        analyses = [
+            self._build_unavailable_holding_analysis(holding, market_regime, ValueError("尚未生成服务端评分缓存"))
+            for holding in holdings
+        ]
+        return self._summarize_holdings_analysis(analyses)
+
+    def _read_cached_holdings_analysis(
+        self,
+        holdings: List[StrategyHolding],
+    ) -> Optional[StrategyHoldingAnalysisResponse]:
+        with self._analysis_cache_lock:
+            try:
+                raw = self.store.get_analysis_cache(self.analysis_cache_key)
+                if not raw:
+                    return None
+                payload = json.loads(raw)
+                cached = StrategyHoldingAnalysisResponse.model_validate(payload.get("analysis", payload))
+            except Exception:
+                return None
+        if not cached.holdings:
+            return None
+        merged = self._merge_cached_holdings_analysis(holdings, cached)
+        if not any(self._has_reusable_holding_analysis(item) for item in merged.holdings):
+            return None
+        return merged
+
+    def _write_cached_holdings_analysis(self, analysis: StrategyHoldingAnalysisResponse) -> None:
+        if analysis.holdings and not any(self._has_reusable_holding_analysis(item) for item in analysis.holdings):
+            return
+        payload = {
+            "updated_at": _now_utc().isoformat(),
+            "analysis": analysis.model_dump(mode="json"),
+        }
+        with self._analysis_cache_lock:
+            self.store.set_analysis_cache(self.analysis_cache_key, json.dumps(payload, ensure_ascii=False))
+
+    def _clear_holdings_analysis_cache(self) -> None:
+        with self._analysis_cache_lock:
+            self.store.clear_analysis_cache(self.analysis_cache_key)
+
+    def _merge_refresh_analysis_with_previous(
+        self,
+        latest: StrategyHoldingAnalysisResponse,
+        previous: StrategyHoldingAnalysisResponse,
+    ) -> StrategyHoldingAnalysisResponse:
+        previous_by_id = {
+            item.holding.id: item
+            for item in previous.holdings
+            if item.holding.id is not None and self._has_reusable_holding_analysis(item)
+        }
+        previous_by_code = {
+            normalize_stock_code(item.holding.stock_code): item
+            for item in previous.holdings
+            if self._has_reusable_holding_analysis(item)
+        }
+        merged: List[StrategyHoldingAnalysis] = []
+        for item in latest.holdings:
+            if self._has_reusable_holding_analysis(item):
+                merged.append(item)
+                continue
+            previous_item = previous_by_id.get(item.holding.id)
+            if previous_item is None:
+                previous_item = previous_by_code.get(normalize_stock_code(item.holding.stock_code))
+            merged.append(self._rebase_cached_holding_analysis(item.holding, previous_item) if previous_item else item)
+        return self._summarize_holdings_analysis(merged)
+
+    def _merge_cached_holdings_analysis(
+        self,
+        holdings: List[StrategyHolding],
+        cached: StrategyHoldingAnalysisResponse,
+    ) -> StrategyHoldingAnalysisResponse:
+        cached_by_id = {
+            item.holding.id: item
+            for item in cached.holdings
+            if item.holding.id is not None and self._has_reusable_holding_analysis(item)
+        }
+        cached_by_code = {
+            normalize_stock_code(item.holding.stock_code): item
+            for item in cached.holdings
+            if self._has_reusable_holding_analysis(item)
+        }
+        market_regime = self._neutral_market_regime()
+        analyses: List[StrategyHoldingAnalysis] = []
+        for holding in holdings:
+            cached_item = cached_by_id.get(holding.id)
+            if cached_item is None:
+                cached_item = cached_by_code.get(normalize_stock_code(holding.stock_code))
+            if cached_item is not None:
+                analyses.append(self._rebase_cached_holding_analysis(holding, cached_item))
+            else:
+                analyses.append(
+                    self._build_unavailable_holding_analysis(
+                        holding,
+                        market_regime,
+                        ValueError("该持仓暂无服务端评分缓存"),
+                    )
+                )
+        return self._summarize_holdings_analysis(analyses)
+
+    @staticmethod
+    def _rebase_cached_holding_analysis(
+        holding: StrategyHolding,
+        cached: StrategyHoldingAnalysis,
+    ) -> StrategyHoldingAnalysis:
+        current_price = holding.exit_price if holding.status == "exited" and holding.exit_price is not None else cached.current_price
+        is_pre_position = holding.status in {"watching", "planned"}
+        cost = holding.entry_price * holding.quantity
+        market_value = 0.0 if is_pre_position else current_price * holding.quantity
+        pnl = 0.0 if is_pre_position else market_value - cost
+        realized_pnl = (
+            ((holding.exit_price or 0) - holding.entry_price) * holding.quantity
+            if holding.status == "exited" and holding.exit_price is not None
+            else 0.0
+        )
+        return cached.model_copy(
+            update={
+                "holding": holding,
+                "current_price": current_price,
+                "market_value": market_value,
+                "pnl": pnl,
+                "pnl_pct": 0.0 if is_pre_position else ((pnl / cost * 100) if cost else 0.0),
+                "realized_pnl": realized_pnl,
+                "realized_pnl_pct": (realized_pnl / cost * 100) if cost and realized_pnl else 0.0,
+                "analysis_status": "cached",
+            }
+        )
+
+    @staticmethod
+    def _has_reusable_holding_analysis(item: StrategyHoldingAnalysis) -> bool:
+        return item.strategy_score.total > 0 and item.analysis_status in {"live", "cached"}
+
+    def _summarize_holdings_analysis(
+        self,
+        analyses: List[StrategyHoldingAnalysis],
+    ) -> StrategyHoldingAnalysisResponse:
+        total_cost = 0.0
+        total_market_value = 0.0
+        total_realized_pnl = 0.0
+        active_count = 0
+        watching_count = 0
+        planned_count = 0
+        weakening_count = 0
+        exited_count = 0
+        invalidated_count = 0
+        exited_win_count = 0
+        scored_count = 0
+        total_score = 0.0
+        for item in analyses:
+            cost = item.holding.entry_price * item.holding.quantity
+            if item.holding.status not in {"watching", "planned"}:
+                total_cost += cost
+                total_market_value += item.market_value
+                total_realized_pnl += item.realized_pnl
+            if self._has_reusable_holding_analysis(item):
+                total_score += item.strategy_score.total
+                scored_count += 1
+            if item.holding.status == "holding":
+                active_count += 1
+            elif item.holding.status == "watching":
+                watching_count += 1
+            elif item.holding.status == "planned":
+                planned_count += 1
+            elif item.holding.status == "weakening":
+                active_count += 1
+                weakening_count += 1
+            elif item.holding.status == "exited":
+                exited_count += 1
+                if item.realized_pnl > 0:
+                    exited_win_count += 1
+            elif item.holding.status == "invalidated":
+                invalidated_count += 1
+
+        total_pnl = total_market_value - total_cost
+        total_pnl_pct = (total_pnl / total_cost * 100) if total_cost else 0
+        win_rate_pct = (exited_win_count / exited_count * 100) if exited_count else 0
+        return StrategyHoldingAnalysisResponse(
+            total_cost=total_cost,
+            total_market_value=total_market_value,
+            total_pnl=total_pnl,
+            total_pnl_pct=total_pnl_pct,
+            total_realized_pnl=total_realized_pnl,
+            holding_count=len(analyses),
+            active_count=active_count,
+            watching_count=watching_count,
+            planned_count=planned_count,
+            weakening_count=weakening_count,
+            exited_count=exited_count,
+            invalidated_count=invalidated_count,
+            win_rate_pct=round(win_rate_pct, 2),
+            average_score=round((total_score / scored_count) if scored_count else 0, 2),
+            todo_items=self._build_todo_items(analyses),
+            review_items=self._build_review_items(analyses),
+            holdings=analyses,
+        )
+
+    def _analyze_single_holding(
+        self,
+        holding: StrategyHolding,
+        market_regime: MarketRegimeResponse,
+    ) -> StrategyHoldingAnalysis:
+        candidate = self._score_candidate(
+            {"code": holding.stock_code, "name": holding.stock_name},
+            "market",
+            None,
+            market_regime=market_regime,
+        )
+        exit_price = holding.exit_price if holding.status == "exited" else None
+        current_price = float(candidate.metadata.get("current_price") or 0.0)
+        if exit_price is not None:
+            current_price = exit_price
+
+        is_pre_position = holding.status in {"watching", "planned"}
+        market_value = 0.0 if is_pre_position else current_price * holding.quantity
+        cost = holding.entry_price * holding.quantity
+        pnl = 0.0 if is_pre_position else (market_value - cost)
+        pnl_pct = 0.0 if is_pre_position else ((pnl / cost * 100) if cost else 0)
+        realized_pnl = (
+            ((holding.exit_price or 0) - holding.entry_price) * holding.quantity
+            if holding.status == "exited" and holding.exit_price is not None
+            else 0.0
+        )
+        realized_pnl_pct = (realized_pnl / cost * 100) if cost and realized_pnl else 0.0
+        thesis_status, invalidation_reason = self._evaluate_thesis_status(candidate, pnl_pct, holding)
+        alerts = candidate.risks[:]
+        trigger_hits = self._detect_trade_plan_hits(holding, current_price, market_regime)
+        if pnl_pct <= -8:
+            alerts.append("浮亏超过 8%，需要复核是否触发止损。")
+        if invalidation_reason:
+            alerts.insert(0, invalidation_reason)
+        if holding.status == "exited":
+            alerts.insert(0, "该策略持股已退出，收益按卖出价固定。")
+        action_label, action_reason = self._build_holding_action(
+            holding=holding,
+            thesis_status=thesis_status,
+            current_price=current_price,
+            pnl_pct=pnl_pct,
+            market_regime=market_regime,
+        )
+
+        return StrategyHoldingAnalysis(
+            holding=holding,
+            current_price=current_price,
+            market_value=market_value,
+            pnl=pnl,
+            pnl_pct=pnl_pct,
+            realized_pnl=realized_pnl,
+            realized_pnl_pct=realized_pnl_pct,
+            strategy_score=candidate.score,
+            thesis_status=thesis_status,
+            factor_notes=candidate.factor_notes,
+            invalidation_reason=invalidation_reason,
+            action_label=action_label,
+            action_reason=action_reason,
+            trigger_hits=trigger_hits,
+            alerts=alerts[:3],
+            analysis_status="live",
+        )
+
+    def _build_unavailable_holding_analysis(
+        self,
+        holding: StrategyHolding,
+        market_regime: MarketRegimeResponse,
+        error: Exception,
+    ) -> StrategyHoldingAnalysis:
+        fallback_price = float(holding.exit_price or holding.entry_price or 0.0)
+        is_pre_position = holding.status in {"watching", "planned"}
+        cost = holding.entry_price * holding.quantity
+        market_value = 0.0 if is_pre_position else fallback_price * holding.quantity
+        pnl = 0.0 if is_pre_position else (market_value - cost)
+        pnl_pct = 0.0 if is_pre_position else ((pnl / cost * 100) if cost else 0.0)
+        realized_pnl = (
+            ((holding.exit_price or 0) - holding.entry_price) * holding.quantity
+            if holding.status == "exited" and holding.exit_price is not None
+            else 0.0
+        )
+        realized_pnl_pct = (realized_pnl / cost * 100) if cost and realized_pnl else 0.0
+        alerts = ["行情暂不可用，已保留持仓记录。"]
+        error_message = str(error).strip()
+        if error_message:
+            alerts.append(f"分析降级原因: {error_message}")
+        if holding.status == "exited":
+            alerts.insert(0, "该策略持股已退出，收益按卖出价固定。")
+        trigger_hits = self._detect_trade_plan_hits(holding, fallback_price, market_regime)
+        thesis_status = "broken" if holding.status == "invalidated" else "weakening" if holding.status == "weakening" else "active"
+        action_label, action_reason = self._build_unavailable_holding_action(holding)
+        fallback_candidate = self._score_candidate_quick(
+            {"code": holding.stock_code, "name": holding.stock_name},
+            "market",
+            holding.source_topic,
+        )
+        factor_notes = {
+            **fallback_candidate.factor_notes,
+            "data": "实时行情或新闻源暂不可用，当前使用本地快速兜底评分；请稍后手动刷新获取完整评分。",
+        }
+
+        return StrategyHoldingAnalysis(
+            holding=holding,
+            current_price=fallback_price,
+            market_value=market_value,
+            pnl=pnl,
+            pnl_pct=pnl_pct,
+            realized_pnl=realized_pnl,
+            realized_pnl_pct=realized_pnl_pct,
+            strategy_score=fallback_candidate.score,
+            thesis_status=thesis_status,
+            factor_notes=factor_notes,
+            invalidation_reason="行情数据暂不可用，当前无法完整验证交易假设。" if holding.status == "invalidated" else None,
+            action_label=action_label,
+            action_reason=action_reason,
+            trigger_hits=trigger_hits,
+            alerts=alerts[:3],
+            analysis_status="degraded",
+        )
+
+    @staticmethod
+    def _build_unavailable_holding_action(holding: StrategyHolding) -> Tuple[str, str]:
+        if holding.status == "exited":
+            return "已退出", "该笔交易已完成退出，当前仅保留记录等待数据恢复。"
+        if holding.status == "invalidated":
+            return "触发卖出", "原持仓已标记失效，当前先保留记录并等待行情恢复后复核。"
+        if holding.status == "watching":
+            return "继续观察", "记录已保存，但实时行情暂不可用，先观察等待刷新。"
+        if holding.status == "planned":
+            return "等待触发", "计划单已保存，但暂时无法校验买点是否命中。"
+        if holding.status == "weakening":
+            return "减仓观察", "持仓已进入走弱状态，但当前无法获取最新行情确认强弱。"
+        return "继续持有", "持仓记录已保存，待行情恢复后再更新最新策略分析。"
+
+    def _build_holding_action(
+        self,
+        *,
+        holding: StrategyHolding,
+        thesis_status: str,
+        current_price: float,
+        pnl_pct: float,
+        market_regime: MarketRegimeResponse,
+    ) -> Tuple[str, str]:
+        entry_zone_hit = self._is_entry_zone_hit(holding, current_price)
+        if holding.status == "exited":
+            return "已退出", "该笔交易已完成退出，不再参与新的加减仓决策。"
+        if holding.status == "invalidated":
+            return "触发卖出", "持仓已被标记为失效，应以退出和复盘为主。"
+        if holding.status == "watching":
+            if entry_zone_hit and market_regime.regime != "risk_off":
+                return "升级计划", "价格进入观察区间，可升级为待执行计划。"
+            return "继续观察", "先跟踪主题和价格是否进入计划区间。"
+        if holding.status == "planned":
+            if market_regime.regime == "risk_off":
+                return "暂停执行", "市场转弱，计划单暂不执行。"
+            if entry_zone_hit:
+                return "可执行买入", "价格进入计划买点区间，可按计划试仓。"
+            return "等待触发", "计划已建立，等待价格进入买点区间。"
+        if holding.plan_stop_loss is not None and current_price <= holding.plan_stop_loss:
+            return "触发卖出", f"当前价已跌破计划止损位 {holding.plan_stop_loss:.2f}。"
+        if holding.plan_take_profit is not None and current_price >= holding.plan_take_profit:
+            return "减仓观察", f"当前价已触及第一目标位 {holding.plan_take_profit:.2f}，可考虑分批兑现。"
+        if thesis_status == "broken":
+            return "触发卖出", "当前策略假设已经破坏，应优先执行退出纪律。"
+        if market_regime.regime == "risk_off":
+            if pnl_pct > 0:
+                return "减仓观察", "大盘转入防守环境，已有利润的持仓应优先保护。"
+            return "禁止加仓", "大盘防守为主，弱势持仓不宜继续加仓。"
+        if holding.status == "weakening":
+            return "减仓观察", "该持仓已进入走弱状态，应限制加仓并准备处理。"
+        if thesis_status == "weakening":
+            return "禁止加仓", "个股逻辑开始走弱，先观察是否重新转强。"
+        if market_regime.regime == "neutral":
+            return "继续持有", "市场仍在震荡，只保留原计划内的强势持仓。"
+        return "继续持有", "市场和个股仍与原交易计划大体一致。"
+
+    def _detect_trade_plan_hits(
+        self,
+        holding: StrategyHolding,
+        current_price: float,
+        market_regime: MarketRegimeResponse,
+    ) -> List[str]:
+        hits: List[str] = []
+        if self._is_entry_zone_hit(holding, current_price):
+            hits.append("进入计划买点区间")
+        if holding.plan_stop_loss is not None and current_price <= holding.plan_stop_loss:
+            hits.append("跌破计划止损位")
+        if holding.plan_take_profit is not None and current_price >= holding.plan_take_profit:
+            hits.append("触及第一目标位")
+        if market_regime.regime == "risk_off":
+            hits.append("市场进入防守状态")
+        return hits
+
+    @staticmethod
+    def _is_entry_zone_hit(holding: StrategyHolding, current_price: float) -> bool:
+        zone = (holding.plan_entry_zone or "").strip()
+        if not zone:
+            return False
+        parts = [part.strip() for part in zone.split("-") if part.strip()]
+        if len(parts) != 2:
+            return False
+        try:
+            low = float(parts[0])
+            high = float(parts[1])
+        except ValueError:
+            return False
+        if low > high:
+            low, high = high, low
+        return low <= current_price <= high
+
+    def _build_todo_items(self, analyses: List[StrategyHoldingAnalysis]) -> List[StrategyTodoItem]:
+        items: List[StrategyTodoItem] = []
+        for item in analyses:
+            priority = self._todo_priority(item)
+            if priority <= 0:
+                continue
+            items.append(
+                StrategyTodoItem(
+                    holding_id=item.holding.id,
+                    stock_code=item.holding.stock_code,
+                    stock_name=item.holding.stock_name,
+                    status=item.holding.status,
+                    action_label=item.action_label,
+                    action_reason=item.action_reason,
+                    priority=priority,
+                )
+            )
+        items.sort(key=lambda entry: (-entry.priority, entry.stock_code))
+        return items[:6]
+
+    def _build_review_items(self, analyses: List[StrategyHoldingAnalysis]) -> List[StrategyReviewItem]:
+        items: List[StrategyReviewItem] = []
+        for item in analyses:
+            if item.holding.status not in {"exited", "invalidated"}:
+                continue
+            items.append(
+                StrategyReviewItem(
+                    holding_id=item.holding.id,
+                    stock_code=item.holding.stock_code,
+                    stock_name=item.holding.stock_name,
+                    status=item.holding.status,
+                    summary=self._review_summary(item),
+                    outcome_label=self._review_outcome(item),
+                )
+            )
+        return items[:6]
+
+    @staticmethod
+    def _todo_priority(item: StrategyHoldingAnalysis) -> int:
+        status = item.holding.status
+        label = item.action_label
+        if label == "触发卖出":
+            return 100
+        if label == "可执行买入":
+            return 90
+        if label == "暂停执行":
+            return 85
+        if label == "减仓观察":
+            return 80
+        if status == "planned" and "进入计划买点区间" in item.trigger_hits:
+            return 88
+        if status == "watching" and label == "升级计划":
+            return 70
+        if status == "holding" and label == "禁止加仓":
+            return 60
+        return 0
+
+    @staticmethod
+    def _review_outcome(item: StrategyHoldingAnalysis) -> str:
+        if item.holding.status == "invalidated":
+            return "假设失效"
+        if item.realized_pnl > 0:
+            return "正收益退出"
+        if item.realized_pnl < 0:
+            return "亏损退出"
+        return "平推退出"
+
+    @staticmethod
+    def _review_summary(item: StrategyHoldingAnalysis) -> str:
+        if item.holding.status == "invalidated":
+            return "原交易假设已失效，后续应复盘是市场、主题还是执行出了问题。"
+        if item.realized_pnl > 0:
+            return f"该笔交易已兑现 {item.realized_pnl:.2f} 收益，可复盘盈利来自主题延续还是执行纪律。"
+        if item.realized_pnl < 0:
+            return f"该笔交易以 {item.realized_pnl:.2f} 收尾，建议复盘止损是否及时、买点是否过激。"
+        return "该笔交易已结束，适合复盘计划执行是否严格。"
+
+    def _sync_portfolio_position_for_code(self, stock_code: str) -> None:
+        normalized_code = normalize_stock_code(stock_code)
+        active_holdings = [
+            item
+            for item in self.store.list_holdings()
+            if normalize_stock_code(item.stock_code) == normalized_code and item.status in {"holding", "weakening"}
+        ]
+        existing = next(
+            (item for item in self.portfolio_store.list_positions() if normalize_stock_code(item.stock_code) == normalized_code),
+            None,
+        )
+
+        if not active_holdings:
+            if existing and existing.id is not None:
+                self.portfolio_store.delete_position(existing.id)
+            return
+
+        total_quantity = sum(item.quantity for item in active_holdings)
+        total_cost = sum(item.entry_price * item.quantity for item in active_holdings)
+        representative = max(active_holdings, key=lambda item: item.updated_at or item.created_at or "")
+        position = PortfolioPosition(
+            stock_code=normalized_code,
+            stock_name=representative.stock_name,
+            cost_price=(total_cost / total_quantity) if total_quantity else representative.entry_price,
+            quantity=total_quantity,
+            weight_pct=existing.weight_pct if existing else None,
+        )
+        if existing and existing.id is not None:
+            self.portfolio_store.update_position(existing.id, position)
+        else:
+            self.portfolio_store.create_position(position)
+
+    def _build_candidates(self, scope: str, topic: Optional[str]) -> List[Dict[str, str]]:
+        if scope == "hotspot":
+            resolved_topic = topic
+            if not resolved_topic:
+                hotspots = self.hotspot_service.list_hotspots(limit=1)
+                resolved_topic = hotspots[0].topic_name if hotspots else None
+            if not resolved_topic:
+                return []
+            detail = self.hotspot_service.get_hotspot_detail(resolved_topic)
+            return [
+                {"code": item.stock_code, "name": item.stock_name}
+                for item in detail.topic.related_stocks
+            ]
+
+        seen_codes: set[str] = set()
+        candidates: List[Dict[str, str]] = []
+        for name, info in stock_searcher.base_stock_db.items():
+            code = normalize_stock_code(str(info.get("code") or ""))
+            if not code or code in seen_codes or not is_a_share_individual_stock(code):
+                continue
+            seen_codes.add(code)
+            candidates.append({"code": code, "name": name})
+
+        if candidates:
+            return candidates
+
+        catalog = get_base_stock_catalog()
+        return [
+            {"code": info["code"], "name": name}
+            for name, info in catalog.items()
+            if is_a_share_individual_stock(info["code"])
+        ]
+
+    def _score_candidate(
+        self,
+        candidate: Dict[str, str],
+        scope: str,
+        topic: Optional[str],
+        market_regime: Optional[MarketRegimeResponse] = None,
+    ) -> StrategyCandidate:
+        analysis = self.stock_service.get_stock_analysis(candidate["code"], include_ai=False)
+        news_items = self._get_stock_news_quick(candidate["code"], candidate["name"], limit=5)
+        chart_series = analysis.chart_series[-120:] if analysis.chart_series else []
+        closes = [float(item["close"]) for item in chart_series if item.get("close") is not None]
+        volumes = [float(item["volume"]) for item in chart_series if item.get("volume") is not None]
+        news_text = " ".join([f"{item.title} {item.summary}" for item in news_items]).lower()
+
+        current_price = analysis.quote.current_price
+        ma20 = analysis.technical_indicators.get("MA20") or current_price
+        ma60 = analysis.technical_indicators.get("MA60") or current_price
+        rsi = analysis.technical_indicators.get("RSI") or 50
+        recent_high = max(closes) if closes else current_price
+        recent_low = min(closes) if closes else current_price
+        average_volume = sum(volumes[:-5]) / max(len(volumes[:-5]), 1) if len(volumes) > 5 else (sum(volumes) / max(len(volumes), 1) if volumes else 0)
+        latest_volume = volumes[-1] if volumes else 0
+        impact_score = sum(int(item.impact_level) for item in news_items[:5])
+        direct_news_count = sum(1 for item in news_items if item.relation_type == "direct")
+        topic_news_count = max(0, len(news_items) - direct_news_count)
+        bullish_news_count = sum(1 for item in news_items if item.sentiment == "bullish")
+        bearish_news_count = sum(1 for item in news_items if item.sentiment == "bearish")
+        earnings_mentions = sum(token in news_text for token in ["业绩", "净利润", "营收", "预增", "增长", "订单", "中标"])
+        institutional_mentions = sum(token in news_text for token in ["机构", "增持", "回购", "基金", "北向", "社保", "券商"])
+        price_vs_ma20_pct = ((current_price - ma20) / ma20 * 100) if ma20 else 0
+        price_vs_ma60_pct = ((current_price - ma60) / ma60 * 100) if ma60 else 0
+        drawdown_from_high_pct = ((recent_high - current_price) / recent_high * 100) if recent_high else 0
+
+        c_score = 88 if analysis.quote.change_pct > 4 else 80 if analysis.quote.change_pct > 2 else 68 if analysis.quote.change_pct > 0 else 42
+        c_score = min(95, c_score + earnings_mentions * 4)
+        a_score = 86 if current_price >= ma20 >= ma60 and price_vs_ma60_pct >= 5 else 74 if current_price >= ma20 >= ma60 else 60 if current_price >= ma20 else 42
+        a_score = min(95, a_score + max(earnings_mentions - 1, 0) * 3)
+        near_breakout = recent_high > 0 and current_price >= recent_high * 0.95
+        breakout_today = recent_high > 0 and current_price >= recent_high * 0.995
+        n_score = 92 if breakout_today else 84 if near_breakout else 72 if scope == "hotspot" else 58
+        if topic:
+            n_score = min(95, n_score + 5)
+        volume_ratio = (latest_volume / average_volume) if average_volume else 1
+        s_score = 86 if volume_ratio >= 1.8 else 78 if volume_ratio >= 1.3 else 68 if volume_ratio >= 1.0 else 48
+        l_score = min(95, max(40, analysis.signal_summary.overall_score * 18 + (8 if rsi >= 55 else 0)))
+        attention_score = impact_score + direct_news_count * 2 + institutional_mentions * 4 + bullish_news_count * 2 - bearish_news_count * 2
+        i_score = 84 if attention_score >= 18 else 76 if attention_score >= 13 else 66 if attention_score >= 8 else 50
+        i_score = min(95, i_score + institutional_mentions * 4)
+        market_proxy, market_score, market_note = self._score_market_context(
+            market_regime=market_regime,
+            scope=scope,
+            current_price=current_price,
+            ma20=ma20,
+            ma60=ma60,
+            signal_score=analysis.signal_summary.overall_score,
+            volume_ratio=volume_ratio,
+        )
+        m_score = market_score
+
+        total = round(
+            c_score * 0.12
+            + a_score * 0.14
+            + n_score * 0.2
+            + s_score * 0.12
+            + l_score * 0.18
+            + i_score * 0.1
+            + m_score * 0.14,
+            1,
+        )
+        score = StrategyScoreBreakdown(
+            c=round(c_score, 1),
+            a=round(a_score, 1),
+            n=round(n_score, 1),
+            s=round(s_score, 1),
+            l=round(l_score, 1),
+            i=round(i_score, 1),
+            m=round(m_score, 1),
+            total=total,
+        )
+        factor_notes = {
+            "c": f"近一日涨幅 {analysis.quote.change_pct:.2f}%，业绩/订单类信号 {earnings_mentions} 个，动量{'偏强' if c_score >= 75 else '一般' if c_score >= 60 else '偏弱'}。",
+            "a": f"相对均线结构: MA20 距离 {price_vs_ma20_pct:.1f}%，MA60 距离 {price_vs_ma60_pct:.1f}%，成长性代理信号 {earnings_mentions} 个。",
+            "n": f"距阶段高点回撤 {drawdown_from_high_pct:.1f}%，{'已接近突破位' if near_breakout else '尚未接近突破位'}。",
+            "s": f"量比近似 {volume_ratio:.2f}，最新成交量{'放大' if volume_ratio >= 1.2 else '未明显放大'}。",
+            "l": f"技术总信号 {analysis.signal_summary.overall_signal} / {analysis.signal_summary.overall_score}，RSI {rsi:.1f}。",
+            "i": self._build_institutional_note(
+                news_items=news_items,
+                impact_score=impact_score,
+                institutional_mentions=institutional_mentions,
+                direct_news_count=direct_news_count,
+                topic_news_count=topic_news_count,
+                bullish_news_count=bullish_news_count,
+                bearish_news_count=bearish_news_count,
+                i_score=i_score,
+            ),
+            "m": f"市场环境为 {market_proxy}，{market_note}",
+        }
+
+        reasons: List[str] = []
+        if current_price >= ma20:
+            reasons.append("股价站上 MA20，短中期趋势维持强势。")
+        if current_price >= ma60:
+            reasons.append("股价位于 MA60 上方，中期结构没有破坏。")
+        if near_breakout:
+            reasons.append("价格接近阶段新高，符合 CAN SLIM 对新高突破的偏好。")
+        if volume_ratio >= 1.2:
+            reasons.append(f"近期量能放大至均量的 {volume_ratio:.1f} 倍，资金参与度提升。")
+        if scope == "hotspot" and topic:
+            reasons.append(f"该股来自“{topic}”热点主题，具备题材催化。")
+        if impact_score >= 5:
+            reasons.append("近期消息催化较多，机构和市场关注度较高。")
+        if earnings_mentions >= 2:
+            reasons.append("近期消息中出现较多业绩/订单类积极信号。")
+        if institutional_mentions >= 1:
+            reasons.append("近期有机构、增持或回购类关注信号。")
+
+        risks: List[str] = []
+        if current_price < ma20:
+            risks.append("股价跌破 MA20，短线强势结构偏弱。")
+        if current_price < ma60:
+            risks.append("股价跌破 MA60，中期趋势有破坏迹象。")
+        if rsi >= 75:
+            risks.append("RSI 偏高，短期可能面临震荡或回撤。")
+        if volume_ratio < 1:
+            risks.append("量能没有明显放大，突破持续性需要确认。")
+        if drawdown_from_high_pct >= 12:
+            risks.append("距离阶段高点回撤较深，离强势突破形态较远。")
+        if analysis.signal_summary.overall_score <= 2:
+            risks.append("现有技术信号偏弱，仍需等待更清晰确认。")
+
+        return StrategyCandidate(
+            strategy_key="can_slim",
+            stock_code=analysis.stock_code,
+            stock_name=analysis.stock_name,
+            market=analysis.market,
+            score=score,
+            factor_notes=factor_notes,
+            reasons=reasons[:4],
+            risks=risks[:3],
+            source_scope=scope,
+            source_topic=topic,
+            metadata={
+                "current_price": current_price,
+                "change_pct": analysis.quote.change_pct,
+                "volume_ratio": round(volume_ratio, 2),
+                "news_count": len(news_items),
+                "signal": analysis.signal_summary.overall_signal,
+                "drawdown_from_high_pct": round(drawdown_from_high_pct, 2),
+                "recent_low": recent_low,
+                "symbol": extract_symbol(analysis.stock_code),
+            },
+        )
+
+    def _get_stock_news_quick(self, stock_code: str, stock_name: str, limit: int = 5) -> List[NewsItem]:
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(self.news_service.get_stock_news, stock_code, stock_name, limit)
+        try:
+            return future.result(timeout=3)
+        except Exception:
+            future.cancel()
+            return []
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def _build_institutional_note(
+        self,
+        news_items: List[NewsItem],
+        impact_score: int,
+        institutional_mentions: int,
+        direct_news_count: int,
+        topic_news_count: int,
+        bullish_news_count: int,
+        bearish_news_count: int,
+        i_score: float,
+    ) -> str:
+        if not news_items:
+            return "近 5 条个股消息暂无有效样本，机构/资金类信号 0 个，市场关注度偏低。"
+
+        if bullish_news_count > bearish_news_count:
+            sentiment_note = "情绪偏积极"
+        elif bearish_news_count > bullish_news_count:
+            sentiment_note = "情绪偏谨慎"
+        else:
+            sentiment_note = "情绪中性"
+
+        title = news_items[0].title.strip()
+        catalyst = f"，最新关注点：{self._compact_note_text(title, 28)}" if title else ""
+        attention = "较高" if i_score >= 75 else "中等" if i_score >= 62 else "偏低"
+        return (
+            f"近 {len(news_items)} 条个股消息累计影响分 {impact_score}，"
+            f"直接消息 {direct_news_count} 条、主题联动 {topic_news_count} 条，"
+            f"机构/资金类信号 {institutional_mentions} 个，{sentiment_note}，市场关注度{attention}{catalyst}。"
+        )
+
+    def _score_market_context(
+        self,
+        market_regime: Optional[MarketRegimeResponse],
+        scope: str,
+        current_price: float,
+        ma20: float,
+        ma60: float,
+        signal_score: int,
+        volume_ratio: float,
+    ) -> Tuple[str, float, str]:
+        if market_regime:
+            regime_label = {
+                "risk_on": "偏强",
+                "neutral": "中性",
+                "risk_off": "偏弱",
+            }.get(market_regime.regime, "中性")
+            base_score = float(market_regime.score or 50)
+        else:
+            regime_label = "偏强" if scope == "hotspot" else "中性"
+            base_score = 72 if scope == "hotspot" else 58
+
+        above_ma20 = current_price >= ma20 if ma20 else False
+        above_ma60 = current_price >= ma60 if ma60 else False
+        if above_ma20 and signal_score >= 3:
+            alignment_delta = 10
+            alignment = "个股趋势顺应市场"
+        elif above_ma60:
+            alignment_delta = 4
+            alignment = "个股中期结构尚可"
+        elif signal_score <= 2:
+            alignment_delta = -12
+            alignment = "个股技术面弱于市场"
+        else:
+            alignment_delta = -4
+            alignment = "个股短线仍需确认"
+
+        if volume_ratio >= 1.5 and above_ma20:
+            alignment_delta += 4
+            alignment = f"{alignment}，且放量配合"
+        if scope == "hotspot":
+            alignment_delta += 4
+
+        score = round(max(35, min(92, base_score + alignment_delta)), 1)
+        basis = "来自市场环境卡片" if market_regime else ("热点主题加分" if scope == "hotspot" else "未取得市场环境，使用中性基准")
+        note = f"{basis}；{alignment}，M 分随个股趋势调整为 {score:.1f}。"
+        return regime_label, score, note
+
+    @staticmethod
+    def _compact_note_text(text: str, max_length: int) -> str:
+        normalized = re.sub(r"\s+", " ", text).strip()
+        if len(normalized) <= max_length:
+            return normalized
+        return f"{normalized[:max_length]}..."
+
+    def _evaluate_thesis_status(
+        self,
+        candidate: StrategyCandidate,
+        pnl_pct: float,
+        holding: Optional[StrategyHolding] = None,
+    ) -> Tuple[str, Optional[str]]:
+        if holding and holding.status == "exited":
+            reason = "已按策略退出。"
+            if holding.exit_price is not None and holding.exit_date:
+                reason = f"已于 {holding.exit_date} 按 {holding.exit_price:.2f} 退出。"
+            return "active", reason
+        if holding and holding.status == "invalidated":
+            return "broken", "该策略持股已被手动标记为失效。"
+        score = candidate.score.total
+        current_price = float(candidate.metadata.get("current_price") or 0)
+        ma60_distance = candidate.factor_notes.get("a", "")
+        if pnl_pct <= -8:
+            return "broken", "浮亏达到 8% 止损阈值，策略假设需要重新确认。"
+        if score < 50:
+            return "broken", "当前 CAN SLIM 总分跌破 50，已偏离强势股标准。"
+        if any("MA60" in risk for risk in candidate.risks) and score < 60:
+            return "broken", "股价跌破 MA60 且总分偏弱，中期趋势假设失效。"
+        if score < 68 or current_price <= 0 or "MA60 距离 -" in ma60_distance:
+            return "weakening", "策略评分下滑，需重点观察是否继续失真。"
+        return "active", None
+
+
+class AgentService:
+    def __init__(
+        self,
+        stock_service: StockAnalysisService,
+        news_service: NewsService,
+        hotspot_service: HotspotService,
+        portfolio_service: PortfolioService,
+        web_search_service: WebSearchService,
+    ):
+        self.stock_service = stock_service
+        self.news_service = news_service
+        self.hotspot_service = hotspot_service
+        self.portfolio_service = portfolio_service
+        self.web_search_service = web_search_service
+        self._stock_topics = load_stock_topics(self.stock_service.config.stock_topics_path)
+        self._cache: Dict[Tuple[str, str], Tuple[float, Any]] = {}
+        self._cache_ttl = {
+            "stock_analysis": 120,
+            "stock_news": 90,
+            "context_news": 90,
+            "web_search": 120,
+            "hotspots": 60,
+            "portfolio": 30,
+            "stock_extract": 300,
+            "comparison_peers": 300,
+        }
+
+    def clarification_for_query(
+        self,
+        user_query: str,
+        history: Optional[List[AgentHistoryTurn]] = None,
+        memory_profile: Optional[Dict[str, Any]] = None,
+    ) -> Optional[AgentResponse]:
+        query = user_query.strip()
+        history = history or []
+        memory_profile = memory_profile or {}
+        target_hint = self._extract_stock_from_history(history, memory_profile)
+        rewrite = self._rewrite_query(query, history, memory_profile, target_hint)
+
+        # A broad company-research request needs a topic before we retrieve a
+        # grab bag of sources. Keep explicit requests (for example, latest
+        # news, earnings, filings, or a first-pass investor brief) on the
+        # direct research path.
+        target_in_query = self._extract_named_stock_from_text(query)
+        ticker_match = re.search(
+            r"\b(?:US\.)?([A-Z]{1,6}(?:\.[A-Z])?)\b|[（(]\s*([A-Z]{1,6}(?:\.[A-Z])?)\s*[）)]",
+            query,
+        )
+        explicit_ticker = next((part for part in ticker_match.groups() if part), None) if ticker_match else None
+        explicit_ticker = explicit_ticker.upper() if explicit_ticker else None
+        known_local_tickers = {
+            str(info.get("code", "")).split(".")[-1].upper()
+            for info in stock_searcher.base_stock_db.values()
+            if isinstance(info, dict) and info.get("code")
+        }
+        if explicit_ticker not in known_local_tickers:
+            explicit_ticker = None
+        has_company_target = bool(target_hint or target_in_query or explicit_ticker)
+        broad_research_request = bool(
+            re.search(
+                r"\b(?:research|analy[sz]e|look\s+into|learn\s+about|tell\s+me\s+about|do\s+(?:some\s+)?research)\b"
+                r"|研究|分析|了解|介绍",
+                query,
+                re.IGNORECASE,
+            )
+        )
+        explicit_research_scope = bool(
+            re.search(
+                r"\b(?:overview|profile|business|products?|competition|competitors?|financials?|filings?|"
+                r"earnings?|revenue|valuation|price|stock\s+performance|technicals?|risks?|news|headlines?|"
+                r"catalysts?|supply\s+chain|investor\s+brief|investment\s+brief|market(?:\s+(?:share|position|dynamics))?|"
+                r"industry|technology|strategy|growth|customers?|margins?|competitive\s+position)\b"
+                r"|概况|简介|业务|产品|竞争|财务|财报|公告|营收|估值|股价|走势|技术面|风险|新闻|消息|催化|供应链|投资简报|市场|行业|技术|芯片|市占率|市场份额|客户|管理层|战略|增长|利润率",
+                query,
+                re.IGNORECASE,
+            )
+        )
+        direct_stock_analysis = bool((target_in_query or explicit_ticker)
+                                     and re.search(r"\banaly[sz]e\b|分析", query, re.I))
+        if (broad_research_request and has_company_target and not explicit_research_scope and not direct_stock_analysis
+                and rewrite.intent != "stock_analysis"):
+            is_english = not re.search(r"[\u3400-\u9fff]", query)
+            target_name = (
+                (target_in_query or {}).get("name")
+                or explicit_ticker
+                or (target_hint or {}).get("name")
+                or (target_hint or {}).get("code")
+                or "this company"
+            )
+            question = (
+                f"What would you like to focus on for {target_name}?"
+                if is_english
+                else f"你想重点研究{target_name}的哪方面？"
+            )
+            options = (
+                ["Business and competition", "Financials and filings", "News and catalysts", "Price and risks"]
+                if is_english
+                else ["业务与竞争", "财务与公告", "新闻与催化", "股价与风险"]
+            )
+            summary = (
+                "Choose a research angle and I’ll look up the relevant sources."
+                if is_english
+                else "选择一个研究方向，我会据此查找相关资料。"
+            )
+            slots = self._build_context_slots(query, rewrite, history, memory_profile)
+            slots.requested_action = "clarification"
+            slots.current_stock = target_in_query or target_hint
+            if not slots.current_stock and explicit_ticker:
+                matched_stock = next(
+                    (
+                        (name, info)
+                        for name, info in stock_searcher.base_stock_db.items()
+                        if isinstance(info, dict)
+                        and str(info.get("code", "")).split(".")[-1].upper() == explicit_ticker
+                    ),
+                    None,
+                )
+                if matched_stock:
+                    slots.current_stock = {
+                        "name": matched_stock[0],
+                        "code": normalize_stock_code(str(matched_stock[1]["code"])),
+                    }
+            return AgentResponse(
+                intent="clarification",
+                summary=summary,
+                clarification=AgentClarification(question=question, options=options),
+                payload={"_meta": self._meta_payload([], [], rewrite, slots)},
+            )
+
+        if rewrite.intent != "clarification":
+            return None
+
+        is_english = not re.search(r"[\u3400-\u9fff]", query)
+        is_news_question = any(token in query.lower() for token in ["news", "headline", "story", "新闻", "消息"])
+        is_stock_question = any(token in query.lower() for token in ["stock", "ticker", "股票", "个股", "这票", "这只"])
+        if is_news_question:
+            question = "Which news item or topic do you mean?" if is_english else "你指的是哪条新闻或哪个主题？"
+            options = (
+                ["Paste a headline or link", "Choose a company or topic", "See global news"]
+                if is_english
+                else ["贴出新闻标题或链接", "指定公司或主题", "查看全球新闻"]
+            )
+            summary = "Please clarify the news or topic." if is_english else "请先明确要看的新闻或主题。"
+        elif is_stock_question:
+            question = "Which stock would you like to research?" if is_english else "你想研究哪只股票？"
+            options = (
+                ["Choose a stock", "See the market overview", "Review my portfolio"]
+                if is_english
+                else ["选择一只股票", "查看市场概览", "分析我的持仓"]
+            )
+            summary = "Please specify the stock or choose another research path." if is_english else "请先明确股票，或选择其他研究方向。"
+        else:
+            question = "What would you like to research?" if is_english else "你想研究哪一类内容？"
+            options = (
+                ["Stock analysis", "News and catalysts", "Market overview", "My portfolio"]
+                if is_english
+                else ["个股分析", "新闻与催化", "市场概览", "我的持仓"]
+            )
+            summary = "Choose a direction and I’ll continue your question." if is_english else "选择一个方向后，我会继续原问题。"
+
+        slots = self._build_context_slots(query, rewrite, history, memory_profile)
+        return AgentResponse(
+            intent="clarification",
+            summary=summary,
+            clarification=AgentClarification(question=question, options=options),
+            payload={"_meta": self._meta_payload([], [], rewrite, slots)},
+        )
+
+    def query(
+        self,
+        user_query: str,
+        history: Optional[List[AgentHistoryTurn]] = None,
+        memory_profile: Optional[Dict[str, Any]] = None,
+        progress_callback: Optional[ProgressCallback] = None,
+    ) -> AgentResponse:
+        def report(stage: str, progress_pct: int, message: str, meta: Optional[Dict[str, Any]] = None) -> None:
+            if progress_callback:
+                progress_callback(stage, progress_pct, message, meta)
+
+        def report_tool_start(progress_pct: int, message: str, tool: str) -> None:
+            report("tool_running", progress_pct, message, {"tool": tool})
+
+        def report_tool_done(progress_pct: int, message: str, tool: str, cached: bool = False) -> None:
+            report("tool_completed", progress_pct, message, {"tool": tool, "cached": cached})
+
+        query = user_query.strip()
+        history = history or []
+        memory_profile = memory_profile or {}
+        tools_used: List[str] = []
+        cache_hits: List[str] = []
+        report("understand_query", 5, "已接收问题，开始理解查询意图")
+        report("load_memory", 15, "已加载会话记忆与历史上下文")
+        clarification = self.clarification_for_query(query, history, memory_profile)
+        if clarification is not None:
+            report("select_engine", 25, "需要先明确研究对象", {"engine": "clarification"})
+            return clarification
+        context_target = self._extract_stock_from_history(history, memory_profile)
+        target: Optional[Dict[str, str]] = None
+        stock_resolution: Optional[StockResolution] = None
+        if self._should_extract_stock(query, history, memory_profile):
+            report("tool_running", 35, "正在识别股票目标", {"tool": "search_stocks"})
+            stock_resolution, search_cached = self._cached_call(
+                "stock_extract",
+                query,
+                self._resolve_stock_from_query,
+                query,
+                history,
+                memory_profile,
+            )
+            tools_used.append("search_stocks")
+            if search_cached:
+                cache_hits.append("search_stocks")
+            report(
+                "tool_completed",
+                45,
+                "股票目标识别完成",
+                {"tool": "search_stocks", "cached": search_cached},
+            )
+            if stock_resolution and stock_resolution.confidence >= 0.85:
+                target = stock_resolution.target
+        rewrite = self._rewrite_query(query, history, memory_profile, target or context_target)
+        slots = self._build_context_slots(query, rewrite, history, memory_profile)
+        report("select_engine", 25, "已完成意图路由，准备执行对应分析")
+
+        if rewrite.intent == "model_info":
+            runtime_config = self.stock_service._runtime_config()
+            model_name = runtime_config.llm_model
+            base_url = runtime_config.llm_base_url
+            return AgentResponse(
+                intent="model_info",
+                summary=(
+                    "## 当前模型配置\n"
+                    f"- 模型: `{model_name}`\n"
+                    f"- Base URL: `{base_url}`\n"
+                    "- 如需切换，可在设置页或环境变量中修改后重启后端。"
+                ),
+                actions=["打开设置页查看模型配置", "如需切换模型，告诉我目标模型名即可"],
+                citations=["/api/settings"],
+                payload={
+                    "model": model_name,
+                    "provider": base_url,
+                    "_meta": self._meta_payload(tools_used, cache_hits, rewrite, slots),
+                },
+            )
+
+        if rewrite.intent == "greeting":
+            return AgentResponse(
+                intent="greeting",
+                summary="你好！我可以帮你分析股票、新闻、热点或持仓。",
+                actions=["分析 sh600036", "查看今日热点", "分析我的持仓"],
+                citations=[],
+                payload={"_meta": self._meta_payload(tools_used, cache_hits, rewrite, slots)},
+            )
+
+        if rewrite.intent == "clarification":
+            if any(token in query for token in ["这个消息", "这个新闻", "这个利好"]):
+                summary = "你指的是哪条消息或哪个主题？贴出标题、链接或关键词即可。"
+                actions = ["贴出新闻标题", "提供相关股票或主题", "指定时间范围"]
+            else:
+                summary = "你指的是哪只股票？请提供股票代码或名称即可。"
+                actions = ["例如：sh600036", "例如：招商银行", "也可以直接贴出股票代码"]
+            return AgentResponse(
+                intent="clarification",
+                summary=summary,
+                actions=actions,
+                citations=[],
+                payload={"_meta": self._meta_payload(tools_used, cache_hits, rewrite, slots)},
+            )
+
+        if rewrite.intent == "help":
+            return AgentResponse(
+                intent="help",
+                summary=(
+                    "## 当前支持的能力\n"
+                    "- 单股分析：输入股票代码或名称，查看技术面判断\n"
+                    "- 个股消息：查看某只股票最近消息面变化\n"
+                    "- 热点追踪：查看今日热点、全球新闻和科技大事\n"
+                    "- 持仓分析：分析当前组合风险、收益和调仓建议\n"
+                    "\n## 示例\n"
+                    "- 分析 sh600036\n"
+                    "- 看看海光信息最近消息\n"
+                    "- 今日热点是什么\n"
+                    "- 分析我的持仓"
+                ),
+                actions=[
+                    "分析 sh600036",
+                    "看看海光信息最近消息",
+                    "今日热点是什么",
+                    "分析我的持仓",
+                ],
+                citations=[
+                    "/api/stocks/search",
+                    "/api/stocks/{code}/analysis",
+                    "/api/stocks/{code}/news",
+                    "/api/hotspots",
+                    "/api/portfolio/analysis",
+                ],
+                payload={"_meta": self._meta_payload(tools_used, cache_hits, rewrite, slots)},
+            )
+
+        if rewrite.intent == "portfolio_analysis":
+            report_tool_start(35, "正在获取持仓组合分析", "portfolio_analysis")
+            analysis, portfolio_cached = self._cached_call("portfolio", "default", self.portfolio_service.analyze_portfolio)
+            tools_used.append("portfolio_analysis")
+            if portfolio_cached:
+                cache_hits.append("portfolio_analysis")
+            report_tool_done(50, "持仓组合分析已完成", "portfolio_analysis", portfolio_cached)
+            performance = f"总盈亏 {analysis.total_pnl:.2f} {analysis.currency or ''}，收益率 {analysis.total_pnl_pct:.2f}%" if analysis.aggregation_available else "多个币种缺少带日期的汇率，无法汇总盈亏或收益率。"
+            summary = (
+                "## 组合快照\n"
+                f"- {performance}\n"
+                f"- 集中度风险 {analysis.concentration_risk}，技术风险 {analysis.technical_risk}\n"
+                "## 当前判断\n"
+                f"- {analysis.rebalance_suggestions[0]}"
+            )
+            context_news: List[GlobalNewsItem] = []
+            if rewrite.include_context:
+                context_news, news_cached = self._cached_call(
+                    "context_news",
+                    f"{rewrite.rewritten_query}|3",
+                    self.news_service.get_context_news_for_query,
+                    rewrite.rewritten_query,
+                    3,
+                )
+                tools_used.append("global_news")
+                if news_cached:
+                    cache_hits.append("global_news")
+            web_results: List[WebSearchResult] = []
+            if rewrite.wants_live_web:
+                web_results, web_cached = self._cached_call(
+                    "web_search",
+                    f"{rewrite.rewritten_query} 全球市场|4",
+                    self.web_search_service.search,
+                    f"{rewrite.rewritten_query} 全球市场",
+                    4,
+                )
+                tools_used.append("web_search")
+                if web_cached:
+                    cache_hits.append("web_search")
+            if context_news:
+                summary += f"\n- 已补充 {len(context_news)} 条全球背景消息"
+            if web_results:
+                summary += f"\n- 已联网检索 {len(web_results)} 条实时网页结果"
+            return AgentResponse(
+                intent="portfolio_analysis",
+                summary=summary,
+                actions=analysis.rebalance_suggestions,
+                citations=["/api/portfolio/analysis", "/api/news/global"],
+                payload={
+                    **analysis.model_dump(),
+                    "global_news": [item.model_dump() for item in context_news[:2]],
+                    "web_results": [item.model_dump() for item in web_results[:2]],
+                    "_meta": self._meta_payload(tools_used, cache_hits, rewrite, slots),
+                },
+            )
+
+        if rewrite.intent == "hotspot_lookup":
+            report_tool_start(35, "正在获取热点列表", "hotspots")
+            hotspots, hotspots_cached = self._cached_call("hotspots", "limit=5", self.hotspot_service.list_hotspots, 5)
+            tools_used.append("hotspots")
+            if hotspots_cached:
+                cache_hits.append("hotspots")
+            report_tool_done(48, "热点列表已加载", "hotspots", hotspots_cached)
+            global_news, news_cached = self._cached_call(
+                "context_news",
+                f"{rewrite.rewritten_query}|5",
+                self.news_service.get_context_news_for_query,
+                rewrite.rewritten_query,
+                5,
+            )
+            tools_used.append("global_news")
+            if news_cached:
+                cache_hits.append("global_news")
+            web_results: List[WebSearchResult] = []
+            if rewrite.wants_live_web:
+                web_results, web_cached = self._cached_call(
+                    "web_search",
+                    f"{rewrite.rewritten_query}|4",
+                    self.web_search_service.search,
+                    rewrite.rewritten_query,
+                    4,
+                )
+                tools_used.append("web_search")
+                if web_cached:
+                    cache_hits.append("web_search")
+            hotspot_briefs = self._compress_hotspots(hotspots, limit=2)
+            news_briefs = self._compress_global_news(global_news, limit=2)
+            web_briefs = self._compress_web_results(web_results, limit=2)
+            hotspot_summary = "\n".join(f"- {item['topic']}" for item in hotspot_briefs)
+            news_summary = "\n".join(f"- {item['topic']}: {item['title']}" for item in news_briefs)
+            web_summary = "\n".join(f"- {item['title']}" for item in web_briefs)
+            summary = "## 热点概览\n" + (hotspot_summary or "- 当前暂无可用热点数据")
+            if news_summary:
+                summary = f"{summary}\n## 背景新闻\n{news_summary}"
+            if web_summary:
+                summary = f"{summary}\n## 联网补充\n{web_summary}"
+            return AgentResponse(
+                intent="hotspot_lookup",
+                summary=summary,
+                actions=["查看热点页获取关联股票后再做单股分析。", "如需单股判断，可继续问：某股票是否受这些全球事件影响？"],
+                citations=["/api/hotspots", "/api/news/global", "/api/web/search"],
+                payload={
+                    "hotspot_briefs": hotspot_briefs,
+                    "global_news_briefs": news_briefs,
+                    "web_briefs": web_briefs,
+                    "_meta": self._meta_payload(tools_used, cache_hits, rewrite, slots),
+                },
+            )
+
+        if rewrite.intent == "news_lookup":
+            target = rewrite.target_stock or context_target
+            if not target:
+                report_tool_start(40, "正在获取全球重点新闻", "global_news")
+                global_news, news_cached = self._cached_call(
+                    "context_news",
+                    f"{rewrite.rewritten_query}|6",
+                    self.news_service.get_context_news_for_query,
+                    rewrite.rewritten_query,
+                    6,
+                )
+                tools_used.append("global_news")
+                if news_cached:
+                    cache_hits.append("global_news")
+                report_tool_done(58, "全球重点新闻已加载", "global_news", news_cached)
+                web_results: List[WebSearchResult] = []
+                if rewrite.wants_live_web:
+                    web_results, web_cached = self._cached_call(
+                        "web_search",
+                        f"{rewrite.rewritten_query}|4",
+                        self.web_search_service.search,
+                        rewrite.rewritten_query,
+                        4,
+                    )
+                    tools_used.append("web_search")
+                    if web_cached:
+                        cache_hits.append("web_search")
+                news_briefs = self._compress_global_news(global_news, limit=3)
+                web_briefs = self._compress_web_results(web_results, limit=2)
+                summary = (
+                    "## 今日消息\n" + "\n".join([f"- {item['topic']}: {item['title']}" for item in news_briefs])
+                    if news_briefs
+                    else "## 今日消息\n- 当前没有抓到可用的全球重点新闻"
+                )
+                if web_briefs:
+                    summary = f"{summary}\n## 联网补充\n" + "\n".join(f"- {item['title']}" for item in web_briefs)
+                return AgentResponse(
+                    intent="web_search_lookup",
+                    summary=summary,
+                    actions=["继续追问：这些事件利好哪些A股/港股？"],
+                    citations=["/api/news/global", "/api/web/search"],
+                    payload={
+                        "global_news_briefs": news_briefs,
+                        "web_briefs": web_briefs,
+                        "_meta": self._meta_payload(tools_used, cache_hits, rewrite, slots),
+                    },
+                )
+            report_tool_start(40, f"正在获取 {target['name']} 的个股消息", "stock_news")
+            results, stock_news_cached = self._cached_call(
+                "stock_news",
+                f"{target['code']}|{target['name']}|6",
+                self.news_service.get_stock_news,
+                target["code"],
+                target["name"],
+                6,
+            )
+            tools_used.append("stock_news")
+            if stock_news_cached:
+                cache_hits.append("stock_news")
+            report_tool_done(55, "个股消息已加载", "stock_news", stock_news_cached)
+            context_news: List[GlobalNewsItem] = []
+            if rewrite.include_context:
+                context_news, news_cached = self._cached_call(
+                    "context_news",
+                    f"{rewrite.rewritten_query}|3",
+                    self.news_service.get_context_news_for_query,
+                    rewrite.rewritten_query,
+                    3,
+                )
+                tools_used.append("global_news")
+                if news_cached:
+                    cache_hits.append("global_news")
+            web_query = f"{target['name']} {target['code']} 最新新闻"
+            web_results: List[WebSearchResult] = []
+            if rewrite.wants_live_web or not results:
+                web_results, web_cached = self._cached_call("web_search", f"{web_query}|4", self.web_search_service.search, web_query, 4)
+                tools_used.append("web_search")
+                if web_cached:
+                    cache_hits.append("web_search")
+            compressed_news = self._compress_stock_news(results, limit=3)
+            context_briefs = self._compress_global_news(context_news, limit=2)
+            web_briefs = self._compress_web_results(web_results, limit=2)
+            summary = (
+                f"## {target['name']} 消息面\n"
+                + (f"- 最近重点消息 {len(compressed_news)} 条，最新标题：{compressed_news[0]['title']}" if compressed_news else "- 暂无最新消息")
+            )
+            if compressed_news:
+                summary += "\n## 核心催化\n" + "\n".join(f"- {item['title']}：{item['takeaway']}" for item in compressed_news[:2])
+            if context_briefs:
+                summary += "\n## 背景变量\n" + "\n".join(f"- {item['topic']}：{item['title']}" for item in context_briefs[:2])
+            if web_briefs:
+                summary += "\n## 联网补充\n" + "\n".join(f"- {item['title']}" for item in web_briefs)
+            return AgentResponse(
+                intent="news_lookup",
+                summary=summary,
+                actions=["查看消息页或单股分析页中的相关新闻模块。", "继续问：这只股票是否会受全球局势影响？"],
+                citations=[f"/api/stocks/{target['code']}/news", "/api/news/global", "/api/web/search"],
+                payload={
+                    "stock_code": target["code"],
+                    "stock_name": target["name"],
+                    "stock": target,
+                    "news": [item.model_dump() for item in results[:3]],
+                    "news_briefs": compressed_news,
+                    "global_news_briefs": context_briefs,
+                    "web_briefs": web_briefs,
+                    "_meta": self._meta_payload(tools_used, cache_hits, rewrite, slots),
+                },
+            )
+
+        if rewrite.intent == "web_search_lookup":
+            web_results, web_cached = self._cached_call(
+                "web_search",
+                f"{rewrite.rewritten_query}|4",
+                self.web_search_service.search,
+                rewrite.rewritten_query,
+                4,
+            )
+            tools_used.append("web_search")
+            if web_cached:
+                cache_hits.append("web_search")
+            if web_results:
+                web_briefs = self._compress_web_results(web_results, limit=3)
+                summary = "## 联网结果\n" + "\n".join(f"- {item['title']}" for item in web_briefs)
+                return AgentResponse(
+                    intent="web_search_lookup",
+                    summary=summary,
+                    actions=["继续追问：这些结果对哪些股票有影响？"],
+                    citations=["/api/web/search"],
+                    payload={
+                        "web_results": [item.model_dump() for item in web_results[:3]],
+                        "web_briefs": web_briefs,
+                        "_meta": self._meta_payload(tools_used, cache_hits, rewrite, slots),
+                    },
+                )
+
+        target = rewrite.target_stock or context_target
+        if not target and stock_resolution and stock_resolution.candidates:
+            candidate_lines = [
+                f"- {item['name']} ({item['code']})"
+                for item in stock_resolution.candidates[:3]
+            ]
+            return AgentResponse(
+                intent="stock_candidates",
+                summary="## 可能的股票目标\n" + "\n".join(candidate_lines),
+                actions=["请直接点名股票代码或更完整名称。", "示例: 分析 sh600938", "示例: 分析 中国海油"],
+                payload={
+                    "candidates": stock_resolution.candidates[:3],
+                    "_meta": self._meta_payload(tools_used, cache_hits, rewrite, slots),
+                },
+            )
+        if rewrite.intent == "stock_comparison" and target:
+            return self._build_comparison_response(target, rewrite, slots, tools_used, cache_hits)
+
+        if target:
+            report_tool_start(40, f"正在获取 {target['name']} 的技术分析", "stock_analysis")
+            analysis, analysis_cached = self._cached_call(
+                "stock_analysis",
+                f"{target['code']}|0",
+                self.stock_service.get_stock_analysis,
+                target["code"],
+                False,
+            )
+            tools_used.append("stock_analysis")
+            if analysis_cached:
+                cache_hits.append("stock_analysis")
+            report_tool_done(55, "技术分析已加载", "stock_analysis", analysis_cached)
+            context_news: List[GlobalNewsItem] = []
+            if rewrite.include_context:
+                context_news, news_cached = self._cached_call(
+                    "context_news",
+                    f"{rewrite.rewritten_query}|3",
+                    self.news_service.get_context_news_for_query,
+                    rewrite.rewritten_query,
+                    3,
+                )
+                tools_used.append("global_news")
+                if news_cached:
+                    cache_hits.append("global_news")
+            web_query = f"{target['name']} {target['code']} 宏观 行业 最新消息"
+            web_results: List[WebSearchResult] = []
+            if rewrite.wants_live_web:
+                web_results, web_cached = self._cached_call("web_search", f"{web_query}|4", self.web_search_service.search, web_query, 4)
+                tools_used.append("web_search")
+                if web_cached:
+                    cache_hits.append("web_search")
+            stance = self._signal_to_stance(analysis.signal_summary.overall_score)
+            summary = (
+                f"## 一句话判断\n"
+                f"- {analysis.stock_name} 当前偏{stance}，信号 {analysis.signal_summary.overall_score}/5，最新价 {analysis.quote.current_price:.2f}\n"
+                "## 关键点\n"
+            )
+            key_points = analysis.technical_commentary[:2] or ["当前先看信号修复，再决定是否介入。"]
+            summary += "\n".join(f"- {item}" for item in key_points)
+            summary += "\n## 风险点\n"
+            summary += f"- 需重点防范 {self._risk_hint_from_signal(analysis.signal_summary.overall_score, analysis.signal_summary.overall_signal)}"
+            context_briefs = self._compress_global_news(context_news, limit=2)
+            web_briefs = self._compress_web_results(web_results, limit=2)
+            if context_briefs:
+                summary += "\n## 背景变量\n" + "\n".join(f"- {item['topic']}：{item['title']}" for item in context_briefs)
+            if web_briefs:
+                summary += "\n## 联网补充\n" + "\n".join(f"- {item['title']}" for item in web_briefs)
+            actions = ["查看这只股票最新消息", "对比同板块股票表现", "打开完整单股分析页"]
+            if not context_briefs and not web_briefs:
+                actions = [f"继续问：{target['name']} 最近消息面有什么变化？", "对比同板块股票表现", "打开完整单股分析页"]
+            return AgentResponse(
+                intent="stock_analysis",
+                summary=summary,
+                actions=actions,
+                citations=[f"/api/stocks/{target['code']}/analysis", "/api/news/global", "/api/web/search"],
+                payload={
+                    **analysis.model_dump(),
+                    "global_news_briefs": context_briefs,
+                    "web_briefs": web_briefs,
+                    "_meta": self._meta_payload(tools_used, cache_hits, rewrite, slots),
+                },
+            )
+
+        return AgentResponse(
+            intent="unknown",
+            summary="没有识别出明确目标。当前支持单股分析、消息查询、热点查看和持仓分析。",
+            actions=[
+                "示例: 分析 sh600036",
+                "示例: 看看海光信息最近消息",
+                "示例: 今日热点是什么",
+                "示例: 分析我的持仓",
+            ],
+            payload={"_meta": self._meta_payload(tools_used, cache_hits, rewrite, slots)},
+        )
+
+    @staticmethod
+    def should_use_fast_path(user_query: str) -> bool:
+        query = user_query.strip().lower()
+        if not query:
+            return True
+        explicit_fast = [
+            "持仓", "组合", "仓位", "热点", "新闻", "消息", "全球", "宏观", "国际", "科技大事",
+            "股票", "个股", "sh", "sz", ".hk", "对比", "同行", "同板块", "板块",
+        ]
+        if any(token in query for token in explicit_fast):
+            return True
+        if len(query) <= 24:
+            return True
+        complex_markers = ["结合", "综合", "同时", "为什么", "逻辑", "推演", "如果", "情景", "多角度"]
+        return not any(token in query for token in complex_markers)
+
+    @staticmethod
+    def _signal_to_stance(score: int) -> str:
+        if score >= 4:
+            return "偏强"
+        if score <= 2:
+            return "偏弱"
+        return "中性"
+
+    @staticmethod
+    def _risk_hint_from_signal(score: int, signal: str) -> str:
+        if score <= 2:
+            return "短线继续走弱和跌破支撑的风险"
+        if score >= 4:
+            return "追高后的回撤风险"
+        return f"{signal}状态下方向不明的震荡风险"
+
+    def _cached_call(self, namespace: str, key: str, fn, *args):
+        now = time.time()
+        cache_key = (namespace, key)
+        entry = self._cache.get(cache_key)
+        if entry and entry[0] > now:
+            return entry[1], True
+        value = fn(*args)
+        ttl = self._cache_ttl.get(namespace, 60)
+        self._cache[cache_key] = (now + ttl, value)
+        return value, False
+
+    @staticmethod
+    def _meta_payload(
+        tools_used: List[str],
+        cache_hits: List[str],
+        rewrite: Optional[IntentRewriteResult] = None,
+        slots: Optional[ContextSlots] = None,
+    ) -> Dict[str, Any]:
+        unique_tools = list(dict.fromkeys(tools_used))
+        unique_cache_hits = list(dict.fromkeys(cache_hits))
+        payload = {
+            "tools_used": unique_tools,
+            "cache_hits": unique_cache_hits,
+        }
+        if rewrite:
+            payload["rewritten_query"] = rewrite.rewritten_query
+        if slots:
+            payload["slots"] = {
+                "current_stock": slots.current_stock,
+                "current_topic": slots.current_topic,
+                "current_market_scope": slots.current_market_scope,
+                "requested_action": slots.requested_action,
+                "comparison_mode": slots.comparison_mode,
+                "time_horizon": slots.time_horizon,
+                "follow_up": slots.follow_up,
+            }
+        return payload
+
+    def _should_extract_stock(
+        self,
+        query: str,
+        history: Optional[List[AgentHistoryTurn]] = None,
+        memory_profile: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        lower_query = query.lower()
+        if re.search(r"\b(?:sh|sz)\d{6}\b|\b\d{5}\.hk\b", lower_query, re.IGNORECASE):
+            return True
+        strong_markers = [
+            "股票", "个股", "分析", "表现", "走势", "股价", "消息面", "同板块", "同行", "对比", "龙头", "银行股",
+        ]
+        if any(token in query for token in strong_markers):
+            return True
+        if self._extract_named_stock_from_text(query):
+            return True
+        context_target = self._extract_stock_from_history(history or [], memory_profile or {})
+        if context_target and any(token in query for token in ["那", "这只", "这家", "它", "继续", "再看", "消息面", "对比", "板块"]):
+            return True
+        return False
+
+    def _rewrite_query(
+        self,
+        query: str,
+        history: List[AgentHistoryTurn],
+        memory_profile: Dict[str, Any],
+        target_hint: Optional[Dict[str, str]],
+    ) -> IntentRewriteResult:
+        lower_query = query.lower()
+        follow_up = bool(target_hint) and any(
+            token in query for token in ["那", "这只", "这家", "它", "刚才", "继续", "再看", "再比较", "消息面", "同板块"]
+        )
+        wants_live_web = any(
+            token in lower_query
+            for token in [
+                "latest", "breaking", "search", "实时", "最新", "刚刚", "突发", "联网",
+                "未来", "前景", "现状", "上市", "公告",
+            ]
+        )
+        include_context = any(token in query for token in ["世界", "全球", "宏观", "局势", "国际", "科技大事", "伊朗", "油价"])
+        if any(token in lower_query for token in ["model", "llm"]) or any(
+            token in query for token in ["什么模型", "哪个模型", "模型名称", "当前模型", "你现在用的模型", "你现在用什么模型"]
+        ):
+            return IntentRewriteResult(
+                intent="model_info",
+                rewritten_query="查看当前模型配置",
+                target_stock=None,
+                wants_live_web=False,
+                include_context=False,
+                follow_up=False,
+            )
+        if any(token in lower_query for token in ["hello", "hi"]) or any(
+            token in query for token in ["你好", "您好", "嗨", "哈喽", "谢谢", "感谢"]
+        ):
+            return IntentRewriteResult(
+                intent="greeting",
+                rewritten_query="问候并简要介绍可用能力",
+                target_stock=None,
+                wants_live_web=False,
+                include_context=False,
+                follow_up=False,
+            )
+        normalized_query = re.sub(r"[\s，。！？、,.!?;:]+", "", query.lower())
+        bare_research_request = bool(
+            re.fullmatch(r"(?:请)?(?:帮我)?(?:分析|看看|看|研究|解释|比较)(?:一下|下)?", normalized_query)
+            or re.fullmatch(r"(?:please)?(?:helpme)?(?:analyze|analyse|review|research|explain|compare)(?:this|it)?", normalized_query)
+        )
+        if not target_hint and (bare_research_request or any(
+            token in query for token in ["这票", "这只股票", "能不能上车", "要不要减仓", "这个消息", "这个新闻", "这个利好"]
+        )):
+            if bare_research_request:
+                clarification_intent = "澄清研究方向"
+            elif any(token in lower_query for token in ["news", "headline", "story"]) or any(
+                token in query for token in ["这个消息", "这个新闻", "这个利好"]
+            ):
+                clarification_intent = "澄清新闻或主题对象"
+            else:
+                clarification_intent = "澄清股票对象"
+            return IntentRewriteResult(
+                intent="clarification",
+                rewritten_query=clarification_intent,
+                target_stock=None,
+                wants_live_web=False,
+                include_context=False,
+                follow_up=False,
+            )
+        if any(token in lower_query for token in ["help", "what can you do"]) or any(
+            token in query for token in ["你能做什么", "你会什么", "怎么用", "如何用", "支持什么", "支持哪些功能", "能做什么", "帮助"]
+        ):
+            return IntentRewriteResult(
+                intent="help",
+                rewritten_query="介绍当前支持的能力和示例用法",
+                target_stock=None,
+                wants_live_web=False,
+                include_context=False,
+                follow_up=False,
+            )
+        if any(token in query for token in ["持仓", "组合", "仓位"]):
+            return IntentRewriteResult(
+                intent="portfolio_analysis",
+                rewritten_query="分析当前持仓组合风险与操作建议",
+                target_stock=None,
+                wants_live_web=wants_live_web,
+                include_context=include_context,
+                follow_up=False,
+            )
+
+        target = target_hint
+        if any(token in query for token in ["对比", "比较", "同板块", "同行", "同业", "板块内"]):
+            rewritten = query
+            if target:
+                rewritten = f"对比 {target['name']} 与同板块代表股近期技术表现"
+            return IntentRewriteResult(
+                intent="stock_comparison",
+                rewritten_query=rewritten,
+                target_stock=target,
+                wants_live_web=wants_live_web,
+                include_context=include_context,
+                follow_up=follow_up,
+                comparison_mode="sector",
+            )
+
+        if any(token in query for token in ["热点", "全球新闻", "国际新闻", "世界局势", "科技大事"]):
+            rewritten = "梳理今日全球热点和科技大事"
+            return IntentRewriteResult(
+                intent="hotspot_lookup",
+                rewritten_query=rewritten,
+                target_stock=None,
+                wants_live_web=wants_live_web,
+                include_context=True,
+                follow_up=False,
+            )
+
+        if "消息" in query or "新闻" in query or "消息面" in query:
+            rewritten = query
+            if target:
+                rewritten = f"查看 {target['name']} 最近消息面变化"
+            return IntentRewriteResult(
+                intent="news_lookup",
+                rewritten_query=rewritten,
+                target_stock=target,
+                wants_live_web=wants_live_web,
+                include_context=include_context or ("影响" in query),
+                follow_up=follow_up,
+            )
+
+        if wants_live_web and not target:
+            return IntentRewriteResult(
+                intent="web_search_lookup",
+                rewritten_query=query,
+                target_stock=None,
+                wants_live_web=True,
+                include_context=include_context,
+                follow_up=False,
+            )
+
+        if target:
+            rewritten = query
+            if follow_up and any(token in query for token in ["表现", "怎么样", "走势", "看法"]):
+                rewritten = f"分析 {target['name']} 当前技术表现"
+            return IntentRewriteResult(
+                intent="stock_analysis",
+                rewritten_query=rewritten,
+                target_stock=target,
+                wants_live_web=wants_live_web,
+                include_context=include_context,
+                follow_up=follow_up,
+            )
+
+        return IntentRewriteResult(
+            intent="unknown",
+            rewritten_query=query,
+            target_stock=self._extract_stock_from_history(history, memory_profile),
+            wants_live_web=wants_live_web,
+            include_context=include_context,
+            follow_up=False,
+        )
+
+    def _build_context_slots(
+        self,
+        query: str,
+        rewrite: IntentRewriteResult,
+        history: List[AgentHistoryTurn],
+        memory_profile: Dict[str, Any],
+    ) -> ContextSlots:
+        current_stock = rewrite.target_stock or self._extract_stock_from_history(history, memory_profile)
+        current_market_scope = "global"
+        if any(token in query for token in ["A股", "沪深"]):
+            current_market_scope = "a_share"
+        elif any(token in query for token in ["港股", "HK"]):
+            current_market_scope = "hk"
+        elif isinstance(memory_profile.get("preferred_market"), str) and memory_profile["preferred_market"]:
+            current_market_scope = str(memory_profile["preferred_market"])
+        current_topic = self._infer_topic_from_query(query, current_stock)
+        time_horizon = "today" if "今日" in query else "recent" if "最近" in query else "short_term" if "短线" in query else "current"
+        return ContextSlots(
+            current_stock=current_stock,
+            current_topic=current_topic,
+            current_market_scope=current_market_scope,
+            requested_action=rewrite.intent,
+            comparison_mode=rewrite.comparison_mode,
+            time_horizon=time_horizon,
+            follow_up=rewrite.follow_up,
+        )
+
+    def _build_comparison_response(
+        self,
+        target: Dict[str, str],
+        rewrite: IntentRewriteResult,
+        slots: ContextSlots,
+        tools_used: List[str],
+        cache_hits: List[str],
+    ) -> AgentResponse:
+        peers, peers_cached = self._cached_call("comparison_peers", target["code"], self._find_comparison_peers, target)
+        tools_used.append("stock_peers")
+        if peers_cached:
+            cache_hits.append("stock_peers")
+        analysis, analysis_cached = self._cached_call(
+            "stock_analysis",
+            f"{target['code']}|0",
+            self.stock_service.get_stock_analysis,
+            target["code"],
+            False,
+        )
+        tools_used.append("stock_analysis")
+        if analysis_cached:
+            cache_hits.append("stock_analysis")
+
+        peer_analyses: List[StockAnalysisResponse] = []
+        for peer in peers[:2]:
+            item, peer_cached = self._cached_call(
+                "stock_analysis",
+                f"{peer['code']}|0",
+                self.stock_service.get_stock_analysis,
+                peer["code"],
+                False,
+            )
+            peer_analyses.append(item)
+            tools_used.append("stock_analysis")
+            if peer_cached:
+                cache_hits.append("stock_analysis")
+
+        all_items = [analysis, *peer_analyses]
+        ranked = sorted(all_items, key=lambda item: item.signal_summary.overall_score, reverse=True)
+        rank = next((index + 1 for index, item in enumerate(ranked) if item.stock_code == analysis.stock_code), 1)
+        category = self._category_for_stock(target) or "同板块"
+        comparison_rows = [self._comparison_snapshot(item) for item in all_items]
+        summary = (
+            "## 对比结论\n"
+            f"- {analysis.stock_name} 在 {category} 代表股中信号排名第 {rank}/{len(all_items)}，"
+            f"当前 {analysis.signal_summary.overall_score}/5\n"
+            "## 横向观察\n"
+            + "\n".join(
+                f"- {item['stock_name']}：{item['stance']}，信号 {item['score']}/5，涨跌幅 {item['change_pct']:.2f}%"
+                for item in comparison_rows
+            )
+            + "\n## 操作提示\n"
+            + f"- 若想继续判断强弱切换，可继续追问：{analysis.stock_name} 和板块龙头相比差在哪？"
+        )
+        return AgentResponse(
+            intent="stock_comparison",
+            summary=summary,
+            actions=[f"继续问：{analysis.stock_name} 最近消息面有什么变化？", "打开完整单股分析页", "查看这只股票最新消息"],
+            citations=[f"/api/stocks/{target['code']}/analysis"],
+            payload={
+                **analysis.model_dump(),
+                "comparison": {
+                    "category": category,
+                    "items": comparison_rows,
+                },
+                "_meta": self._meta_payload(tools_used, cache_hits, rewrite, slots),
+            },
+        )
+
+    def _find_comparison_peers(self, target: Dict[str, str], limit: int = 2) -> List[Dict[str, str]]:
+        category = self._category_for_stock(target)
+        topics = self._stock_topics.get(target["name"], [])
+        candidates: List[Dict[str, str]] = []
+        seen_codes = {target["code"]}
+
+        for name, info in stock_searcher.base_stock_db.items():
+            code = normalize_stock_code(str(info.get("code", "")))
+            if not code or code in seen_codes:
+                continue
+            if category and info.get("category") == category:
+                candidates.append({"name": name, "code": code, "reason": f"同属 {category}"})
+                seen_codes.add(code)
+            if len(candidates) >= limit:
+                return candidates[:limit]
+
+        if topics:
+            stock_pool = load_stock_pool()
+            for stock_name, stock_topics in self._stock_topics.items():
+                code = normalize_stock_code(stock_pool.get(stock_name, ""))
+                if not code or code in seen_codes or stock_name == target["name"]:
+                    continue
+                if set(stock_topics) & set(topics):
+                    candidates.append({"name": stock_name, "code": code, "reason": f"同属主题 {stock_topics[0]}"})
+                    seen_codes.add(code)
+                if len(candidates) >= limit:
+                    break
+        return candidates[:limit]
+
+    def _category_for_stock(self, target: Dict[str, str]) -> Optional[str]:
+        info = stock_searcher.get_stock_info(target["code"])
+        if isinstance(info, dict) and info.get("category"):
+            return str(info["category"])
+        search_results = self.stock_service.search_stocks(target["name"], max_results=1)
+        if search_results and search_results[0].category:
+            return search_results[0].category
+        return None
+
+    def _comparison_snapshot(self, analysis: StockAnalysisResponse) -> Dict[str, Any]:
+        return {
+            "stock_name": analysis.stock_name,
+            "stock_code": analysis.stock_code,
+            "score": analysis.signal_summary.overall_score,
+            "signal": analysis.signal_summary.overall_signal,
+            "stance": self._signal_to_stance(analysis.signal_summary.overall_score),
+            "current_price": analysis.quote.current_price,
+            "change_pct": analysis.quote.change_pct,
+        }
+
+    def _infer_topic_from_query(self, query: str, current_stock: Optional[Dict[str, str]]) -> Optional[str]:
+        if any(token in query for token in ["热点", "科技大事"]):
+            return "global_hotspot"
+        if current_stock and current_stock["name"] in self._stock_topics:
+            return self._stock_topics[current_stock["name"]][0]
+        if "消息" in query or "新闻" in query:
+            return "news"
+        if "对比" in query:
+            return "comparison"
+        return None
+
+    @staticmethod
+    def _compress_stock_news(items: List[NewsItem], limit: int = 3) -> List[Dict[str, Any]]:
+        return [
+            {
+                "title": item.title,
+                "source": item.source,
+                "impact_level": item.impact_level,
+                "sentiment": item.sentiment,
+                "published_at": item.published_at,
+                "takeaway": (item.ai_takeaway or item.summary or item.title)[:72],
+                "url": item.url,
+            }
+            for item in items[:limit]
+        ]
+
+    @staticmethod
+    def _compress_global_news(items: List[GlobalNewsItem], limit: int = 3) -> List[Dict[str, Any]]:
+        return [
+            {
+                "topic": item.topic,
+                "title": item.title,
+                "impact_level": item.impact_level,
+                "source": item.source,
+                "published_at": item.published_at,
+            }
+            for item in items[:limit]
+        ]
+
+    @staticmethod
+    def _compress_web_results(items: List[WebSearchResult], limit: int = 2) -> List[Dict[str, Any]]:
+        return [
+            {
+                "title": item.title,
+                "source": item.source,
+                "url": item.url,
+                "published_at": item.published_at,
+            }
+            for item in items[:limit]
+        ]
+
+    @staticmethod
+    def _compress_hotspots(items: List[HotspotItem], limit: int = 2) -> List[Dict[str, Any]]:
+        return [
+            {
+                "topic": f"{item.topic_name}（热度 {item.heat_score:.0f}）",
+                "lead_stock": item.related_stocks[0].stock_name if item.related_stocks else None,
+                "summary": item.ai_summary or item.reason,
+            }
+            for item in items[:limit]
+        ]
+
+    def _extract_named_stock_from_text(self, query: str) -> Optional[Dict[str, str]]:
+        for alias, canonical_name in STOCK_NAME_ALIASES.items():
+            if alias in query:
+                info = stock_searcher.base_stock_db.get(canonical_name)
+                if isinstance(info, dict) and info.get("code"):
+                    return {"name": canonical_name, "code": normalize_stock_code(str(info["code"]))}
+        merged_names: Dict[str, str] = {
+            name: info["code"]
+            for name, info in stock_searcher.base_stock_db.items()
+            if isinstance(info, dict) and info.get("code")
+        }
+        for name, code in load_stock_pool().items():
+            merged_names.setdefault(name, code)
+        for name in sorted((item for item in merged_names.keys() if item), key=len, reverse=True):
+            if name in query:
+                normalized_code = normalize_stock_code(merged_names[name])
+                if normalized_code:
+                    return {"name": name, "code": normalized_code}
+        return None
+
+    def _resolve_stock_from_query(
+        self,
+        query: str,
+        history: Optional[List[AgentHistoryTurn]] = None,
+        memory_profile: Optional[Dict[str, Any]] = None,
+    ) -> StockResolution:
+        history = history or []
+        memory_profile = memory_profile or {}
+        fallback_candidates: List[Dict[str, Any]] = []
+        code_match = re.search(r"\b(?:sh|sz)\d{6}\b|\b\d{5}\.HK\b", query, re.IGNORECASE)
+        if code_match:
+            code = normalize_stock_code(code_match.group(0))
+            info = stock_searcher.get_stock_info(code)
+            target = {"name": info["name"] if info else code, "code": code}
+            return StockResolution(target=target, confidence=1.0, source="explicit_code", candidates=[target])
+
+        named_match = self._extract_named_stock_from_text(query)
+        if named_match:
+            return StockResolution(target=named_match, confidence=0.99, source="local_alias", candidates=[named_match])
+
+        direct_results = self.stock_service.search_stocks(query, max_results=3)
+        if direct_results:
+            candidates = [self._search_result_to_candidate(item) for item in direct_results[:3]]
+            fallback_candidates = candidates
+            top = direct_results[0]
+            top_candidate = candidates[0]
+            confidence = self._confidence_from_search_result(query, top)
+            margin = top.score - (direct_results[1].score if len(direct_results) > 1 else 0)
+            if confidence >= 0.85 and margin >= 8:
+                return StockResolution(target=top_candidate, confidence=confidence, source="search_full_query", candidates=candidates)
+            if confidence >= 0.95:
+                return StockResolution(target=top_candidate, confidence=confidence, source="search_full_query", candidates=candidates)
+
+        cleaned_query = re.sub(r"[，。！？、,.?!:：；;（）()“”\"'‘’]", " ", query)
+        cleaned_query = re.sub(
+            r"(这只股票|这只|股票|个股|表现|怎么样|最近|帮我|看看|分析|一下|可以吗|好吗|对比|同板块|同行|板块|消息面)",
+            " ",
+            cleaned_query,
+        )
+        for token in cleaned_query.split():
+            normalized_token = token.strip()
+            if len(normalized_token) < 2:
+                continue
+            if normalized_token in {"能", "下", "吗", "呀", "啊", "吧", "呢"}:
+                continue
+            results = self.stock_service.search_stocks(token, max_results=3)
+            if results:
+                top = results[0]
+                confidence = self._confidence_from_search_result(normalized_token, top)
+                if confidence < 0.9:
+                    continue
+                candidates = [self._search_result_to_candidate(item) for item in results[:3]]
+                return StockResolution(
+                    target=candidates[0],
+                    confidence=confidence,
+                    source="search_token",
+                    candidates=candidates,
+                )
+        history_target = self._extract_stock_from_history(history, memory_profile)
+        if history_target:
+            return StockResolution(target=history_target, confidence=0.8, source="history", candidates=[history_target])
+        return StockResolution(target=None, confidence=0.0, source="none", candidates=fallback_candidates)
+
+    def _extract_stock_from_query(
+        self,
+        query: str,
+        history: Optional[List[AgentHistoryTurn]] = None,
+        memory_profile: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, str]]:
+        resolution = self._resolve_stock_from_query(query, history, memory_profile)
+        if resolution.confidence >= 0.85:
+            return resolution.target
+        return self._extract_stock_from_history(history or [], memory_profile or {})
+
+    @staticmethod
+    def _search_result_to_candidate(item: StockSearchResult) -> Dict[str, Any]:
+        return {
+            "name": item.name,
+            "code": item.code,
+            "market": item.market,
+            "category": item.category,
+            "score": item.score,
+            "match_type": item.match_type,
+        }
+
+    @staticmethod
+    def _confidence_from_search_result(query: str, item: StockSearchResult) -> float:
+        normalized_query = query.strip().lower()
+        normalized_name = item.name.strip().lower()
+        if item.match_type in {"exact_code", "exact_name"}:
+            return 0.98
+        if normalized_query and normalized_query == normalized_name:
+            return 0.96
+        if len(normalized_query) >= 4 and normalized_query in normalized_name and item.match_type == "fuzzy_name":
+            return 0.88
+        if len(normalized_query) >= 3 and item.score >= 90:
+            return 0.85
+        if item.match_type == "category":
+            return 0.35
+        return 0.2
+
+    @staticmethod
+    def _extract_stock_from_history(history: List[AgentHistoryTurn], memory_profile: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, str]]:
+        for turn in reversed(history):
+            if turn.stock_code:
+                return {
+                    "name": turn.stock_name or turn.stock_code,
+                    "code": normalize_stock_code(turn.stock_code),
+                }
+        if memory_profile:
+            stock_code = memory_profile.get("last_stock_code")
+            if isinstance(stock_code, str) and stock_code:
+                stock_name = memory_profile.get("last_stock_name")
+                return {
+                    "name": str(stock_name) if isinstance(stock_name, str) and stock_name else stock_code,
+                    "code": normalize_stock_code(stock_code),
+                }
+        return None

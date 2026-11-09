@@ -1,0 +1,362 @@
+import asyncio
+from types import SimpleNamespace
+
+from api.agent_pydantic import (
+    AgentDeps,
+    AgentOutput,
+    _format_stock_news_for_agent,
+    build_agent_response,
+    run_agent_async,
+)
+from api.schemas import AgentClarification
+from api.agent_eval import EvalCase, EvalObservation, evaluate_case, summarize_report
+from tests.agent_eval_cases import PUBLIC_EVAL_CASES
+
+
+def _response(*, summary="", tools=(), citations=(), intent="test", payload=None, clarification=None):
+    response = {
+        "intent": intent,
+        "summary": summary,
+        "citations": list(citations),
+        "payload": {
+            **(payload or {}),
+            "_meta": {"tools_used": list(tools)},
+        },
+    }
+    if clarification is not None:
+        response["clarification"] = clarification
+    return response
+
+
+def test_tool_aliases_and_citations_are_evaluated():
+    case = next(item for item in PUBLIC_EVAL_CASES if item.case_id == "stock_analysis_uses_analysis_tool")
+    response = _response(
+        summary="招商银行当前偏中性。",
+        tools=("get_stock_analysis",),
+        citations=("/api/stocks/sh600036/analysis",),
+        payload={"stock_code": "sh600036"},
+    )
+
+    result = evaluate_case(case, EvalObservation.from_response(response))
+
+    assert result.passed
+    assert result.observation.tools_used == ["stock_analysis"]
+
+
+def test_greeting_rejects_any_tool_and_long_answer():
+    case = next(item for item in PUBLIC_EVAL_CASES if item.case_id == "greeting_is_brief")
+    response = _response(summary="你好？" + " 很高兴为你提供市场分析。" * 30, tools=("web_search",))
+
+    result = evaluate_case(case, EvalObservation.from_response(response))
+
+    assert not result.passed
+    assert {failure.rule for failure in result.failures} == {"forbidden_tools", "conciseness"}
+
+
+def test_ambiguous_question_requires_clarification():
+    case = next(item for item in PUBLIC_EVAL_CASES if item.case_id == "ambiguous_stock_asks_clarification")
+    response = _response(
+        summary="请提供股票代码或名称，或选择其他研究方向。",
+        intent="clarification",
+        clarification={"question": "你想研究哪只股票？", "options": ["苹果", "微软"]},
+    )
+
+    result = evaluate_case(case, EvalObservation.from_response(response))
+
+    assert result.passed
+
+
+def test_clarification_text_without_modal_options_fails_review():
+    case = next(item for item in PUBLIC_EVAL_CASES if item.case_id == "ambiguous_stock_asks_clarification")
+    response = _response(summary="你指的是哪只股票？请提供代码或名称即可。", intent="clarification")
+
+    result = evaluate_case(case, EvalObservation.from_response(response))
+
+    assert not result.passed
+    assert {failure.rule for failure in result.failures} == {"structured_clarification"}
+
+
+def test_missing_required_tool_is_reported_without_dumping_payload():
+    case = next(item for item in PUBLIC_EVAL_CASES if item.case_id == "stock_news_uses_news_tool")
+    response = _response(
+        summary="招商银行最近暂无可用消息。",
+        tools=("get_global_news",),
+        citations=("/api/news/global",),
+        payload={"news": [{"title": "private detail that must not appear in report"}]},
+    )
+
+    result = evaluate_case(case, EvalObservation.from_response(response))
+    report = result.to_report()
+
+    assert not result.passed
+    assert any(failure.rule == "required_tools" for failure in result.failures)
+    assert "private detail" not in str(report)
+    assert report["payload_keys"] == ["news"]
+
+
+def test_tool_result_usage_requires_payload_projection():
+    case = next(item for item in PUBLIC_EVAL_CASES if item.case_id == "stock_news_uses_news_tool")
+    response = _response(
+        summary="招商银行最近有消息。",
+        tools=("get_stock_news",),
+        citations=("/api/stocks/sh600036/news",),
+    )
+
+    result = evaluate_case(case, EvalObservation.from_response(response))
+
+    assert not result.passed
+    assert any(failure.rule == "tool_result_usage" for failure in result.failures)
+
+
+def test_summary_report_has_loop_metrics():
+    case = PUBLIC_EVAL_CASES[0]
+    result = evaluate_case(case, EvalObservation.from_response(_response(summary="你好")))
+
+    report = summarize_report([result])
+
+    assert report["total"] == 1
+    assert report["passed"] == 1
+    assert report["pass_rate"] == 1.0
+
+
+def test_transport_failure_is_not_misreported_as_model_behavior():
+    case = PUBLIC_EVAL_CASES[0]
+    observation = EvalObservation(status_code=0, intent="transport_error", summary="", error="connection refused")
+
+    result = evaluate_case(case, observation)
+
+    assert [failure.rule for failure in result.failures] == ["http_status", "transport"]
+
+
+def test_agent_run_delegates_tool_choice_to_agent():
+    calls = []
+
+    class FakeAgent:
+        async def run(self, query, deps, **kwargs):
+            calls.append(query)
+            return SimpleNamespace(output=AgentOutput(summary="## 消息\n- 等待工具结果", actions=[]))
+
+    deps = AgentDeps(
+        stock_service=SimpleNamespace(),
+        news_service=SimpleNamespace(),
+        hotspot_service=SimpleNamespace(),
+        portfolio_service=SimpleNamespace(),
+        web_search_service=SimpleNamespace(),
+    )
+
+    asyncio.run(run_agent_async(FakeAgent(), deps, "看看海光信息最近消息"))
+
+    assert calls == ["看看海光信息最近消息"]
+    assert deps.tool_results == []
+
+
+def test_news_formatter_preserves_evidence_for_agent():
+    item = SimpleNamespace(
+        title="海光信息发布重要公告",
+        source="公司公告",
+        published_at="2026-08-16 09:30:00",
+        summary="  公司披露了新的业务进展， 需要结合公告原文判断影响。 ",
+    )
+
+    formatted = _format_stock_news_for_agent(item)
+
+    assert "海光信息发布重要公告" in formatted
+    assert "2026-08-16 09:30" in formatted
+    assert "公司公告" in formatted
+    assert "新的业务进展，需要结合公告原文判断影响。" in formatted
+
+
+def test_news_response_does_not_invent_technical_payload():
+    response = build_agent_response(
+        AgentOutput(summary="## 消息面\n- 海光信息发布公告", actions=[]),
+        [{
+            "tool": "get_stock_news",
+            "data": [{
+                "stock_code": "sh688041",
+                "stock_name": "海光信息",
+                "title": "海光信息发布公告",
+            }],
+        }],
+    )
+
+    assert response.payload["stock_name"] == "海光信息"
+    assert response.payload["news"][0]["title"] == "海光信息发布公告"
+    assert "quote" not in response.payload
+    assert "signal_summary" not in response.payload
+    assert "/api/stocks/sh688041/news" in response.citations
+
+
+def test_structured_clarification_clears_other_response_components():
+    response = build_agent_response(
+        AgentOutput(
+            summary="你想分析哪只股票？",
+            actions=["查看行情"],
+            ui_components=["chart", "actions"],
+            clarification=AgentClarification(
+                question="你想分析哪只股票？",
+                options=["苹果", "微软"],
+            ),
+        ),
+        [],
+    )
+
+    assert response.intent == "clarification"
+    assert response.clarification is not None
+    assert response.clarification.options == ["苹果", "微软"]
+    assert response.actions == []
+    assert response.ui_components == []
+
+
+def test_response_selects_only_tool_backed_native_components():
+    analysis = {
+        "stock_name": "Apple",
+        "stock_code": "US.AAPL",
+        "market": "us",
+        "quote": {"current_price": 200, "change_pct": 1.2},
+        "chart_series": [
+            {"date": "2026-09-01", "open": 195, "high": 201, "low": 194, "close": 200},
+            {"date": "2026-09-02", "open": 200, "high": 202, "low": 199, "close": 201},
+        ],
+        "technical_indicators": {},
+        "technical_commentary": [],
+        "ai_insight": {"enabled": False},
+        "metadata": {},
+    }
+    response = build_agent_response(
+        AgentOutput(
+            summary="| Metric | Value |\n| --- | --- |\n| Revenue | Retrieved |",
+            actions=["查看最新消息"],
+            ui_components=["chart", "table", "comparison", "actions"],
+        ),
+        [
+            {"tool": "get_stock_analysis", "data": analysis},
+            {"tool": "get_stock_analysis", "data": {**analysis, "stock_name": "Microsoft", "stock_code": "US.MSFT"}},
+        ],
+    )
+
+    assert response.ui_components == ["chart", "table", "comparison", "actions"]
+    assert len(response.payload["stocks"]) == 2
+
+
+def test_response_drops_components_without_supporting_data():
+    response = build_agent_response(
+        AgentOutput(summary="没有检索到足够数据。", ui_components=["chart", "table", "comparison", "actions"]),
+        [],
+    )
+
+    assert response.ui_components == []
+
+
+def test_combined_response_projects_both_requested_tool_results():
+    response = build_agent_response(
+        AgentOutput(summary="## 消息与走势\n- 已分别核验", actions=[]),
+        [
+            {
+                "tool": "get_stock_analysis",
+                "data": {
+                    "stock_name": "海光信息",
+                    "stock_code": "sh688041",
+                    "market": "sh",
+                    "quote": {"current_price": 100},
+                    "signal_summary": {"overall_signal": "看涨", "overall_score": 4},
+                    "technical_indicators": {},
+                    "technical_commentary": [],
+                    "ai_insight": {"enabled": False},
+                    "chart_series": [],
+                    "metadata": {},
+                },
+            },
+            {
+                "tool": "get_stock_news",
+                "data": [{"stock_code": "sh688041", "stock_name": "海光信息", "title": "公告"}],
+            },
+        ],
+    )
+
+    assert response.payload["quote"]["current_price"] == 100
+    assert response.payload["news"][0]["title"] == "公告"
+    assert "/api/stocks/sh688041/analysis" in response.citations
+    assert "/api/stocks/sh688041/news" in response.citations
+
+
+def test_greeting_short_circuits_before_agent_tool_choice():
+    class FailingAgent:
+        async def run(self, query, deps, **kwargs):
+            raise AssertionError("greeting should not reach the model")
+
+    deps = AgentDeps(
+        stock_service=SimpleNamespace(),
+        news_service=SimpleNamespace(),
+        hotspot_service=SimpleNamespace(),
+        portfolio_service=SimpleNamespace(),
+        web_search_service=SimpleNamespace(),
+    )
+
+    response = asyncio.run(run_agent_async(FailingAgent(), deps, "你好"))
+
+    assert response.intent == "greeting"
+    assert deps.tool_results == []
+
+
+def test_news_contract_rejects_technical_analysis_tool():
+    case = EvalCase(
+        case_id="news_without_analysis",
+        query="看看海光信息最近消息",
+        description="消息查询不应自动调用技术分析。",
+        expected_tools=("stock_news",),
+        forbidden_tools=("stock_analysis",),
+    )
+    response = _response(
+        summary="海光信息最近有一条消息。",
+        tools=("get_stock_news", "get_stock_analysis"),
+        citations=("/api/stocks/sh688041/news", "/api/stocks/sh688041/analysis"),
+    )
+
+    result = evaluate_case(case, EvalObservation.from_response(response))
+
+    assert not result.passed
+    assert any(failure.rule == "forbidden_tools" for failure in result.failures)
+
+
+def test_partial_source_failures_keep_completed_results_and_endpoints():
+    results = [
+        {"tool": "read_public_source", "status": "completed", "data": {"url": "https://example.com/a", "data_gaps": []}, "evidence": []},
+        {"tool": "read_public_source", "status": "completed", "data": {"url": "https://example.org/b", "data_gaps": []}, "evidence": []},
+        {"tool": "read_public_source", "status": "unavailable", "data": {"url": "https://example.net/c", "data_gaps": ["blocked"]}, "evidence": []},
+    ]
+    response = build_agent_response(AgentOutput(summary="## 回答\n- ok", actions=[]), results, language="zh-CN")
+    assert len(response.research_steps) == 3
+    assert {step.endpoint for step in response.research_steps} == {"example.com", "example.org", "example.net"}
+    assert any("3 次调用中 1 次失败，2 次成功" in gap for gap in response.data_gaps)
+    assert not any("read_public_source：来源数据不可用" in gap for gap in response.data_gaps)
+
+
+def test_unconfigured_source_is_skipped_not_reported_as_outage():
+    response = build_agent_response(
+        AgentOutput(summary="## 回答\n- 未配置", actions=[]),
+        [{"tool": "get_sec_company_data", "status": "unavailable", "reason_code": "not_configured", "data": {"data_gaps": ["skipped"]}, "evidence": []}],
+        language="zh-CN",
+    )
+    assert any("数据源未配置，本次已跳过" in gap for gap in response.data_gaps)
+    assert not any("来源数据不可用" in gap for gap in response.data_gaps)
+
+
+def test_tool_data_plans_and_cards_reach_the_agent_payload():
+    data = {
+        "provider": "yfinance",
+        "endpoint": "query1.finance.yahoo.com",
+        "currency": "USD",
+        "adjustment": "not_applicable",
+        "statement": "income",
+        "data_as_of": "2025-09-30",
+        "periods": [{"period": "2025-09-30", "values": {"Revenue": 100.0, "NetIncomeLoss": 20.0}}],
+    }
+    response = build_agent_response(
+        AgentOutput(summary="## 财报\n- 已获取", actions=[]),
+        [{"tool": "get_company_fundamentals", "data": data, "evidence": []}],
+        language="zh-CN",
+    )
+    assert response.payload["data_plans"][0]["capability"] == "financials"
+    assert response.payload["data_plans"][0]["provider"] == "yfinance"
+    assert response.payload["data_cards"][0]["kind"] == "financials"
+    assert response.payload["data_cards"][0]["rows"][0]["values"]["营业收入"] == 100.0

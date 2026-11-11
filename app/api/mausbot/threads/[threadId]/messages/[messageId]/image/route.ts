@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { requireMausbotProxyAdmin } from "../../../../../_auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -9,9 +10,11 @@ const PROXY =
 
 export async function GET(
   _req: NextRequest,
-  ctx: { params: Promise<{ threadId: string; messageId: string }> | { threadId: string; messageId: string } },
+  ctx: { params: Promise<{ threadId: string; messageId: string }> },
 ) {
-  const params = await Promise.resolve(ctx.params);
+  const denied = await requireMausbotProxyAdmin();
+  if (denied) return denied;
+  const params = await ctx.params;
   const threadId = encodeURIComponent(params.threadId);
   const messageId = encodeURIComponent(params.messageId);
   const url = `${PROXY}/api/mausbot/threads/${threadId}/messages/${messageId}/image`;

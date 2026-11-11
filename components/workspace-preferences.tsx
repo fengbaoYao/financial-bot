@@ -15,14 +15,11 @@ const PreferencesContext = createContext<{ preferences: Preferences; updatePrefe
 export function WorkspacePreferencesProvider({ children, initialDeepResearchAvailable = true }: { children: React.ReactNode; initialDeepResearchAvailable?: boolean }) {
   const pathname = usePathname();
   const [deepResearchAvailable, setDeepResearchAvailable] = useState(initialDeepResearchAvailable);
-  const deepResearchEnabledForRoute = pathname !== "/work";
   const [preferences, setPreferences] = useState(defaults);
   const [ready, setReady] = useState(false);
   useEffect(() => {
-    // The capability endpoint is currently unavailable from the research workspace.
-    if (pathname === "/work") return;
     // The public beta stays suspended even if an older backend advertises Deep.
-    if (!initialDeepResearchAvailable || pathname === "/landing" || pathname === "/" || pathname === "/bot" || pathname.startsWith("/journal/")) return;
+    if (!initialDeepResearchAvailable || pathname === "/landing" || pathname === "/" || pathname === "/bot" || pathname === "/work" || pathname.startsWith("/journal/")) return;
     let active = true;
     void getAgentResearchCapabilities().then(capabilities => {
       if (active) setDeepResearchAvailable(capabilities.deep_available === true);
@@ -50,10 +47,9 @@ export function WorkspacePreferencesProvider({ children, initialDeepResearchAvai
       try { localStorage.setItem(storageKey, JSON.stringify(preferences)); } catch { /* Retain preferences for this visit. */ }
     }
   }, [preferences, ready]);
-  const availableDeepResearch = deepResearchEnabledForRoute && deepResearchAvailable;
-  const updatePreferences = useCallback((patch: Partial<Preferences>) => setPreferences(current => ({ ...current, ...patch, ...(patch.researchMode ? { researchMode: effectiveResearchMode(patch.researchMode, availableDeepResearch) } : {}) })), [availableDeepResearch]);
-  const effectivePreferences = { ...preferences, researchMode: effectiveResearchMode(preferences.researchMode, availableDeepResearch) };
-  return <PreferencesContext.Provider value={{ preferences: effectivePreferences, updatePreferences, deepResearchAvailable: availableDeepResearch }}>{children}</PreferencesContext.Provider>;
+  const updatePreferences = useCallback((patch: Partial<Preferences>) => setPreferences(current => ({ ...current, ...patch, ...(patch.researchMode ? { researchMode: effectiveResearchMode(patch.researchMode, deepResearchAvailable) } : {}) })), [deepResearchAvailable]);
+  const effectivePreferences = { ...preferences, researchMode: effectiveResearchMode(preferences.researchMode, deepResearchAvailable) };
+  return <PreferencesContext.Provider value={{ preferences: effectivePreferences, updatePreferences, deepResearchAvailable }}>{children}</PreferencesContext.Provider>;
 }
 
 export function useWorkspacePreferences() {

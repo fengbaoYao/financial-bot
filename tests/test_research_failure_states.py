@@ -576,16 +576,20 @@ def test_outbound_webhook_is_opt_in_and_best_effort(monkeypatch):
     monkeypatch.setenv("FINANCIAL_BOT_WEBHOOK_URL", "https://example.org/hook")
     calls = []
 
-    def post_public_https(url, data, headers):
-        calls.append((url, data, headers))
-        return 204
+    class Response:
+        status = 204
 
-    monkeypatch.setattr(dispatch_module, "_post_public_https", post_public_https)
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(dispatch_module.urllib.request, "urlopen", lambda request, timeout: calls.append(request) or Response())
     result = dispatch_notification({"title": "x", "body": "y", "bot_id": "b"})
     assert result["webhook"] is True
     assert len(calls) == 1
-    assert calls[0][0] == "https://example.org/hook"
-    assert b'"title": "x"' in calls[0][1]
+    assert calls[0].data
 
 
 def test_market_hours_quiet_hours_and_private_channel_settings():

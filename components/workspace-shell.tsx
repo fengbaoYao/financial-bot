@@ -13,12 +13,17 @@ import { CandlestickChart, type ChartPoint } from "@/components/candlestick-char
 import { ResearchChart, type ChartAnnotation, type ChartSegment } from "@/components/research-chart";
 import {
   getGlobalNews,
+  getCreditBalance,
   getHotspotDetail,
   getMarketRegime,
   getPortfolioAnalysis,
   getStockAnalysis,
   getStockNews,
   getWorkspaceBootstrap,
+  getWorkspaceWatchlist,
+  initializeWorkspaceWatchlist,
+  updateWorkspaceWatchlist,
+  searchStocks,
 } from "@/lib/api";
 import type {
   GlobalNewsItem,
@@ -27,6 +32,7 @@ import type {
   NewsItem,
   PortfolioAnalysisResponse,
   StockAnalysisResponse,
+  CreditBalanceResponse,
 } from "@/lib/types";
 import {
   AGENT_LAB_RUN_EVENT,
@@ -105,6 +111,7 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
   const [watchlist, setWatchlist] = useState<WatchItem[]>(DEFAULT_WATCHLIST);
   const [watchlistLoaded, setWatchlistLoaded] = useState(false);
   const [watchlistBusy, setWatchlistBusy] = useState(false);
+  const [watchlistInput, setWatchlistInput] = useState("");
   const [watchlistError, setWatchlistError] = useState("");
   const [sessions, setSessions] = useState<WorkspaceSessionSummary[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
@@ -166,20 +173,48 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
   }, [compactViewport, preferences.showResearchPanel]);
   const [cloudStatus, setCloudStatus] = useState<"local" | "syncing" | "connected" | "error">("local");
   const [cloudError, setCloudError] = useState("");
-  const refreshWatchlist = useCallback(() => {
-    setWatchlist(readWatchlistCache());
-    setWatchlistLoaded(true);
-    setWatchlistError("");
+  const [creditBalance, setCreditBalance] = useState<CreditBalanceResponse | null>(null);
+
+  const refreshCreditBalance = useCallback(async () => {
+    try {
+      setCreditBalance(await getCreditBalance());
+    } catch {
+      setCreditBalance(null);
+    }
   }, []);
 
+  const refreshWatchlist = useCallback(async () => {
+    try {
+      const saved = await getWorkspaceWatchlist();
+      const canonical = saved.initialized ? saved : await initializeWorkspaceWatchlist(readWatchlistCache());
+      setWatchlist(canonical.items);
+      setWatchlistLoaded(true);
+      setWatchlistError("");
+    } catch {
+      setWatchlistError(locale === "en" ? "Watchlist sync unavailable. Your saved list is preserved." : "自选股同步暂不可用，已保存的列表仍保留。");
+    }
+  }, [locale]);
+
   useEffect(() => {
-    refreshWatchlist();
-  }, [refreshWatchlist]);
+    let cancelled = false;
+    const existing = readWatchlistCache();
+    setWatchlist(existing);
+    void (async () => {
+      try {
+        const saved = await getWorkspaceWatchlist();
+        const canonical = saved.initialized ? saved : await initializeWorkspaceWatchlist(existing);
+        if (!cancelled) { setWatchlist(canonical.items); setWatchlistLoaded(true); setWatchlistError(""); }
+      } catch {
+        if (!cancelled) setWatchlistError("Watchlist sync unavailable. Your saved list is preserved.");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     if (!watchlistLoaded) return;
     try { window.localStorage.setItem(WATCHLIST_STORAGE_KEY, JSON.stringify(watchlist)); }
-    catch { /* Keep the in-memory list for this visit when browser storage is full. */ }
+    catch { /* The backend remains the source of truth when browser storage is full. */ }
   }, [watchlist, watchlistLoaded]);
 
   useEffect(() => {
@@ -302,7 +337,8 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
     if (!snapshot.session?.access_token) {
       setCloudStatus("local");
       setCloudError(snapshot.error ?? "");
-      refreshWatchlist();
+      void refreshCreditBalance();
+      void refreshWatchlist();
       return;
     }
     setCloudStatus("syncing");
@@ -310,13 +346,18 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
     try {
       const bootstrap = await getWorkspaceBootstrap(snapshot.session.access_token);
       void bootstrap;
-      refreshWatchlist();
+      await refreshWatchlist();
       setCloudStatus("connected");
+      await refreshCreditBalance();
     } catch (syncError) {
       setCloudStatus("error");
       setCloudError(syncError instanceof Error ? syncError.message : t("Supabase 工作台同步失败"));
     }
-  }, [refreshWatchlist, t]);
+  }, [refreshCreditBalance, refreshWatchlist, t]);
+
+  useEffect(() => {
+    void refreshCreditBalance();
+  }, [refreshCreditBalance]);
 
   useEffect(() => {
     const symbol = searchParams.get("symbol");
@@ -368,11 +409,42 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
     if (compactViewport) setLeftPanelOpen(false);
   }
 
+  async function addWatchItem(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const value = watchlistInput.trim();
+    if (!value || watchlistBusy || !watchlistLoaded) return;
+    setWatchlistError("");
+    let code = normalizeSymbol(value);
+    let name = value;
+    try {
+      const matches = await searchStocks(value);
+      const exact = matches.filter(item => item.name.toLowerCase() === value.toLowerCase() || item.code.toUpperCase() === value.toUpperCase() || item.code.toUpperCase() === `US.${value.toUpperCase()}`);
+      const target = exact[0] ?? (matches.length === 1 ? matches[0] : null);
+      if (!target) { setWatchlistError(locale === "en" ? "Use a ticker to identify the company precisely." : "请提供股票代码，以准确识别公司。"); return; }
+      code = target.code;
+      name = target.name;
+    } catch { setWatchlistError(locale === "en" ? "Company search unavailable. Please try again." : "股票搜索暂不可用，请重试。"); return; }
+    if (watchlist.some((item) => item.code.toLowerCase() === code.toLowerCase())) {
+      openStock(code);
+      setWatchlistInput("");
+      return;
+    }
+    setWatchlistBusy(true);
+    try {
+      const saved = await updateWorkspaceWatchlist("add", code);
+      setWatchlist(saved.items);
+      setWatchlistInput("");
+      openStock(code, name);
+    } catch (error) { setWatchlistError(error instanceof Error ? error.message : t("自选股保存失败")); }
+    finally { setWatchlistBusy(false); }
+  }
+
   async function removeWatchItem(code: string) {
     if (watchlistBusy) return;
     setWatchlistBusy(true);
     setWatchlistError("");
-    try { setWatchlist(items => items.filter(item => item.code.toUpperCase() !== code.toUpperCase())); }
+    try { setWatchlist((await updateWorkspaceWatchlist("remove", code)).items); }
+    catch (error) { setWatchlistError(error instanceof Error ? error.message : t("自选股保存失败")); }
     finally { setWatchlistBusy(false); }
   }
 
@@ -381,11 +453,10 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
     setWatchlistBusy(true);
     setWatchlistError("");
     try {
-      const exists = watchlist.some(item => item.code.toUpperCase() === code.toUpperCase());
-      setWatchlist(items => exists
-        ? items.filter(item => item.code.toUpperCase() !== code.toUpperCase())
-        : [...items, { code: normalizeSymbol(code), name: normalizeSymbol(code) }]);
-    } finally { setWatchlistBusy(false); }
+      const action = watchlist.some(item => item.code.toUpperCase() === code.toUpperCase()) ? "remove" : "add";
+      setWatchlist((await updateWorkspaceWatchlist(action, code)).items);
+    } catch (error) { setWatchlistError(error instanceof Error ? error.message : t("自选股保存失败")); }
+    finally { setWatchlistBusy(false); }
   }
 
   function selectSession(sessionId: string) {
@@ -598,12 +669,16 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
 
             <WorkspaceTools activeType={activeContext?.type} onOpen={openResearchTool} />
 
-            <p className="workspace-empty-copy" role="status">
-              {locale === "en" ? "Stock search and adding are temporarily unavailable." : "股票搜索和新增自选股暂时关闭。"}
-            </p>
-            <p className="workspace-empty-copy">
-              {locale === "en" ? "Saved stocks stay in this browser; cloud sync is paused." : "现有自选股保存在当前浏览器，云端同步已暂停。"}
-            </p>
+            <form className="workspace-watch-search" onSubmit={addWatchItem}>
+              <span aria-hidden="true">⌕</span>
+              <input
+                disabled={watchlistBusy || !watchlistLoaded}
+                value={watchlistInput}
+                onChange={(event) => setWatchlistInput(event.target.value)}
+                placeholder={t("添加股票或代码")}
+                aria-label={t("添加股票或代码")}
+              />
+            </form>
             {watchlistError ? <p className="workspace-empty-copy" role="alert">{watchlistError}</p> : null}
 
             <section className="workspace-list-section">
@@ -729,7 +804,7 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
                     <SupabaseAuthPanel placement="profile" onAuthChange={handleSupabaseAuth} />
                     <p className="workspace-account-status">{cloudStatus === "connected" ? t("云端已连接") : cloudStatus === "syncing" ? t("同步中") : cloudStatus === "error" ? t("云端同步未完成") : t("本地模式")}</p>
                     {cloudError ? <p className="workspace-account-status">{t("使用本地记录")}</p> : null}
-                    <p className="workspace-account-status">{locale === "en" ? "Credit balance temporarily unavailable" : "额度信息暂时不可用"}</p>
+                    <p className="workspace-account-status">{creditBalance?.unlimited ? t("本地模式 · Credits 不限") : `${creditBalance?.balance ?? "—"} Credits`}</p>
                   </div>
                 ) : null}
                 <button
@@ -765,6 +840,14 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
             onCurrentSessionChange={setActiveSessionId}
             onContextUpdate={handleContextUpdate}
             onLabTrace={labMode ? handleLabTrace : undefined}
+            onCreditUpdate={(usage) => {
+              if (usage.remaining == null || usage.unlimited) return;
+              setCreditBalance((current) => current ? {
+                ...current,
+                balance: usage.remaining ?? current.balance,
+                lifetime_used: current.lifetime_used + usage.charged,
+              } : current);
+            }}
           />
         </section>
 
@@ -959,10 +1042,30 @@ function ResearchContextPanel({
         if (context.type === "stock" && context.entityId) {
           const requestedSymbol = context.entityId;
           const payloadStock = payloadToStock(context.payload);
+          let searchResults: Awaited<ReturnType<typeof searchStocks>> = [];
+          // Bound search so a hung lookup cannot keep the panel spinning forever.
+          try {
+            searchResults = await Promise.race([
+              searchStocks(requestedSymbol),
+              new Promise<Awaited<ReturnType<typeof searchStocks>>>((_, reject) => {
+                const timer = setTimeout(() => reject(new Error(locale === "en" ? "Search timed out" : "搜索超时")), 4000);
+                controller.signal.addEventListener("abort", () => { clearTimeout(timer); reject(new Error("aborted")); }, { once: true });
+              }),
+            ]);
+          } catch {
+            // A temporary search outage should not block a request that already has a code.
+            searchResults = [];
+          }
           if (cancelled || controller.signal.aborted) return;
-          const stockCode = payloadStock?.stock_code ?? requestedSymbol;
+          const exactMatch = searchResults.find((item) =>
+            item.match_type !== "code_validation" &&
+            !isUnknownStockName(item.name) &&
+            (item.code.toLowerCase() === requestedSymbol.toLowerCase() ||
+              item.name.trim().toLowerCase() === requestedSymbol.trim().toLowerCase()),
+          );
+          const stockCode = exactMatch?.code ?? payloadStock?.stock_code ?? requestedSymbol;
           const payloadName = payloadStock?.stock_name;
-          const stockName = payloadName && !isUnknownStockName(payloadName) ? payloadName : undefined;
+          const stockName = exactMatch?.name ?? (payloadName && !isUnknownStockName(payloadName) ? payloadName : undefined);
           if (stockName && stockName !== stockCode) setResolvedStockName(stockName);
           // News is best-effort: a hung HK/CN news provider must not blank the quote/chart panel.
           const analysisPromise = getStockAnalysis(stockCode, {

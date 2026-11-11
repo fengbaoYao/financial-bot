@@ -18,7 +18,8 @@ export async function proxy(request: NextRequest) {
     }
   }
 
-  // financial-bot shell and its BFF do not use Supabase auth.
+  // The bot shell and BFF skip this shared middleware. Privileged Mausbot
+  // proxy routes perform their own server-side authorization checks.
   if (path === "/bot" || path.startsWith("/bot/") || path.startsWith("/api/mausbot")) {
     return NextResponse.next();
   }

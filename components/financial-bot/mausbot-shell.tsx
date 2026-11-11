@@ -3,7 +3,6 @@
 
 import { FormEvent, SyntheticEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import styles from "./mausbot-shell.module.css";
-import MausbotBrowserPanel from "./mausbot-browser-panel";
 
 type OmbTask = {
   threadId: string;
@@ -1265,7 +1264,7 @@ function AttachImage({ src, alt }: { src: string; alt: string }) {
 }
 
 function MessageBody({ msg, botName, zh }: { msg: ChatMsg; botName: string; zh: boolean }) {
-  const html = useMemo(() => renderLightMarkdown(msg.text || ""), [msg.text]);
+  const html = useMemo(() => renderLightMarkdown(String(msg.text || "").replace(/<attached-(?:image|file)[^>]*>/gi, "")), [msg.text]);
   const [zoomed, setZoomed] = useState<string | null>(null);
 
   useEffect(() => {
@@ -2715,6 +2714,22 @@ export function MausbotShell() {
   const [config, setConfig] = useState<any>(null);
   const [health, setHealth] = useState<any>(null);
   const [panelOpen, setPanelOpen] = useState(true);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [inboxOnly, setInboxOnly] = useState(false);
+  const [dictating, setDictating] = useState(false);
+  const [engineBusy, setEngineBusy] = useState(false);
+  const [browserState, setBrowserState] = useState<{ url?: string; tabs?: any[] } | null>(null);
+  const [browserUrl, setBrowserUrl] = useState("");
+  const [browserShot, setBrowserShot] = useState("");
+  const [browserBusy, setBrowserBusy] = useState(false);
+  const browserEditingRef = useRef(false);
+  const dictationRef = useRef<any>(null);
+  const searchRef = useRef<HTMLInputElement | null>(null);
+  const [origin, setOrigin] = useState("");
+  const [pendingFiles, setPendingFiles] = useState<Array<{ path: string; mime: string; name: string; bytes: number; kind?: string }>>([]);
+  const pendingFilesRef = useRef<Array<{ path: string; mime: string; name: string; bytes: number; kind?: string }>>([]);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  useEffect(() => { setOrigin(window.location.origin); }, []);
   const [modelBusy, setModelBusy] = useState(false);
   const [navOpen, setNavOpen] = useState(false);
   const [threadQuery, setThreadQuery] = useState("");
@@ -3268,6 +3283,8 @@ export function MausbotShell() {
       const bid = botIdRef.current;
       const tid = threadIdRef.current;
       if (!text.trim() || !bid || !tid) return;
+      const attachmentMarkers = pendingFilesRef.current.map((f) => f.kind === "file" ? `\n<attached-file path="${f.path}" name="${f.name}">` : `\n<attached-image path="${f.path}" name="${f.name}">`).join("");
+      const sendText = text + attachmentMarkers;
       if (streamingRef.current) {
         void queueMidTurn(text);
         return;
@@ -3358,7 +3375,7 @@ export function MausbotShell() {
         const res = await fetch("/api/mausbot/ask/stream", {
           method: "POST",
           headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-          body: JSON.stringify({ text, botId: bid, threadId: tid }),
+          body: JSON.stringify({ text: sendText, botId: bid, threadId: tid }),
           cache: "no-store",
           signal: ac.signal,
         });
@@ -3367,6 +3384,7 @@ export function MausbotShell() {
           const data = await readJson(res);
           throw new Error(String(data?.detail || data?.error || `ask failed (${res.status})`));
         }
+        if (pendingFilesRef.current.length) setPending([]);
 
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
@@ -3813,9 +3831,132 @@ if (kind === "turn") {
     }
   }
 
+  function setPending(next: Array<{ path: string; mime: string; name: string; bytes: number; kind?: string }>) {
+    pendingFilesRef.current = next;
+    setPendingFiles(next);
+  }
+
+  async function attachFiles(list: FileList | null) {
+    if (!list?.length) return;
+    if (streamingRef.current) {
+      setError(zh ? "当前回合结束后再添加附件" : "Add attachments after this turn ends");
+      return;
+    }
+    for (const file of Array.from(list).slice(0, 4)) {
+      const isImage = file.type.startsWith("image/");
+      const endpoint = isImage ? "/api/mausbot/attachments" : "/api/mausbot/files";
+      try {
+        const res = await fetch(`${endpoint}?name=${encodeURIComponent(file.name)}`, {
+          method: "POST",
+          headers: { "Content-Type": file.type || "application/octet-stream" },
+          body: file,
+          cache: "no-store",
+        });
+        const data = await readJson(res);
+        if (!res.ok || !data?.path) throw new Error(String(data?.detail || data?.error || `upload failed (${res.status})`));
+        setPending([...pendingFilesRef.current, { path: String(data.path), mime: String(data.mime || file.type), name: String(data.name || file.name), bytes: Number(data.bytes || file.size), kind: isImage ? "image" : "file" }]);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    }
+  }
+
+  const refreshBrowser = useCallback(async () => {
+    try {
+      const res = await fetch("/api/mausbot/browser/state", { cache: "no-store" });
+      const data = await readJson(res);
+      if (!res.ok) throw new Error(String(data?.detail || data?.error || "browser unavailable"));
+      setBrowserState(data);
+      if (!browserEditingRef.current) setBrowserUrl(String(data?.url || ""));
+      setBrowserShot(`/api/mausbot/browser/screenshot?t=${Date.now()}`);
+    } catch {
+      setBrowserState(null);
+    }
+  }, []);
+
+  async function browserOpenUrl(url?: string) {
+    const target = String(url ?? browserUrl).trim();
+    if (!target) return;
+    setBrowserBusy(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/mausbot/browser/open", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url: target }), cache: "no-store" });
+      const data = await readJson(res);
+      if (!res.ok) throw new Error(String(data?.detail || data?.error || `open failed (${res.status})`));
+      await refreshBrowser();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBrowserBusy(false);
+    }
+  }
+
+  async function browserAct(action: string, index?: number, tabId?: string) {
+    setBrowserBusy(true);
+    try {
+      const res = await fetch("/api/mausbot/browser/action", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, index, tabId }), cache: "no-store" });
+      const data = await readJson(res);
+      if (!res.ok) throw new Error(String(data?.detail || data?.error || `action failed (${res.status})`));
+      await refreshBrowser();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBrowserBusy(false);
+    }
+  }
+
+  async function installBrowserEngine() {
+    setEngineBusy(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/mausbot/browser-engine/install", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}", cache: "no-store" });
+      const data = await readJson(res);
+      if (!res.ok) throw new Error(String(data?.detail || data?.error || `install failed (${res.status})`));
+      if (botId) await loadRail(botId);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setEngineBusy(false);
+    }
+  }
+
+  async function toggleDictation() {
+    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SR) {
+      setError(zh ? "当前浏览器不支持听写" : "Dictation is not supported in this browser");
+      return;
+    }
+    if (dictating) {
+      dictationRef.current?.stop();
+      setDictating(false);
+      return;
+    }
+    const rec = new SR();
+    rec.lang = zh ? "zh-CN" : "en-US";
+    rec.continuous = true;
+    rec.interimResults = false;
+    rec.onresult = (ev: any) => {
+      let add = "";
+      for (let i = ev.resultIndex; i < ev.results.length; i += 1) add += ev.results[i][0]?.transcript || "";
+      if (add) setInput((prev) => (prev ? prev + add : add));
+    };
+    rec.onend = () => { setDictating(false); dictationRef.current = null; };
+    rec.onerror = () => { setDictating(false); };
+    dictationRef.current = rec;
+    try { rec.start(); setDictating(true); } catch { setDictating(false); }
+  }
+
+  function switchLang(next: string) {
+    const url = new URL(window.location.href);
+    url.searchParams.set("lang", next);
+    window.location.href = url.toString();
+  }
+
   function onSubmit(e?: FormEvent) {
     e?.preventDefault();
-    const text = input.trim();
+    const typed = input.trim();
+    const hasFiles = pendingFilesRef.current.length > 0;
+    const text = typed || (hasFiles ? (zh ? "请看附件" : "Please look at the attachment") : "");
     if (!text || !botId || !threadId || bootstrapping) return;
     setInput("");
     if (streamingRef.current) {
@@ -3939,7 +4080,9 @@ if (kind === "turn") {
   }, [zh]);
 
 
-  /* Desktop / Local VM controls were removed from the right rail; do not poll computer status. */
+  useEffect(() => {
+    if (rail === "screen") void refreshComputer();
+  }, [rail, refreshComputer]);
 
 
 
@@ -4267,10 +4410,20 @@ if (kind === "turn") {
 
   const shownThreads = threads.filter((t) => {
     if (isNoisyTitle(t.title) && t.threadId !== threadId) return false;
+    if (inboxOnly && !t.unread) return false;
     const q = threadQuery.trim().toLowerCase();
     if (!q) return true;
     return (t.title || "").toLowerCase().includes(q);
   });
+
+  useEffect(() => {
+    if (rail !== "browser") return;
+    void refreshBrowser();
+    const timer = window.setInterval(() => { void refreshBrowser(); }, 2500);
+    return () => window.clearInterval(timer);
+  }, [rail, refreshBrowser]);
+
+  const unreadCount = threads.filter((t) => t.unread).length;
 
   const presence = (() => {
     const openSecret = messages.some(
@@ -4353,9 +4506,20 @@ if (kind === "turn") {
             </span>
           </div>
 
+          <div className={styles.topActions}>
+            <button type="button" className={styles.topAction} data-active={inboxOnly ? "true" : "false"} title={zh ? "收件箱：只看未读" : "Inbox: unread only"} onClick={() => setInboxOnly((v) => !v)}>
+              <span aria-hidden="true">◔</span>
+              {unreadCount > 0 ? <span className={styles.topBadge}>{unreadCount}</span> : null}
+            </button>
+            <button type="button" className={styles.topAction} title={zh ? "应用设置" : "App settings"} onClick={() => setSettingsOpen(true)}><span aria-hidden="true">⚙</span></button>
+            <button type="button" className={styles.topAction} title={zh ? "搜索机器人和消息" : "Search bots and messages"} onClick={() => searchRef.current?.focus()}><span aria-hidden="true">⌕</span></button>
+            <button type="button" className={styles.topAction} title={zh ? "新建话题" : "New thread"} onClick={() => void onNewThread()} disabled={!botId || streaming}><span aria-hidden="true">＋</span></button>
+          </div>
+
           <label className={styles.search}>
             <span className={styles.srOnly}>{zh ? "筛选话题" : "Filter threads"}</span>
             <input
+              ref={searchRef}
               className={styles.searchInput}
               value={threadQuery}
               onChange={(ev) => setThreadQuery(ev.target.value)}
@@ -4446,7 +4610,7 @@ if (kind === "turn") {
           <div className={styles.sideFoot}>
             <button type="button" className={styles.footButton} data-active={panelOpen && rail === "data" ? "true" : "false"} onClick={() => openRail("data")}>{zh ? "工具" : "Tools"}</button>
             <button type="button" className={styles.footButton} data-active={panelOpen && rail === "routines" ? "true" : "false"} onClick={() => openRail("routines")}>{zh ? "自动化" : "Automate"}</button>
-            <button type="button" className={styles.footButton} data-active={panelOpen && rail === "browser" ? "true" : "false"} onClick={() => openRail("browser")}>{zh ? "用户" : "User"}</button>
+            <button type="button" className={styles.footButton} data-active={settingsOpen ? "true" : "false"} onClick={() => setSettingsOpen(true)}>{zh ? "设置" : "Settings"}</button>
           </div>
           <div className={styles.userChip} title={zh ? "当前用户" : "Current user"}>
             <span className={styles.userChipDot} aria-hidden="true">姚</span>
@@ -4659,6 +4823,16 @@ if (kind === "turn") {
           </div>
 
           <div className={styles.composerWrap} role="form">
+            {pendingFiles.length ? (
+              <div className={styles.attachChips}>
+                {pendingFiles.map((f, i) => (
+                  <span key={f.path} className={styles.attachChip}>
+                    <span>{f.name}</span>
+                    <button type="button" aria-label={zh ? "移除附件" : "Remove attachment"} onClick={() => setPending(pendingFilesRef.current.filter((_, j) => j !== i))}>✕</button>
+                  </span>
+                ))}
+              </div>
+            ) : null}
             {queued.length ? (
               <div className={styles.queue} aria-label={zh ? "排队中的消息（回合未完时发送会进队）" : "Queued messages (sends enqueue while a turn runs)"}>
                 <div className={styles.queueHead}>
@@ -4694,8 +4868,12 @@ if (kind === "turn") {
               </div>
             ) : null}
             <div className={styles.composerTools} aria-hidden="true">
-              <button type="button" className={styles.composerToolBtn} tabIndex={-1} title={zh ? "附件" : "Attach"}>
+              <input ref={fileInputRef} type="file" multiple hidden onChange={(e) => { void attachFiles(e.currentTarget.files); e.currentTarget.value = ""; }} />
+              <button type="button" className={styles.composerToolBtn} tabIndex={-1} disabled={streaming} title={zh ? "附件（图片）" : "Attach image"} onClick={() => fileInputRef.current?.click()}>
                 <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M7.2 12.4 11.6 8a2.6 2.6 0 0 0-3.7-3.7L4.2 8a1.5 1.5 0 0 0 2.1 2.1l3.2-3.2" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/></svg>
+              </button>
+              <button type="button" className={styles.composerToolBtn} tabIndex={-1} title={zh ? "听写" : "Dictation"} disabled={streaming} data-active={dictating ? "true" : "false"} onClick={() => void toggleDictation()}>
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="6" y="2.2" width="4" height="7.4" rx="2" stroke="currentColor" strokeWidth="1.3"/><path d="M3.6 7.6a4.4 4.4 0 0 0 8.8 0M8 12v1.8" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>
               </button>
               <button type="button" className={styles.composerToolBtn} tabIndex={-1} title={zh ? "清空" : "Clear"} onClick={() => setInput("")}>
                 <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M4 5.5h8M6.2 5.5V4.4c0-.5.4-.9.9-.9h1.8c.5 0 .9.4.9.9v1.1M5.2 5.5l.5 6.2c0 .5.4.8.9.8h3c.5 0 .8-.3.9-.8l.5-6.2" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/></svg>
@@ -4744,7 +4922,7 @@ if (kind === "turn") {
                     {zh ? "停止" : "Stop"}
                   </button>
                 ) : null}
-                <button type="button" className={styles.sendBtn} disabled={!input.trim() || !threadId || bootstrapping} onClick={() => onSubmit()}>
+                <button type="button" className={styles.sendBtn} disabled={(!input.trim() && pendingFiles.length === 0) || !threadId || bootstrapping} onClick={() => onSubmit()}>
                   {streaming ? (zh ? "排队" : "Queue") : (zh ? "发送" : "Send")}
                 </button>
               </div>
@@ -4759,7 +4937,7 @@ if (kind === "turn") {
         <aside className={styles.rail} aria-label={zh ? "功能板块" : "Panels"}>
           <div className={styles.tabs} role="tablist">
             {([
-              ["screen", zh ? "工作台" : "Workbench"],
+              ["screen", zh ? "屏幕" : "Screen"],
               ["routines", zh ? "例行任务" : "Routines"],
               ["browser", zh ? "浏览器" : "Browser"],
               ["data", zh ? "数据" : "Data"],
@@ -4779,13 +4957,22 @@ if (kind === "turn") {
           </div>
           <div className={styles.railBody}>
             {rail === "screen" ? (
-              <section>
-                <strong className={styles.panelTitle}>{zh ? "工作台" : "Workbench"}</strong>
-                <p className={styles.desktopNote}>
-                  {zh
-                    ? "桌面暂不可用。这台机器无法运行 Local VM 或工作位置，普通对话和取数不受影响。"
-                    : "Desktop is unavailable. This host cannot run Local VM or work-location controls. Chat and data tools still work."}
-                </p>
+              <section className={styles.desktopPanel}>
+                <strong className={styles.panelTitle}>{zh ? "屏幕" : "Screen"}</strong>
+                {computerStatus?.desktopReady ? (
+                  <iframe
+                    className={styles.desktopFrame}
+                    src="/desktop-viewer#target=local%2Fshared"
+                    title={zh ? "桌面" : "Desktop"}
+                    allow="clipboard-read; clipboard-write"
+                  />
+                ) : (
+                  <p className={styles.desktopNote}>
+                    {computerStatus?.reason || (zh
+                      ? "桌面正在准备中，稍后会自动显示。普通对话和取数不受影响。"
+                      : "Preparing the desktop. It will appear here shortly.")}
+                  </p>
+                )}
               </section>
             ) : null}
             {rail === "routines" ? (
@@ -4874,7 +5061,53 @@ if (kind === "turn") {
                 ) : null}
               </section>
             ) : null}
-            {rail === "browser" ? <MausbotBrowserPanel zh={zh} /> : null}
+            {rail === "browser" ? (
+              <section className={styles.browserPanel}>
+                <div className={styles.browserBar}>
+                  <button type="button" title={zh ? "后退" : "Back"} onClick={() => void browserAct("back")}>‹</button>
+                  <button type="button" title={zh ? "前进" : "Forward"} onClick={() => void browserAct("forward")}>›</button>
+                  <button type="button" title={zh ? "刷新" : "Reload"} onClick={() => void browserAct("reload")}>⟳</button>
+                  <input
+                    className={styles.browserAddress}
+                    value={browserUrl}
+                    onChange={(e) => setBrowserUrl(e.target.value)}
+                    onFocus={() => { browserEditingRef.current = true; }}
+                    onBlur={() => { browserEditingRef.current = false; }}
+                    onKeyDown={(e) => { if (e.key === "Enter") void browserOpenUrl(); }}
+                    placeholder={zh ? "输入网址" : "Enter address"}
+                    aria-label={zh ? "浏览器地址" : "Browser address"}
+                  />
+                  <button type="button" disabled={browserBusy} onClick={() => void browserOpenUrl()}>{zh ? "前往" : "Go"}</button>
+                </div>
+                <div className={styles.browserTabs}>
+                  {(browserState?.tabs || []).map((t, i) => (
+                    <span key={t.tabId || i} className={styles.browserTab} data-active={t.active ? "true" : "false"}>
+                      <button type="button" onClick={() => void browserAct("tab-select", i, t.tabId)}>{t.title || t.url || `${zh ? "标签" : "Tab"} ${i + 1}`}</button>
+                      <button type="button" aria-label={zh ? "关闭标签" : "Close tab"} onClick={() => void browserAct("tab-close", i, t.tabId)}>×</button>
+                    </span>
+                  ))}
+                  <button type="button" className={styles.browserTabNew} title={zh ? "新建标签页" : "New tab"} onClick={() => void browserAct("tab-new")}>＋</button>
+                </div>
+                {browserShot ? (
+                  <img className={styles.browserShot} src={browserShot} alt={zh ? "浏览器画面" : "Browser view"} />
+                ) : (
+                  <p className={styles.emptyHint}>{zh ? "浏览器未启动或暂不可用。" : "Browser is not running or unavailable."}</p>
+                )}
+                {config?.browserEngine?.kind === "unavailable" && config.browserEngine.installable ? (
+                  <button type="button" className={styles.textButton} disabled={engineBusy} onClick={() => void installBrowserEngine()}>
+                    {engineBusy ? (zh ? "安装中…" : "Installing…") : (zh ? "安装浏览器引擎" : "Install browser engine")}
+                  </button>
+                ) : null}
+                <details className={styles.engineDetails}>
+                  <summary>{zh ? "连接与引擎" : "Connection & engine"}</summary>
+                  <ul className={styles.settingsList}>
+                    <li className={styles.settingsRow}><strong>{zh ? "入口" : "Entry"}</strong><span>{origin || "—"}</span></li>
+                    <li className={styles.settingsRow}><strong>{zh ? "引擎" : "Engine"}</strong><span>{config?.browserEngine?.kind === "engine" ? `${zh ? "已就绪" : "ready"}${config.browserEngine.version ? ` · ${config.browserEngine.version}` : ""}` : (zh ? "未就绪" : "not ready")}</span></li>
+                    <li className={styles.settingsRow}><strong>{zh ? "桌面" : "Desktop"}</strong><span>{computerStatus?.desktopReady ? (zh ? "已连接" : "connected") : (computerStatus?.status || (zh ? "未连接" : "off"))}</span></li>
+                  </ul>
+                </details>
+              </section>
+            ) : null}
             {rail === "data" ? (
               <section>
                 <strong className={styles.panelTitle}>{zh ? "数据 / 记忆" : "Data / Memory"}</strong>
@@ -4892,6 +5125,31 @@ if (kind === "turn") {
           </div>
         </aside>
       </div>
+      {settingsOpen ? (
+        <div className={styles.modalBackdrop} onClick={() => setSettingsOpen(false)}>
+          <div className={styles.modal} role="dialog" aria-modal="true" aria-label={zh ? "设置" : "Settings"} onClick={(e) => e.stopPropagation()}>
+            <div className={styles.modalHead}>
+              <strong>{zh ? "设置" : "Settings"}</strong>
+              <button type="button" className={styles.iconButton} aria-label={zh ? "关闭" : "Close"} onClick={() => setSettingsOpen(false)}>✕</button>
+            </div>
+            <ul className={styles.settingsList}>
+              <li className={styles.settingsRow}><strong>{zh ? "账号" : "Account"}</strong><span>{zh ? "姚星宇" : "Xingyu"}</span></li>
+              <li className={styles.settingsRow}><strong>{zh ? "模型" : "Model"}</strong><span>{modelLabel}</span></li>
+              <li className={styles.settingsRow}><strong>{zh ? "连接" : "Link"}</strong><span>{health?.ok ? (zh ? "正常" : "ok") : (zh ? "不可用" : "down")}</span></li>
+              <li className={styles.settingsRow}><strong>{zh ? "入口" : "Entry"}</strong><span>{origin || "—"}</span></li>
+              <li className={styles.settingsRow}><strong>{zh ? "桌面" : "Desktop"}</strong><span>{computerStatus?.desktopReady ? (zh ? "已连接" : "connected") : (computerStatus?.status || (zh ? "未连接" : "off"))}</span></li>
+              <li className={styles.settingsRow}><strong>{zh ? "语言" : "Language"}</strong><span className={styles.langSwitch}>
+                <button type="button" data-active={zh ? "true" : "false"} onClick={() => switchLang("zh")}>中文</button>
+                <button type="button" data-active={!zh ? "true" : "false"} onClick={() => switchLang("en")}>English</button>
+              </span></li>
+            </ul>
+            <div className={styles.modalActions}>
+              <button type="button" className={styles.textButton} onClick={() => { setSettingsOpen(false); openRail("screen"); }}>{zh ? "打开屏幕" : "Open screen"}</button>
+              <button type="button" className={styles.textButton} onClick={() => { setSettingsOpen(false); openRail("data"); }}>{zh ? "记忆与技能" : "Memory & skills"}</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       <button
         type="button"
         className={styles.backdrop}

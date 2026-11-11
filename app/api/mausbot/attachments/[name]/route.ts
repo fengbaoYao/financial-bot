@@ -1,4 +1,5 @@
 import { NextRequest } from "next/server";
+import { requireMausbotProxyAdmin } from "../../_auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -22,8 +23,10 @@ function imageTypeFor(name: string): string | null {
   return null;
 }
 
-export async function GET(_req: NextRequest, ctx: { params: Promise<{ name: string }> | { name: string } }) {
-  const resolved = await Promise.resolve(ctx.params);
+export async function GET(_req: NextRequest, ctx: { params: Promise<{ name: string }> }) {
+  const denied = await requireMausbotProxyAdmin();
+  if (denied) return denied;
+  const resolved = await ctx.params;
   let name = String(resolved?.name || "");
   try {
     name = decodeURIComponent(name);

@@ -96,7 +96,7 @@ export default function LandingMedia({
             <img className={styles.posterFallback} src={fallbackImage.src} alt={fallbackImage.alt} />
           ) : (
             <div className={styles.emptyFallback} aria-hidden="true">
-              <span>OPENASHARE</span>
+              <span>FINANCIAL BOT</span>
               <strong>Research in motion.</strong>
             </div>
           )}

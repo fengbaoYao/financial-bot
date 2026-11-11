@@ -4,10 +4,29 @@ import { updateSession } from "@/utils/supabase/middleware";
 
 export async function proxy(request: NextRequest) {
   const path = request.nextUrl.pathname;
+
+  // Invalid Next-Action POSTs return a non-HTML 404. Safari treats a document
+  // navigation to that response as "This page could not load".
+  if (request.method === "POST") {
+    const actionId = request.headers.get("next-action");
+    if (actionId && actionId.length !== 42) {
+      const dest = request.headers.get("sec-fetch-dest");
+      const mode = request.headers.get("sec-fetch-mode");
+      if (dest === "document" || mode === "navigate") {
+        return NextResponse.redirect(request.nextUrl, 303);
+      }
+    }
+  }
+
+  // financial-bot shell and its BFF do not use Supabase auth.
+  if (path === "/bot" || path.startsWith("/bot/") || path.startsWith("/api/mausbot")) {
+    return NextResponse.next();
+  }
+
   if (path === "/" || path === "/landing" || path.startsWith("/journal/")) {
     const requested = request.nextUrl.searchParams.get("lang");
     const language = requested === "en" || requested === "zh"
-      ? requested : request.cookies.get("openashare-language")?.value === "zh" ? "zh" : "en";
+      ? requested : request.cookies.get("financial-bot-language")?.value === "zh" ? "zh" : "en";
     if (path === "/") {
       // Redirect before rendering/streaming so crawlers receive an HTTP redirect.
       // Use the incoming origin to keep local and staging navigation on that site.
@@ -16,7 +35,7 @@ export async function proxy(request: NextRequest) {
       return NextResponse.redirect(destination);
     }
     const requestHeaders = new Headers(request.headers);
-    requestHeaders.set("x-openashare-page-language", language);
+    requestHeaders.set("x-financial-bot-page-language", language);
     // Public pages need no auth refresh; language must also be correct before hydration.
     return NextResponse.next({ request: { headers: requestHeaders } });
   }

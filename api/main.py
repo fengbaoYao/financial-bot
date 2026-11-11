@@ -7,6 +7,8 @@ import logging
 import os
 import re
 import sqlite3
+import subprocess
+import sys
 import time
 import uuid
 from collections import defaultdict, deque
@@ -127,11 +129,11 @@ def _cloud_auth_enabled() -> bool:
 
 
 def _agent_research_capabilities() -> AgentResearchCapabilities:
-    hosted = _cloud_auth_enabled() or os.getenv("OPENASHARE_PUBLIC_BETA", "").lower() == "true"
+    hosted = _cloud_auth_enabled() or os.getenv("FINANCIAL_BOT_PUBLIC_BETA", "").lower() == "true"
     return AgentResearchCapabilities(
         deep_available=not hosted,
         deep_unavailable_reason="public_beta_suspended" if hosted else None,
-        deep_unavailable_message="Deep research is unavailable at the moment. Please use Quick research." if hosted else None,
+        deep_unavailable_message=("深度研究暂不可用，请改用快速研究。" if hosted else None),
     )
 
 
@@ -327,19 +329,99 @@ def _warm_stock_pool() -> None:
             logger.warning("Warmup failed for stock %s", code, exc_info=True)
 
 
+_SERVER_STARTED_AT: str | None = None
+
+
+def _git_short_sha() -> str | None:
+    """Best-effort build identity, so a stale process is obvious in the logs."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return (out.stdout or "").strip() or None
+    except Exception:
+        return None
+
+
+def _reload_enabled() -> bool:
+    return "--reload" in sys.argv or os.environ.get("UVICORN_RELOAD", "").strip() not in ("", "0")
+
+
+def _log_startup_diagnostics() -> None:
+    global _SERVER_STARTED_AT
+    _SERVER_STARTED_AT = datetime.now(timezone.utc).isoformat()
+    routes = len(app.routes)
+    sha = _git_short_sha() or "unknown"
+    reloading = _reload_enabled()
+    logger.warning(
+        "Financial Bot API ready · routes=%s · git=%s · reload=%s",
+        routes,
+        sha,
+        "on" if reloading else "off",
+    )
+    if not reloading:
+        logger.warning(
+            "Started WITHOUT --reload: routes added to the source after this process "
+            "started will 404 until you restart. Use ./scripts/run_api.sh for development."
+        )
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    monitor_runner = None
+    try:
+        _log_startup_diagnostics()
+    except Exception:
+        logger.exception("Startup diagnostics failed")
+    try:
+        from api.financial_bot import runtime as financial_bot_runtime
+
+        recovered = await asyncio.to_thread(financial_bot_runtime.initialize, PROJECT_ROOT)
+        if not supabase_config.enabled or not supabase_config.require_auth:
+            from api.financial_bot.auth import LOCAL_MODE, LOCAL_OWNER_ID, OwnerContext
+
+            try:
+                started = await financial_bot_runtime.start_openmuse_deletion_recovery(
+                    OwnerContext(owner_id=LOCAL_OWNER_ID, mode=LOCAL_MODE)
+                )
+                if started:
+                    logger.info("OpenMuse pending task deletion recovery enabled for local mode")
+            except Exception:
+                # Recovery errors may include a configured local endpoint or
+                # transport details; never echo exception text into logs.
+                logger.warning("OpenMuse deletion recovery could not start; pending records are preserved")
+        if recovered:
+            logger.warning("Recovered %s interrupted Financial Bot task(s) as unknown", recovered)
+        if os.environ.get("FINANCIAL_BOT_MONITORS", "1").strip() != "0":
+            from api.financial_bot.monitors import MonitorRunner
+
+            monitor_runner = MonitorRunner(financial_bot_runtime.get_store(PROJECT_ROOT))
+            monitor_runner.start()
+    except Exception:
+        logger.exception("Failed to initialize Financial Bot store")
     try:
         asyncio.create_task(asyncio.to_thread(_warm_read_caches))
     except Exception:
         logger.exception("Failed to schedule cache warmup")
     yield
+    try:
+        from api.financial_bot import runtime as financial_bot_runtime
+
+        await financial_bot_runtime.stop_openmuse_deletion_recovery()
+    except Exception:
+        logger.warning("OpenMuse deletion recovery shutdown failed; pending records are preserved")
+    if monitor_runner is not None:
+        await monitor_runner.stop()
 
 
 app = FastAPI(
-    title="OpenAshare API",
+    title="Financial Bot API",
     version="0.1.0",
-    description="API layer for stock analysis, portfolio insights, news and hotspots.",
+    description="API layer for Financial Bot research, portfolios, news and hotspots.",
     lifespan=lifespan,
 )
 
@@ -711,6 +793,8 @@ HEARTBEAT_INTERVAL_MINUTES = int(os.environ.get("AGENT_HEARTBEAT_MINUTES", "15")
 _pydantic_agent: Optional[object] = None
 _agent_deps: Optional[object] = None
 _pydantic_agent_signature: Optional[tuple[str, str, str]] = None
+_pydantic_agent_loop = None
+_pydantic_agent_lock = Lock()
 
 
 def _load_agent_runtime():
@@ -729,30 +813,44 @@ def _build_agent_deps() -> AgentDeps:
 
 
 def _get_pydantic_agent():
-    global _pydantic_agent, _agent_deps, _pydantic_agent_signature
+    # Bot tasks may use separate threads and event loops. Keep cache updates
+    # atomic so an agent cannot be paired with another loop's identity.
+    with _pydantic_agent_lock:
+        return _get_pydantic_agent_locked()
+
+
+def _get_pydantic_agent_locked():
+    global _pydantic_agent, _agent_deps, _pydantic_agent_signature, _pydantic_agent_loop
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
     runtime_config = settings_store.build_runtime_config(stock_service.config)
     if not runtime_config.llm_api_key:
         _pydantic_agent = None
         _agent_deps = None
         _pydantic_agent_signature = None
+        _pydantic_agent_loop = None
         return None, None
     signature = (
         runtime_config.llm_api_key,
         runtime_config.llm_base_url,
         runtime_config.llm_model,
     )
-    if _pydantic_agent is not None and _pydantic_agent_signature == signature:
+    if _pydantic_agent is not None and _pydantic_agent_signature == signature and _pydantic_agent_loop is current_loop:
         return _pydantic_agent, _build_agent_deps()
     try:
         _, create_agent, _ = _load_agent_runtime()
-        _pydantic_agent = create_agent(
+        agent = create_agent(
             api_key=runtime_config.llm_api_key,
             base_url=runtime_config.llm_base_url,
             model=runtime_config.llm_model,
         )
         _agent_deps = None
         _pydantic_agent_signature = signature
-        return _pydantic_agent, _build_agent_deps()
+        _pydantic_agent_loop = current_loop
+        _pydantic_agent = agent
+        return agent, _build_agent_deps()
     except Exception:
         _pydantic_agent_signature = None
         return None, None
@@ -916,7 +1014,7 @@ def update_user_settings(request: Request, payload: UserSettingsUpdate) -> UserS
             status_code=403,
             detail="云端 Beta 的模型连接由平台管理，不能通过 API 修改。",
         )
-    global _pydantic_agent, _agent_deps, _pydantic_agent_signature
+    global _pydantic_agent, _agent_deps, _pydantic_agent_signature, _pydantic_agent_loop
     updated = settings_store.update_settings(
         llm_base_url=payload.llm_base_url,
         llm_api_key=payload.llm_api_key,
@@ -926,6 +1024,7 @@ def update_user_settings(request: Request, payload: UserSettingsUpdate) -> UserS
     _pydantic_agent = None
     _agent_deps = None
     _pydantic_agent_signature = None
+    _pydantic_agent_loop = None
     return updated
 
 
@@ -1666,6 +1765,11 @@ def _build_enriched_agent_query(query: str, history: List[AgentHistoryTurn], mem
             pinned_items = [str(item).strip() for item in pinned_memory[:5] if str(item).strip()]
             if pinned_items:
                 memory_lines.append(f"固定记忆: {'; '.join(pinned_items)}")
+        confirmed_memories = memory_profile.get("confirmed_memories") or []
+        if confirmed_memories:
+            confirmed_items = [str(item).strip() for item in confirmed_memories[:12] if str(item).strip()]
+            if confirmed_items:
+                memory_lines.append("用户已确认的长期记忆: " + "; ".join(confirmed_items))
         watchlist = memory_profile.get("watchlist") or []
         if watchlist:
             focus_names = [
@@ -1682,13 +1786,92 @@ def _build_enriched_agent_query(query: str, history: List[AgentHistoryTurn], mem
         enriched_query = "\n\n".join([*context_blocks, f"当前问题：{query}"])
     return enriched_query
 
+
+
+async def _maybe_recover_incomplete_synthesis(
+    response,
+    *,
+    query: str,
+    language: str,
+    model_provider: str,
+    tool_results=None,
+    agent=None,
+    deps=None,
+    progress_callback=None,
+):
+    """When tools/synthesis stall, ask the selected LLM for a usable answer.
+
+    Prefers a tool-enabled recovery agent turn (prior tools kept; new tool calls
+    append to the same trace). Falls back to text-only model fill.
+    """
+    try:
+        from api.financial_bot.gap_synthesis import needs_research_recovery, recover_incomplete_synthesis
+
+        if not needs_research_recovery(response):
+            return response
+        if agent is not None and deps is not None:
+            try:
+                from api.agent_pydantic import run_recovery_async
+
+                recovered = await run_recovery_async(
+                    agent,
+                    deps,
+                    query,
+                    progress_callback=progress_callback,
+                    model_provider=model_provider or "deepseek",
+                )
+                if recovered and (recovered.summary or "").strip():
+                    return recovered
+            except Exception:
+                logger.warning("tool-enabled research recovery failed; falling back to text fill", exc_info=False)
+        return await recover_incomplete_synthesis(
+            response,
+            query=query,
+            language=language,
+            model_provider=model_provider or "deepseek",
+            tool_results=tool_results if tool_results is not None else (
+                deps.tool_results if deps is not None else None
+            ),
+        )
+    except Exception:
+        logger.warning("research synthesis recovery skipped", exc_info=False)
+        return response
+
+
+async def _maybe_apply_data_gap_fill(
+    response,
+    *,
+    query: str,
+    language: str,
+    model_provider: str,
+    tool_results=None,
+):
+    """After providers run, fill material gaps via the selected LLM (labeled unverified)."""
+    try:
+        from api.financial_bot.data_gap_fill import apply_data_gap_fill
+
+        return await apply_data_gap_fill(
+            response,
+            query=query,
+            language=language,
+            model_provider=model_provider or "deepseek",
+            tool_results=tool_results,
+        )
+    except Exception:
+        logger.warning("data gap fill skipped", exc_info=False)
+        return response
+
 async def _run_agent_request(
     payload: AgentQuery,
     merged_history: List[AgentHistoryTurn],
     memory_profile: dict[str, Any],
     progress_callback=None,
     watchlist_store=None,
+    *,
+    allow_chatgpt=False,
 ) -> AgentResponse:
+    if payload.model_provider == "chatgpt" and not allow_chatgpt:
+        raise HTTPException(status_code=403, detail="chatgpt_local_only")
     direct = await _explicit_watchlist_request(payload, watchlist_store, progress_callback)
     if direct is not None:
         return direct
@@ -1702,6 +1885,33 @@ async def _run_agent_request(
             progress_callback("select_engine", 25, "需要先明确研究对象", {"engine": "clarification"})
         return clarification
     agent, deps = _get_pydantic_agent()
+    fallback_agent = agent
+    fallback_reason = None
+    actual_provider = "deepseek"
+    if payload.model_provider == "chatgpt":
+        try:
+            from api.financial_bot import chatgpt_session
+            from api.financial_bot.chatgpt_provider import make_chatgpt_model
+            if not chatgpt_session.is_signed_in():
+                raise RuntimeError("chatgpt_not_signed_in")
+            auth = chatgpt_session.load_auth_module()
+            models = await asyncio.to_thread(auth.list_models)
+            if not models:
+                raise RuntimeError("chatgpt_no_models")
+            from api.financial_bot.chatgpt_provider import select_chatgpt_model
+            choices = [slug for _, slug in models]
+            selected = select_chatgpt_model(choices)
+            agent = create_agent(model_instance=make_chatgpt_model(auth.credential(), selected))
+            deps = deps or _build_agent_deps()
+            actual_provider = "chatgpt"
+        except Exception:
+            fallback_reason = "chatgpt_unavailable"
+            agent = fallback_agent
+            if progress_callback and agent is not None:
+                progress_callback("select_engine", 25, "ChatGPT 订阅暂不可用，已切换到 DeepSeek Flash", {"engine": "deepseek", "fallback": fallback_reason})
+    if payload.model_provider == "chatgpt" and agent is None:
+        return AgentResponse(intent="error", summary="ChatGPT 订阅不可用，DeepSeek 也未配置。", actions=[], citations=[],
+                             payload={"_meta": {"model_provider": "unavailable", "model_fallback": fallback_reason}})
     if isinstance(deps, AgentDeps):
         deps.language = resolve_language(payload.query, payload.language)
         deps.research_mode = payload.research_mode
@@ -1709,24 +1919,74 @@ async def _run_agent_request(
         deps.session_id = payload.session_id or ""
         deps.memory_store = agent_memory_store
         deps.watchlist_store = watchlist_store
+        deps.bot_prompt = str(payload.bot_prompt or "")
+        deps.bot_capabilities = dict(payload.bot_capabilities or {})
+        deps.ui_context = dict(payload.ui_context or {})
+        if not deps.bot_prompt and payload.bot_instructions:
+            deps.bot_prompt = (
+                f"你是独立研究 Bot【{payload.bot_name or 'Research Bot'}】。\n"
+                f"在不违反平台安全与证据规则的前提下，遵循以下 Bot 专属指令：\n"
+                f"{payload.bot_instructions[:4000]}"
+            )
     if agent is not None and deps is not None:
         if progress_callback:
             progress_callback("select_engine", 25, "已选择智能引擎，准备执行工具调用", {"engine": "pydantic_ai"})
         try:
             _, _, run_agent_async = _load_agent_runtime()
-            enriched_query = _build_enriched_agent_query(payload.query, merged_history, memory_profile)
-            if progress_callback is not None:
-                try:
-                    return await run_agent_async(
-                        agent,
-                        deps,
-                        enriched_query,
-                        progress_callback=progress_callback,
-                    )
-                except TypeError as exc:
-                    if "progress_callback" not in str(exc):
-                        raise
-            return await run_agent_async(agent, deps, enriched_query)
+            if payload.bot_prompt:
+                # Bot memory is injected as system instructions by the executor.
+                # Keep the user turn clean of memory; conversation history stays
+                # in the user-context block, where it belongs.
+                enriched_query = _build_enriched_agent_query(payload.query, merged_history, {})
+            else:
+                enriched_query = _build_enriched_agent_query(payload.query, merged_history, memory_profile)
+            async def execute_selected(selected_agent):
+                if progress_callback is not None:
+                    try:
+                        return await run_agent_async(selected_agent, deps, enriched_query, progress_callback=progress_callback)
+                    except TypeError as exc:
+                        if "progress_callback" not in str(exc):
+                            raise
+                return await run_agent_async(selected_agent, deps, enriched_query)
+
+            try:
+                response = await execute_selected(agent)
+            except Exception as exc:
+                from api.financial_bot.chatgpt_provider import can_fallback_after_failure
+                if (actual_provider != "chatgpt" or fallback_agent is None
+                        or not can_fallback_after_failure(exc, deps)):
+                    raise
+                actual_provider = "deepseek"
+                fallback_reason = "chatgpt_rejected"
+                if isinstance(deps, AgentDeps):
+                    deps.model_request_offset = 1
+                if progress_callback:
+                    progress_callback("select_engine", 25, "ChatGPT 订阅请求被拒绝，已切换到 DeepSeek Flash", {"engine": "deepseek", "fallback": fallback_reason})
+                response = await execute_selected(fallback_agent)
+            response.payload.setdefault("_meta", {})["model_provider"] = actual_provider
+            response.payload["_meta"]["requested_model_provider"] = payload.model_provider
+            if fallback_reason:
+                response.payload["_meta"]["model_fallback"] = fallback_reason
+                response.data_gaps.append("ChatGPT 订阅不可用，本次使用 DeepSeek，可能产生 API 费用。" if payload.language != "en-US" else "ChatGPT was unavailable; DeepSeek was used and API charges may apply.")
+            language = resolve_language(payload.query, payload.language)
+            tool_results = deps.tool_results if isinstance(deps, AgentDeps) else None
+            response = await _maybe_recover_incomplete_synthesis(
+                response,
+                query=payload.query,
+                language=language,
+                model_provider=actual_provider,
+                tool_results=tool_results,
+                agent=agent,
+                deps=deps if isinstance(deps, AgentDeps) else None,
+                progress_callback=progress_callback,
+            )
+            return await _maybe_apply_data_gap_fill(
+                response,
+                query=payload.query,
+                language=language,
+                model_provider=actual_provider,
+                tool_results=tool_results,
+            )
         except asyncio.CancelledError:
             raise
         except (asyncio.TimeoutError, UsageLimitExceeded) as exc:
@@ -1740,6 +2000,7 @@ async def _run_agent_request(
             response = evidence_fallback(deps, message)
             response.intent = "error"
             response.payload["_meta"].update(engine="pydantic_ai", limit_reached=True, limit_reason=reason)
+            # A stopped run must not start another model call after its limit.
             if isinstance(deps, AgentDeps):
                 usage = deps.run_usage
                 response.payload["_meta"].update(
@@ -1776,6 +2037,24 @@ async def _run_agent_request(
                     message = "Research synthesis could not finish. Available sources are preserved below." if language == "en-US" else "研究汇总未能完成，已获取的来源保留在下方。"
                 response = evidence_fallback(deps, message)
                 response.payload["_meta"]["failure_type"] = type(exc).__name__
+                tool_results = deps.tool_results if isinstance(deps, AgentDeps) else None
+                response = await _maybe_recover_incomplete_synthesis(
+                    response,
+                    query=payload.query,
+                    language=language,
+                    model_provider=actual_provider,
+                    tool_results=tool_results,
+                    agent=agent,
+                    deps=deps if isinstance(deps, AgentDeps) else None,
+                    progress_callback=progress_callback,
+                )
+                response = await _maybe_apply_data_gap_fill(
+                    response,
+                    query=payload.query,
+                    language=language,
+                    model_provider=actual_provider,
+                    tool_results=deps.tool_results if isinstance(deps, AgentDeps) else tool_results,
+                )
                 from api.research_runs import save_run
                 response.payload["_meta"].update(save_run(deps, "incomplete", type(exc).__name__, response=response))
                 return response
@@ -1793,17 +2072,48 @@ async def _run_agent_request(
                 memory_profile,
                 progress_callback,
             )
-            return localize_fallback(fallback, resolve_language(payload.query, payload.language))
+            language = resolve_language(payload.query, payload.language)
+            localized = localize_fallback(fallback, language)
+            return await _maybe_apply_data_gap_fill(
+                localized,
+                query=payload.query,
+                language=language,
+                model_provider=actual_provider,
+                tool_results=None,
+            )
         except TypeError as exc:
             if "positional argument" not in str(exc) and "given" not in str(exc):
                 raise
+            fallback = await asyncio.to_thread(
+                agent_service.query,
+                payload.query,
+                merged_history,
+                memory_profile,
+            )
+            language = resolve_language(payload.query, payload.language)
+            localized = localize_fallback(fallback, language)
+            return await _maybe_apply_data_gap_fill(
+                localized,
+                query=payload.query,
+                language=language,
+                model_provider=actual_provider,
+                tool_results=None,
+            )
     fallback = await asyncio.to_thread(
         agent_service.query,
         payload.query,
         merged_history,
         memory_profile,
     )
-    return localize_fallback(fallback, resolve_language(payload.query, payload.language))
+    language = resolve_language(payload.query, payload.language)
+    localized = localize_fallback(fallback, language)
+    return await _maybe_apply_data_gap_fill(
+        localized,
+        query=payload.query,
+        language=language,
+        model_provider=actual_provider,
+        tool_results=None,
+    )
 
 
 @app.get("/api/agent/capabilities", response_model=AgentResearchCapabilities)
@@ -1816,6 +2126,15 @@ def agent_research_capabilities() -> AgentResearchCapabilities:
 async def agent_query(request: Request, payload: AgentQuery) -> Response:
     """Validate mode before accounting; research execution returns a JSON result."""
     _require_available_research_mode(payload)
+    from api.research_rate_limit import enforce_research_rate_limit
+
+    limited = enforce_research_rate_limit(
+        request,
+        language=payload.language,
+        bucket="research_agent",
+    )
+    if limited is not None:
+        return limited
     estimated_amount = estimate_request_cost(payload.query)
     request_id = payload.request_id or str(uuid.uuid4())
     try:
@@ -1879,10 +2198,46 @@ async def agent_query(request: Request, payload: AgentQuery) -> Response:
 
 
 
+@app.post("/api/agent/preflight")
+async def agent_preflight(payload: AgentQuery):
+    from api.credits import estimate_request_cost
+
+    runtime_config = settings_store.build_runtime_config(stock_service.config)
+    estimated = int(estimate_request_cost(payload.query))
+    threshold = 4
+    return {
+        "requires_approval": bool(runtime_config.llm_api_key and estimated > threshold),
+        "estimated_credits": estimated,
+        "threshold": threshold,
+        "model": runtime_config.llm_model if runtime_config.llm_api_key else None,
+        "model_configured": bool(runtime_config.llm_api_key),
+    }
+
+
 @app.post("/api/agent/query/stream")
 async def agent_query_stream(request: Request, payload: AgentQuery) -> Response:
     _require_available_research_mode(payload)
+    from api.research_rate_limit import enforce_research_rate_limit
+
+    limited = enforce_research_rate_limit(
+        request,
+        language=payload.language,
+        bucket="research_agent",
+    )
+    if limited is not None:
+        return limited
     estimated_amount = estimate_request_cost(payload.query)
+    runtime_config = settings_store.build_runtime_config(stock_service.config)
+    if runtime_config.llm_api_key and estimated_amount > 4 and not payload.model_approved:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "model_approval_required",
+                "estimated_credits": estimated_amount,
+                "threshold": 4,
+                "model": runtime_config.llm_model,
+            },
+        )
     request_id = payload.request_id or str(uuid.uuid4())
     try:
         credit_user = await _credit_user_for_request(request)
@@ -2005,3 +2360,28 @@ async def agent_query_stream(request: Request, payload: AgentQuery) -> Response:
 
     task = asyncio.create_task(runner())
     return sse_response(queue, task)
+
+
+# Financial Bot: owner-scoped tasks/events/memory/deletion. The router lives in
+# a dedicated package so the browser workbench and the legacy agent stream share
+# the same research engine without duplicating business logic.
+from api.financial_bot.routes import router as financial_bot_router  # noqa: E402
+from api.financial_data_api import router as financial_data_router  # noqa: E402
+
+app.include_router(financial_bot_router)
+app.include_router(financial_data_router)
+
+
+@app.get("/api/version")
+def api_version() -> dict[str, Any]:
+    """What this process actually loaded.
+
+    A stale dev server is indistinguishable from a broken feature until you can
+    see the route count and commit it was started from.
+    """
+    return {
+        "routes": len(app.routes),
+        "git": _git_short_sha(),
+        "reload": _reload_enabled(),
+        "started_at": _SERVER_STARTED_AT,
+    }

@@ -37,6 +37,7 @@ _INVESTOR_BRIEF = re.compile(
 _NON_NEWS_SCOPE = re.compile(
     r"filings?|10[- ]?[kq]|20[- ]?f|financial statements?|earnings materials?|annual reports?|"
     r"valuation|balance sheet|cash flow|competitive advantage|industry analysis|"
+    r"quote|price|technical|chart|行情|价格|技术面|走势|k线|"
     r"财报|申报文件|业绩材料|年报|估值|现金流|资产负债|产业优势|竞争优势|行业分析", re.I,
 )
 _BENCHMARK_TARGET = re.compile(r"S&P\s*500|Nasdaq|标普\s*500|纳斯达克|benchmark|基准指数", re.I)

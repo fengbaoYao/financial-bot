@@ -143,16 +143,16 @@ export function WaitlistPageClient() {
   return (
     <main className={styles.page}>
       <header className={styles.header}>
-        <a className={styles.brand} href={`/landing?lang=${locale}`} aria-label={en ? "Open the OpenAshare home page" : "前往 OpenAshare 首页"}>
+        <a className={styles.brand} href={`/landing?lang=${locale}`} aria-label={en ? "Open the Financial Bot home page" : "前往 Financial Bot 首页"}>
           <img src="/favicon.svg" alt="" width="36" height="36" />
-          <span>OpenAshare<small>AI RESEARCH DESK</small></span>
+          <span>Financial Bot<small>AI RESEARCH DESK</small></span>
         </a>
         <SupabaseAuthPanel placement="header" onAuthChange={handleAuthChange} />
       </header>
 
       <section className={styles.content} aria-labelledby="waitlist-title">
         <div className={styles.intro}>
-          <p>OPENAShare CLOUD BETA</p>
+          <p>FINANCIAL BOT CLOUD BETA</p>
           <h1 id="waitlist-title">{en ? "Join the waitlist" : "申请加入等待名单"}</h1>
           <p>{en ? "Tell us how you research so we can invite testers at the right pace." : "用一分钟告诉我们你的研究习惯，帮助我们按合适的节奏邀请测试用户。"}</p>
           <ul>

@@ -32,8 +32,11 @@
 .language { white-space: nowrap; }
 .navBeta { background: var(--teal-dark); color: var(--paper) !important; padding: 12px 18px; display: inline-flex; align-items: center; gap: 18px; border-radius: 6px; }
 .navBeta:hover { background: var(--teal); }
+.navQuiet { color: var(--muted); font-size: 13px; font-weight: 550; white-space: nowrap; }
+.navQuiet:hover { color: var(--teal); }
 .mobileBeta { display: none; }
-.menuButton { display: none; background: none; border: 0; color: var(--ink); width: 40px; height: 40px; font-size: 28px !important; place-items: center; }
+.mobileLang { display: none; }
+.menuButton { display: none; background: none; border: 0; color: var(--ink); width: 44px; height: 44px; min-width: 44px; min-height: 44px; font-size: 28px !important; place-items: center; border-radius: 10px; }
 .skip { position: absolute; top: -100px; left: 20px; padding: 12px 20px; background: var(--paper); z-index: 10; }
 .skip:focus { top: 12px; }
 .hero { padding-top: 60px; padding-bottom: 0; display: flex; flex-direction: column; align-items: center; position: relative; }
@@ -47,6 +50,34 @@
 .primary:hover { background: var(--teal); border-color: var(--teal); transform: translateY(-2px); }
 .textButton { display: inline-flex; align-items: center; gap: 14px; font-size: 13px; font-weight: 600; padding-block: 15px; }
 .textButton:hover { color: var(--teal); }
+/* Equal-weight hero/closing CTAs: Work outline + Bot filled (同权、色差) */
+.ctaWork, .ctaBot {
+  min-height: 48px;
+  min-width: 148px;
+  padding: 14px 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -.01em;
+  transition: background .2s, color .2s, border-color .2s, transform .2s;
+  box-sizing: border-box;
+}
+.ctaWork {
+  color: var(--teal-dark) !important;
+  background: transparent;
+  border: 1.5px solid var(--teal-dark);
+}
+.ctaWork:hover { background: rgba(23, 62, 55, .07); transform: translateY(-2px); }
+.ctaBot {
+  color: #fff !important;
+  background: var(--teal-dark);
+  border: 1.5px solid var(--teal-dark);
+}
+.ctaBot:hover { background: var(--teal); border-color: var(--teal); transform: translateY(-2px); }
 .ribbonScene { width: min(100vw, 1740px); position: relative; margin: 28px 0 0; }
 .ribbonVisual { position: relative; }
 .ribbonArt { position: relative; height: 280px; isolation: isolate; pointer-events: none; animation: ribbon-unfold 4.2s cubic-bezier(.25,.1,.25,1) .15s both; }
@@ -204,7 +235,7 @@
 .closing { background: var(--paper-deep); text-align: center; padding: 84px 20px 88px; }
 .closing h2 { font-size: clamp(48px, 6vw, 82px); font-weight: 500; letter-spacing: -.05em; line-height: 1.12; margin-top: 24px; }
 .closing h2 span { display: block; color: var(--clay); }
-.closing .primary { margin-top: 30px; }
+.closing .primary, .closing .ctaWork, .closing .ctaBot { margin-top: 30px; }
 .closing p { font-size: 10px; color: var(--muted); letter-spacing: .13em; margin-top: 32px; }
 .footer { min-height: 130px; display: flex; justify-content: space-between; align-items: center; gap: 24px; font-size: 12px; color: var(--muted); }
 .footerBrand { font-size: 18px; font-weight: 700; color: var(--ink) !important; letter-spacing: -.5px; }
@@ -246,9 +277,16 @@
   .journal, .approach { padding-bottom: 80px; }
   .footer { flex-direction: column; align-items: flex-start; justify-content: center; padding-block: 30px; }
   .footer > div { gap: 20px; }
+  /* Phone: keep bar to brand + hamburger; language/classic live in the menu */
+  .language,
+  .navQuiet { display: none; }
+  .mobileLang { display: block; }
+  .brand { font-size: 18px; gap: 8px; min-width: 0; }
+  .navRight { gap: 4px; }
 }
 @media (max-width: 480px) {
-  .brand { font-size: 20px; gap: 8px; }
+  .menuButton { width: 44px; height: 44px; }
+  .brand { font-size: 18px; gap: 8px; }
   .brand img { width: 30px; height: 30px; }
   .nav { gap: 10px; }
   .hero { padding-top: 52px; }
@@ -296,6 +334,7 @@
   .heroActions { flex-direction: column; gap: 3px; margin-top: 23px; }
   .primary { min-height: 48px; font-size: 12px; }
   .textButton { font-size: 12px; }
+  .ctaWork, .ctaBot { min-height: 48px; min-width: 100%; width: min(280px, 100%); font-size: 12px; padding: 14px 20px; }
   .sectionHeader { align-items: flex-start; flex-direction: column; gap: 10px; padding-block: 24px; }
   .sectionMeta { font-size: 12px; }
   .journalGrid { grid-template-columns: 1fr; padding-top: 16px; }

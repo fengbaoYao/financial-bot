@@ -4,7 +4,8 @@
 .beta::before { content: ""; display: inline-block; width: 7px; height: 7px; border: 1px solid var(--ink); border-radius: 50%; margin-right: 9px; }
 .hero h1 { font-family: inherit; font-weight: 550; font-size: clamp(40px, 4.8vw, 68px); line-height: 1.12; letter-spacing: -.045em; text-wrap: balance; }
 .support { font-size: 18px; color: var(--muted); line-height: 1.65; margin: 26px auto 0 !important; max-width: 64ch; }
-.actions { display: flex; justify-content: center; gap: 24px; align-items: center; flex-wrap: wrap; margin-top: 30px; }
+.actions { display: flex; justify-content: center; gap: 16px; align-items: center; flex-wrap: wrap; margin-top: 30px; }
+.closingActions { display: flex; align-items: center; justify-content: flex-end; gap: 16px; flex-wrap: wrap; flex-shrink: 0; }
 .trust { margin-top: 22px !important; font-size: 12px; line-height: 1.6; color: var(--ink); }
 .access { max-width: 72ch; margin: 10px auto 0 !important; font-size: 12px; line-height: 1.65; color: var(--muted); }
 .section { padding-block: 60px; scroll-margin-top: 24px; }
@@ -40,9 +41,9 @@
 @media (max-width: 900px) { .hero { gap: 0; padding-block: 48px 0; } .heroCopy { max-width: 650px; } .hero h1 { font-size: 54px; } .sectionHeading { flex-direction: column; gap: 12px; } .sourceGrid { gap: 30px; } }
 @media (max-width: 600px) {
   .hero { padding-top: 36px; gap: 0; } .hero h1 { font-size: 42px; line-height: 1.12; } .beta { margin-bottom: 20px !important; }
-  .support { font-size: 16px; margin-top: 22px !important; } .actions { align-items: center; flex-direction: column; gap: 4px; margin-top: 24px; }
+  .support { font-size: 16px; margin-top: 22px !important; } .actions { align-items: stretch; flex-direction: column; gap: 12px; margin-top: 24px; width: min(280px, 100%); }
   .trust, .access { font-size: 11px; }
   .section { padding-block: 32px; } .sectionHeading { padding-top: 24px; }
   .sourceGrid { grid-template-columns: 1fr; } .openSource { padding-block: 44px; margin-block: 24px; } .openSource h2 { max-width: 16ch; } .quickstart { padding: 24px; }
-  .faq summary { font-size: 16px; } .faq p { font-size: 14px; } .closing { flex-direction: column; align-items: flex-start; padding-block: 44px 56px; } .footerTop { align-items: flex-start; flex-direction: column; } .footerTop > div { gap: 16px; }
+  .faq summary { font-size: 16px; } .faq p { font-size: 14px; } .closing { flex-direction: column; align-items: flex-start; padding-block: 44px 56px; } .closingActions { width: 100%; justify-content: stretch; flex-direction: column; gap: 10px; } .closingActions a { width: 100%; } .footerTop { align-items: flex-start; flex-direction: column; } .footerTop > div { gap: 16px; }
 }

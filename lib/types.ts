@@ -347,7 +347,7 @@ export type AgentResponse = {
   ui_components?: Array<"chart" | "table" | "comparison" | "actions">;
   clarification?: AgentClarification | null;
   citations: string[];
-  research_steps?: Array<{ tool: string; status: "completed" | "unavailable"; retrieved_at: string; evidence_count: number; reason_code?: string | null }>;
+  research_steps?: Array<{ tool: string; status: "completed" | "unavailable"; retrieved_at: string; evidence_count: number; reason_code?: string | null; endpoint?: string | null }>;
   evidence?: Array<{ id: string; source: string; url?: string | null; retrieved_at: string; data_as_of?: string | null; freshness: string; title?: string | null; excerpts?: Array<{ location: string; text: string }> }>;
   data_gaps?: string[];
   payload: {
@@ -370,6 +370,8 @@ export type AgentResponse = {
       usage_unresolved?: boolean;
       retrieval_calls?: number;
       synthesis_incomplete?: boolean;
+      output_fallback?: string;
+      structured_output_validated?: boolean;
       failure_type?: string;
       run_id?: string;
       finish_reason?: string;

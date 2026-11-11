@@ -55,7 +55,7 @@ export type SupabaseWorkspaceBootstrap = {
 export type WorkspaceEvent =
   | { type: "message_delta"; message?: string; reset?: boolean; provisional?: boolean }
   | { type: "tool_started"; tool?: string; message?: string; stage?: string }
-  | { type: "tool_progress"; tool?: string; message?: string; stage?: string; progressPct?: number; status?: "running" | "completed" | "unavailable"; reasonCode?: string }
+  | { type: "tool_progress"; tool?: string; message?: string; stage?: string; progressPct?: number; status?: "running" | "completed" | "unavailable"; reasonCode?: string; endpoint?: string }
   | { type: "tool_result"; tool?: string; payload?: Record<string, unknown> }
   | { type: "context_update"; context: ResearchContext }
   | { type: "citation"; citation: string }

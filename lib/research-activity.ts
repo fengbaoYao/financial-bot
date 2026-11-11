@@ -1,4 +1,4 @@
-export type ToolActivity = { tool: string; status: "running" | "completed" | "unavailable"; reasonCode?: string | null; retried?: boolean };
+export type ToolActivity = { tool: string; status: "running" | "completed" | "unavailable"; reasonCode?: string | null; retried?: boolean; endpoint?: string | null; endpoints?: string[] };
 
 export function researchWorkLabel(seconds: unknown, locale: "zh" | "en"): string | undefined {
   if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0) return;
@@ -29,7 +29,10 @@ export function updateToolActivity(previous: ToolActivity[], incoming: ToolActiv
   if (index < 0) return [...previous, incoming];
   const prior = previous[index];
   const hadIssue = prior.status === "unavailable" || Boolean(prior.reasonCode);
-  const next = { ...incoming, retried: prior.retried || (hadIssue && incoming.status === "running"), reasonCode: incoming.reasonCode ?? (incoming.status === "running" ? undefined : prior.status === "running" ? undefined : prior.reasonCode) };
+  const endpoints = incoming.endpoint
+    ? Array.from(new Set([...(prior.endpoints ?? []), incoming.endpoint])).slice(-6)
+    : prior.endpoints;
+  const next = { ...incoming, retried: prior.retried || (hadIssue && incoming.status === "running"), endpoint: incoming.endpoint ?? prior.endpoint, endpoints, reasonCode: incoming.reasonCode ?? (incoming.status === "running" ? undefined : prior.status === "running" ? undefined : prior.reasonCode) };
   return previous.map((step, i) => i === index ? next : step);
 }
 
@@ -37,7 +40,9 @@ const reasons: Record<string, [string, string]> = {
   no_matches: ["没有匹配", "No match"], no_results: ["暂无结果", "No results"],
   ambiguous_identity: ["需要确认代码", "Choose ticker"], identity_unverified: ["身份未核验", "Not verified"],
   identity_required: ["等待身份核验", "Needs identity"],
+  not_configured: ["未配置（已跳过）", "Not configured (skipped)"],
   specialist_error: ["复核未完成", "Review failed"], provider_error: ["来源不可用", "Source unavailable"],
+  unverified_model: ["未核验", "Unverified"],
 };
 
 export function toolActivityOutcome(step: ToolActivity, locale: "zh" | "en", laterSucceeded = false) {

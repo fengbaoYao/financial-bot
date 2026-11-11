@@ -316,3 +316,47 @@ def test_news_contract_rejects_technical_analysis_tool():
 
     assert not result.passed
     assert any(failure.rule == "forbidden_tools" for failure in result.failures)
+
+
+def test_partial_source_failures_keep_completed_results_and_endpoints():
+    results = [
+        {"tool": "read_public_source", "status": "completed", "data": {"url": "https://example.com/a", "data_gaps": []}, "evidence": []},
+        {"tool": "read_public_source", "status": "completed", "data": {"url": "https://example.org/b", "data_gaps": []}, "evidence": []},
+        {"tool": "read_public_source", "status": "unavailable", "data": {"url": "https://example.net/c", "data_gaps": ["blocked"]}, "evidence": []},
+    ]
+    response = build_agent_response(AgentOutput(summary="## 回答\n- ok", actions=[]), results, language="zh-CN")
+    assert len(response.research_steps) == 3
+    assert {step.endpoint for step in response.research_steps} == {"example.com", "example.org", "example.net"}
+    assert any("3 次调用中 1 次失败，2 次成功" in gap for gap in response.data_gaps)
+    assert not any("read_public_source：来源数据不可用" in gap for gap in response.data_gaps)
+
+
+def test_unconfigured_source_is_skipped_not_reported_as_outage():
+    response = build_agent_response(
+        AgentOutput(summary="## 回答\n- 未配置", actions=[]),
+        [{"tool": "get_sec_company_data", "status": "unavailable", "reason_code": "not_configured", "data": {"data_gaps": ["skipped"]}, "evidence": []}],
+        language="zh-CN",
+    )
+    assert any("数据源未配置，本次已跳过" in gap for gap in response.data_gaps)
+    assert not any("来源数据不可用" in gap for gap in response.data_gaps)
+
+
+def test_tool_data_plans_and_cards_reach_the_agent_payload():
+    data = {
+        "provider": "yfinance",
+        "endpoint": "query1.finance.yahoo.com",
+        "currency": "USD",
+        "adjustment": "not_applicable",
+        "statement": "income",
+        "data_as_of": "2025-09-30",
+        "periods": [{"period": "2025-09-30", "values": {"Revenue": 100.0, "NetIncomeLoss": 20.0}}],
+    }
+    response = build_agent_response(
+        AgentOutput(summary="## 财报\n- 已获取", actions=[]),
+        [{"tool": "get_company_fundamentals", "data": data, "evidence": []}],
+        language="zh-CN",
+    )
+    assert response.payload["data_plans"][0]["capability"] == "financials"
+    assert response.payload["data_plans"][0]["provider"] == "yfinance"
+    assert response.payload["data_cards"][0]["kind"] == "financials"
+    assert response.payload["data_cards"][0]["rows"][0]["values"]["营业收入"] == 100.0

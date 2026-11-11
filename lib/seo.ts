@@ -30,7 +30,7 @@ export function localizedMetadata({ path, language, title, description, indexabl
 }): Metadata {
   const canonical = localizedUrl(path, language);
   const index = indexable && searchIndexingEnabled();
-  const image = { url: `${siteOrigin()}/opengraph-image`, width: 1200, height: 630, alt: "OpenAshare — AI stock research desk" };
+  const image = { url: `${siteOrigin()}/opengraph-image`, width: 1200, height: 630, alt: "Financial Bot — AI stock research desk" };
   return {
     title,
     description,
@@ -44,7 +44,7 @@ export function localizedMetadata({ path, language, title, description, indexabl
     },
     robots: { index, follow: true },
     openGraph: {
-      type: "website", siteName: "OpenAshare", url: canonical, title, description,
+      type: "website", siteName: "Financial Bot", url: canonical, title, description,
       locale: language === "zh" ? "zh_CN" : "en_US",
       alternateLocale: language === "zh" ? "en_US" : "zh_CN",
       images: [image],
@@ -59,16 +59,16 @@ export function landingStructuredData(language: SiteLanguage, description: strin
     "@context": "https://schema.org",
     "@graph": [
       {
-        "@type": "Organization", "@id": `${origin}/#organization`, name: "OpenAshare",
+        "@type": "Organization", "@id": `${origin}/#organization`, name: "Financial Bot",
         url: origin, logo: `${origin}/logo.png`,
         sameAs: ["https://github.com/ZhiweiChen-coder/OpenAshare"],
       },
       {
-        "@type": "WebSite", "@id": `${origin}/#website`, name: "OpenAshare", url: origin,
+        "@type": "WebSite", "@id": `${origin}/#website`, name: "Financial Bot", url: origin,
         inLanguage: ["en", "zh-CN"], publisher: { "@id": `${origin}/#organization` },
       },
       {
-        "@type": "SoftwareApplication", "@id": `${origin}/#application`, name: "OpenAshare",
+        "@type": "SoftwareApplication", "@id": `${origin}/#application`, name: "Financial Bot",
         applicationCategory: "FinanceApplication", operatingSystem: "Web",
         url: localizedUrl("/landing", language), description,
         inLanguage: language === "zh" ? "zh-CN" : "en",

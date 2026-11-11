@@ -229,3 +229,125 @@ def test_specialist_review_does_not_inherit_the_parent_full_report_policy(tmp_pa
         assert result.summary.startswith('This fixture')
         assert result.payload['_meta']['usage']['requests'] == 1
     asyncio.run(scenario())
+
+
+def test_deep_investor_brief_runs_roles_after_initial_evidence():
+    async def scenario():
+        deps = fixtures()
+        deps.research_mode = 'deep'
+        requests = []
+        def model(messages, info):
+            requests.append(info)
+            names = [tool.name for tool in info.function_tools]
+            if 'research_company' in names:
+                return ModelResponse(parts=[ToolCallPart('research_company', {'company':'NVDA', 'focus':'overview'})])
+            news = next(item for item in deps.tool_results if item['tool'] == 'get_stock_news')['evidence'][0]['id']
+            doc = next(item for item in deps.tool_results if item['tool'] == 'read_public_source')['evidence'][0]['id']
+            summary = ('## Verified identity\nNVIDIA is US.NVDA.\n\n'
+                f'## Source-backed facts\n- Fixture news [{news}].\n- Earnings excerpts [{doc}].\n\n'
+                '## Inference\nNo conclusion follows from fixtures.\n\n'
+                '## Unavailable data\nFull filing narratives were not read.')
+            return ModelResponse(parts=[ToolCallPart('final_result', {'summary':summary, 'evidence_ids':[news, doc]})])
+        agent = create_agent(api_key='offline-test')
+        agent.model = FunctionModel(model)
+        result = await run_agent_async(agent, deps, QUESTION)
+        assert len(requests) == 6
+        assert {'review_company_position', 'review_catalysts_risks', 'tradingagents_risk', 'tradingagents_manager'} <= {step.tool for step in result.research_steps}
+        assert not result.payload['_meta'].get('deep_research_incomplete', False)
+    asyncio.run(scenario())
+
+
+def test_quick_answer_can_use_four_requested_fact_bullets():
+    import asyncio
+    from pydantic_ai.messages import ModelResponse, ToolCallPart
+    from pydantic_ai.models.function import FunctionModel
+    from api.agent_pydantic import create_agent, run_agent_async
+    from tests.test_company_research import dependencies
+
+    async def run():
+        deps = dependencies(research_mode='quick')
+        deps.language = 'zh-CN'
+        calls = []
+        def model(messages, info):
+            calls.append(1)
+            return ModelResponse(parts=[ToolCallPart('final_result', {
+                'summary': '- 价格：暂缺。\n- 时间：暂缺。\n- 来源：暂缺。\n- 延迟：未知。',
+                'data_gaps': ['数据暂不可用'],
+            })])
+        agent = create_agent(api_key='offline', model='offline-model')
+        agent.model = FunctionModel(model)
+        response = await run_agent_async(agent, deps, '只列出价格、时间、来源和延迟情况')
+        assert len(calls) == 1
+        assert response.summary.count('\n- ') == 3
+    asyncio.run(run())
+
+
+def test_sector_correlation_cannot_be_presented_as_proven_price_cause():
+    import pytest
+    from pydantic_ai import ModelRetry
+    from api.agent_pydantic import AgentOutput, validate_research_output
+    result = AgentOutput(summary='腾讯跌幅主要是港股科技板块系统性回撤导致。')
+    with pytest.raises(ModelRetry, match='correlation'):
+        validate_research_output(result, [], '腾讯近三个月股价为什么下跌', 'zh-CN')
+
+
+def test_sector_correlation_rejected_even_when_query_only_requests_price_research():
+    import pytest
+    from pydantic_ai import ModelRetry
+    from api.agent_pydantic import AgentOutput, validate_research_output
+
+    output = AgentOutput(summary='近三个月腾讯下跌，主体是港股科技板块的系统性回撤，而非公司层面负面事件。')
+    query = '请深度研究腾讯控股近三个月的股价走势与相关新闻公告，区分已证实事实、可能解释和数据缺口。'
+    with pytest.raises(ModelRetry, match='correlation'):
+        validate_research_output(output, [], query, 'zh-CN')
+
+
+@pytest.mark.parametrize('summary', [
+    '近三个月腾讯股价在跌，但跌幅主要在板块而非个股。',
+    '最硬的解释是板块整体回调，个股跌幅小于基准。',
+])
+def test_sector_relative_performance_is_not_a_proven_explanation(summary):
+    from pydantic_ai import ModelRetry
+    from api.agent_pydantic import AgentOutput, validate_research_output
+    with pytest.raises(ModelRetry, match='correlation'):
+        validate_research_output(AgentOutput(summary=summary), [], '研究腾讯股价走势', 'zh-CN')
+
+
+def test_quote_answer_cannot_invent_previous_close_from_open_price():
+    from pydantic_ai import ModelRetry
+    import pytest
+    quote = {'tool': 'get_stock_analysis', 'data': {'quote': {'current_price': 396.8, 'change': -0.4, 'open_price': 397.8}}, 'evidence': []}
+    output = AgentOutput(summary='最新价 396.8 港元，昨收 397.8 港元。')
+    with pytest.raises(ModelRetry, match='previous close'):
+        validate_research_output(output, [quote], '查询最新报价与来源', 'zh-CN')
+
+
+def test_history_chart_uses_last_bar_date_not_quote_timestamp():
+    from api.agent_pydantic import AgentOutput, build_agent_response
+    data = {'stock_name': '腾讯控股', 'stock_code': '00700.HK',
+            'quote': {'current_price': 397.6},
+            'chart_series': [{'date': '2026-11-03', 'close': 397.2}, {'date': '2026-11-04', 'close': 398.0}],
+            'metadata': {'provider': 'yfinance', 'currency': 'HKD', 'data_as_of': '2026-11-04 13:17:48'}}
+    response = build_agent_response(AgentOutput(summary='报价与历史走势'), [{'tool': 'get_stock_analysis', 'data': data}], 'zh-CN')
+    assert response.payload['chart']['data_as_of'] == '2026-11-04'
+
+
+def test_unverified_sector_cause_is_also_rejected_in_viewpoint_proposal():
+    from pydantic_ai import ModelRetry
+    from api.agent_pydantic import AgentOutput, ViewpointProposal, validate_research_output
+    import pytest
+    output = AgentOutput(summary='相关性不能证明原因。', viewpoint_proposals=[ViewpointProposal(
+        text='腾讯近三个月的股价回撤主要可由恒生科技板块表现解释。',
+        rationale='尚缺行业归因数据。')])
+    with pytest.raises(ModelRetry, match='correlation'):
+        validate_research_output(output, [], '研究腾讯股价走势', 'zh-CN')
+
+
+def test_quote_timestamp_cannot_be_mislabeled_as_retrieval_time():
+    from pydantic_ai import ModelRetry
+    import pytest
+    quote = {'tool': 'get_stock_analysis', 'data': {'quote': {'current_price': 398.2},
+             'metadata': {'data_as_of': '2026-11-04 13:24:40', 'retrieved_at': '2026-11-04T05:27:00Z'}}, 'evidence': []}
+    output = AgentOutput(summary='报价时间 2026-11-04 13:24:40。该时间戳为抓取时点。')
+    with pytest.raises(ModelRetry, match='retrieval time'):
+        validate_research_output(output, [quote], '查询最新报价时间', 'zh-CN')

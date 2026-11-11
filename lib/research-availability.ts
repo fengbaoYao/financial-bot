@@ -2,7 +2,7 @@ export type ResearchMode = "quick" | "deep";
 type RuntimeEnvironment = Readonly<Record<string, string | undefined>>;
 
 export function isPublicBetaRuntime(environment: RuntimeEnvironment): boolean {
-  return environment.VERCEL === "1" || environment.OPENASHARE_PUBLIC_BETA === "true";
+  return environment.VERCEL === "1" || environment.FINANCIAL_BOT_PUBLIC_BETA === "true";
 }
 
 export function effectiveResearchMode(mode: ResearchMode, deepAvailable: boolean): ResearchMode {
@@ -11,7 +11,7 @@ export function effectiveResearchMode(mode: ResearchMode, deepAvailable: boolean
 
 export function deepResearchUnavailableMessage(language: string): string {
   return language === "zh-CN"
-    ? "深入研究暂时不可用，请使用快速研究。"
+    ? "深度研究暂时不可用，请改用快速研究。"
     : "Deep research is unavailable at the moment. Please use Quick research.";
 }
 

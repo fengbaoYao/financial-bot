@@ -1,4 +1,4 @@
--- OpenAshare workspace persistence
+-- Financial Bot workspace persistence (legacy filename 0001_openashare_workspace.sql kept for migrate compatibility)
 -- Run this migration in the Supabase SQL editor or with the Supabase CLI.
 -- All user-owned tables use auth.uid() RLS. The backend must still pass the
 -- authenticated user's access token when calling PostgREST.

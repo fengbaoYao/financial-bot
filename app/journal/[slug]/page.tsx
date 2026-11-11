@@ -18,7 +18,7 @@ async function getLanguage(searchParams: Props["searchParams"]): Promise<Landing
   const { lang } = await searchParams;
   const requested = Array.isArray(lang) ? lang[0] : lang;
   if (requested === "en" || requested === "zh") return requested;
-  return (await cookies()).get("openashare-language")?.value === "zh" ? "zh" : "en";
+  return (await cookies()).get("financial-bot-language")?.value === "zh" ? "zh" : "en";
 }
 
 export async function generateStaticParams() {
@@ -34,13 +34,13 @@ export async function generateMetadata({ params, searchParams }: Props): Promise
   const article = getJournalArticle(slug, language);
 
   if (!article) {
-    return { title: "Journal Article Not Found — OpenAshare" };
+    return { title: "Journal Article Not Found — Financial Bot" };
   }
 
   return localizedMetadata({
     path: `/journal/${slug}`,
     language,
-    title: `${article.title} — OpenAshare Journal`,
+    title: `${article.title} — Financial Bot Journal`,
     description: article.description,
     indexable: false,
   });
@@ -237,12 +237,12 @@ export default async function JournalArticlePage({ params, searchParams }: Props
               </h3>
               <p>
                 {language === "zh"
-                  ? "在 OpenAshare 中调取行情、公告、研报与供应链数据，进行交互式推演。"
+                  ? "在 Financial Bot 中调取行情、公告、研报与供应链数据，进行交互式推演。"
                   : "Bring charts, filings, research and supply chain telemetry together in your own research session."}
               </p>
             </div>
             <Link
-              href={`/work?lang=${language}&q=${encodeURIComponent(article.actionPrompt)}`}
+              href={`/bot?mode=use&lang=${language}&q=${encodeURIComponent(article.actionPrompt)}`}
               className={styles.actionButton}
             >
               {language === "zh" ? "进入工作台研究此课题" : "Open in Research Desk"}{" "}
@@ -256,7 +256,7 @@ export default async function JournalArticlePage({ params, searchParams }: Props
 
       <footer className={`${landingStyles.footer} ${styles.wrap}`}>
         <Link href={`/landing?lang=${language}`} className={landingStyles.footerBrand}>
-          OpenAshare
+          Financial Bot
         </Link>
         <div>
           <Link href={`/landing?lang=${language}#journal`}>{copy.journal}</Link>

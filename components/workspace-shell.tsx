@@ -13,17 +13,12 @@ import { CandlestickChart, type ChartPoint } from "@/components/candlestick-char
 import { ResearchChart, type ChartAnnotation, type ChartSegment } from "@/components/research-chart";
 import {
   getGlobalNews,
-  getCreditBalance,
   getHotspotDetail,
   getMarketRegime,
   getPortfolioAnalysis,
   getStockAnalysis,
   getStockNews,
   getWorkspaceBootstrap,
-  getWorkspaceWatchlist,
-  initializeWorkspaceWatchlist,
-  updateWorkspaceWatchlist,
-  searchStocks,
 } from "@/lib/api";
 import type {
   GlobalNewsItem,
@@ -32,7 +27,6 @@ import type {
   NewsItem,
   PortfolioAnalysisResponse,
   StockAnalysisResponse,
-  CreditBalanceResponse,
 } from "@/lib/types";
 import {
   AGENT_LAB_RUN_EVENT,
@@ -81,6 +75,7 @@ const PROJECTS_STORAGE_KEY = "ashare-workspace-projects-v1";
 const SESSION_PROJECTS_STORAGE_KEY = "ashare-workspace-session-projects-v1";
 
 const DEFAULT_WATCHLIST: WatchItem[] = [
+  { code: "00700.HK", name: "腾讯控股" },
   { code: "US.AAPL", name: "Apple" },
   { code: "US.NVDA", name: "NVIDIA" },
   { code: "US.MSFT", name: "Microsoft" },
@@ -89,6 +84,10 @@ const DEFAULT_WATCHLIST: WatchItem[] = [
   { code: "HK.HSI", name: "恒生指数" },
   { code: "sh000300", name: "沪深300" },
 ];
+
+const DEFAULT_WORK_SYMBOL = "00700.HK";
+const DEFAULT_WORK_NAME_ZH = "腾讯控股";
+const DEFAULT_WORK_NAME_EN = "Tencent";
 
 function readWatchlistCache(): WatchItem[] {
   try {
@@ -106,7 +105,6 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
   const [watchlist, setWatchlist] = useState<WatchItem[]>(DEFAULT_WATCHLIST);
   const [watchlistLoaded, setWatchlistLoaded] = useState(false);
   const [watchlistBusy, setWatchlistBusy] = useState(false);
-  const [watchlistInput, setWatchlistInput] = useState("");
   const [watchlistError, setWatchlistError] = useState("");
   const [sessions, setSessions] = useState<WorkspaceSessionSummary[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
@@ -168,48 +166,20 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
   }, [compactViewport, preferences.showResearchPanel]);
   const [cloudStatus, setCloudStatus] = useState<"local" | "syncing" | "connected" | "error">("local");
   const [cloudError, setCloudError] = useState("");
-  const [creditBalance, setCreditBalance] = useState<CreditBalanceResponse | null>(null);
-
-  const refreshCreditBalance = useCallback(async () => {
-    try {
-      setCreditBalance(await getCreditBalance());
-    } catch {
-      setCreditBalance(null);
-    }
+  const refreshWatchlist = useCallback(() => {
+    setWatchlist(readWatchlistCache());
+    setWatchlistLoaded(true);
+    setWatchlistError("");
   }, []);
-
-  const refreshWatchlist = useCallback(async () => {
-    try {
-      const saved = await getWorkspaceWatchlist();
-      const canonical = saved.initialized ? saved : await initializeWorkspaceWatchlist(readWatchlistCache());
-      setWatchlist(canonical.items);
-      setWatchlistLoaded(true);
-      setWatchlistError("");
-    } catch {
-      setWatchlistError(locale === "en" ? "Watchlist sync unavailable. Your saved list is preserved." : "自选股同步暂不可用，已保存的列表仍保留。");
-    }
-  }, [locale]);
 
   useEffect(() => {
-    let cancelled = false;
-    const existing = readWatchlistCache();
-    setWatchlist(existing);
-    void (async () => {
-      try {
-        const saved = await getWorkspaceWatchlist();
-        const canonical = saved.initialized ? saved : await initializeWorkspaceWatchlist(existing);
-        if (!cancelled) { setWatchlist(canonical.items); setWatchlistLoaded(true); setWatchlistError(""); }
-      } catch {
-        if (!cancelled) setWatchlistError("Watchlist sync unavailable. Your saved list is preserved.");
-      }
-    })();
-    return () => { cancelled = true; };
-  }, []);
+    refreshWatchlist();
+  }, [refreshWatchlist]);
 
   useEffect(() => {
     if (!watchlistLoaded) return;
     try { window.localStorage.setItem(WATCHLIST_STORAGE_KEY, JSON.stringify(watchlist)); }
-    catch { /* The backend remains the source of truth when browser storage is full. */ }
+    catch { /* Keep the in-memory list for this visit when browser storage is full. */ }
   }, [watchlist, watchlistLoaded]);
 
   useEffect(() => {
@@ -332,8 +302,7 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
     if (!snapshot.session?.access_token) {
       setCloudStatus("local");
       setCloudError(snapshot.error ?? "");
-      void refreshCreditBalance();
-      void refreshWatchlist();
+      refreshWatchlist();
       return;
     }
     setCloudStatus("syncing");
@@ -341,18 +310,13 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
     try {
       const bootstrap = await getWorkspaceBootstrap(snapshot.session.access_token);
       void bootstrap;
-      await refreshWatchlist();
+      refreshWatchlist();
       setCloudStatus("connected");
-      await refreshCreditBalance();
     } catch (syncError) {
       setCloudStatus("error");
       setCloudError(syncError instanceof Error ? syncError.message : t("Supabase 工作台同步失败"));
     }
-  }, [refreshCreditBalance, refreshWatchlist, t]);
-
-  useEffect(() => {
-    void refreshCreditBalance();
-  }, [refreshCreditBalance]);
+  }, [refreshWatchlist, t]);
 
   useEffect(() => {
     const symbol = searchParams.get("symbol");
@@ -363,6 +327,17 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
     } else if (context === "portfolio" || context === "market" || context === "news") {
       setActiveContext({ type: context, title: (locale === "en" ? { portfolio: "My portfolio", market: "Market pulse", news: "Global news" } : { portfolio: "我的持仓", market: "市场脉搏", news: "全球新闻" })[context], payload: {}, updatedAt: new Date().toISOString() });
       setRightPanelOpen(true);
+    } else {
+      // Cold-start /work: always land on Tencent unless URL overrides.
+      const defaultName = locale === "en" ? DEFAULT_WORK_NAME_EN : DEFAULT_WORK_NAME_ZH;
+      const existing = watchlist.find((item) => item.code.toUpperCase() === DEFAULT_WORK_SYMBOL);
+      if (!existing) {
+        setWatchlist((current) => {
+          if (current.some((item) => item.code.toUpperCase() === DEFAULT_WORK_SYMBOL)) return current;
+          return [{ code: DEFAULT_WORK_SYMBOL, name: defaultName }, ...current];
+        });
+      }
+      openStock(existing?.code ?? DEFAULT_WORK_SYMBOL, existing?.name ?? defaultName);
     }
     // URL state is an initial deep-link, not a live source of truth.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -393,42 +368,11 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
     if (compactViewport) setLeftPanelOpen(false);
   }
 
-  async function addWatchItem(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const value = watchlistInput.trim();
-    if (!value || watchlistBusy || !watchlistLoaded) return;
-    setWatchlistError("");
-    let code = normalizeSymbol(value);
-    let name = value;
-    try {
-      const matches = await searchStocks(value);
-      const exact = matches.filter(item => item.name.toLowerCase() === value.toLowerCase() || item.code.toUpperCase() === value.toUpperCase() || item.code.toUpperCase() === `US.${value.toUpperCase()}`);
-      const target = exact[0] ?? (matches.length === 1 ? matches[0] : null);
-      if (!target) { setWatchlistError(locale === "en" ? "Use a ticker to identify the company precisely." : "请提供股票代码，以准确识别公司。"); return; }
-      code = target.code;
-      name = target.name;
-    } catch { setWatchlistError(locale === "en" ? "Company search unavailable. Please try again." : "股票搜索暂不可用，请重试。"); return; }
-    if (watchlist.some((item) => item.code.toLowerCase() === code.toLowerCase())) {
-      openStock(code);
-      setWatchlistInput("");
-      return;
-    }
-    setWatchlistBusy(true);
-    try {
-      const saved = await updateWorkspaceWatchlist("add", code);
-      setWatchlist(saved.items);
-      setWatchlistInput("");
-      openStock(code, name);
-    } catch (error) { setWatchlistError(error instanceof Error ? error.message : t("自选股保存失败")); }
-    finally { setWatchlistBusy(false); }
-  }
-
   async function removeWatchItem(code: string) {
     if (watchlistBusy) return;
     setWatchlistBusy(true);
     setWatchlistError("");
-    try { setWatchlist((await updateWorkspaceWatchlist("remove", code)).items); }
-    catch (error) { setWatchlistError(error instanceof Error ? error.message : t("自选股保存失败")); }
+    try { setWatchlist(items => items.filter(item => item.code.toUpperCase() !== code.toUpperCase())); }
     finally { setWatchlistBusy(false); }
   }
 
@@ -437,10 +381,11 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
     setWatchlistBusy(true);
     setWatchlistError("");
     try {
-      const action = watchlist.some(item => item.code.toUpperCase() === code.toUpperCase()) ? "remove" : "add";
-      setWatchlist((await updateWorkspaceWatchlist(action, code)).items);
-    } catch (error) { setWatchlistError(error instanceof Error ? error.message : t("自选股保存失败")); }
-    finally { setWatchlistBusy(false); }
+      const exists = watchlist.some(item => item.code.toUpperCase() === code.toUpperCase());
+      setWatchlist(items => exists
+        ? items.filter(item => item.code.toUpperCase() !== code.toUpperCase())
+        : [...items, { code: normalizeSymbol(code), name: normalizeSymbol(code) }]);
+    } finally { setWatchlistBusy(false); }
   }
 
   function selectSession(sessionId: string) {
@@ -558,8 +503,8 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
 
   const handleContextUpdate = useCallback((context: ResearchContext | null, initial = false, openPanel = false) => {
     if (pinnedContext) return;
-    // An explicit stock/tool link takes precedence over the initial saved chat.
-    if (initial && (searchParams.get("symbol") || searchParams.get("context"))) return;
+    // URL deep-links win; otherwise /work cold-starts on Tencent and must not be overwritten by saved chat context.
+    if (initial) return;
     setActiveContext(context);
     setSelectedSymbol(context?.type === "stock" ? context.entityId ?? null : null);
     if (openPanel && context?.type === "stock") {
@@ -567,7 +512,7 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
       if (!compactViewport) updatePreferences({ showResearchPanel: true });
       if (compactViewport) setLeftPanelOpen(false);
     }
-  }, [compactViewport, pinnedContext, searchParams, updatePreferences]);
+  }, [compactViewport, pinnedContext, updatePreferences]);
 
   function handleLabTrace(trace: AgentLabTrace) {
     setLabTraces((current) => [...current, trace].slice(-30));
@@ -607,20 +552,31 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
           <a
             className="workspace-brand-lockup"
             href={`/landing?lang=${locale}`}
-            aria-label={t("返回 OpenAshare 首页")}
+            aria-label={t("返回 Financial Bot 首页")}
           >
             <span className="workspace-brand-mark">
-              <Image src="/favicon.svg" alt="OpenAshare" width={44} height={44} priority />
+              <Image src="/favicon.svg" alt="Financial Bot" width={44} height={44} priority />
             </span>
             <div>
-              <strong>OpenAshare</strong>
-              <span>{t("研究工作台")}</span>
+              <strong>
+                <span className="workspace-brand-full">Financial Bot</span>
+                <span className="workspace-brand-short">Financial</span>
+              </strong>
+              <span>financial-work</span>
             </div>
           </a>
         </div>
         <div className="workspace-header-status">
-          <button className="workspace-icon-button" type="button" aria-expanded={rightPanelOpen} aria-controls="research-drawer" onClick={() => { const open = !rightPanelOpen; setRightPanelOpen(open); if (compactViewport) setLeftPanelOpen(false); else updatePreferences({showResearchPanel: open}); }}>
-            {rightPanelOpen ? (locale === "en" ? "Hide panel" : "隐藏面板") : (locale === "en" ? "Show panel" : "显示面板")}
+          <nav className="workspace-product-crumb" aria-label={locale === "en" ? "Product hierarchy" : "产品层级"}>
+            <a href={`/landing?lang=${locale}`}>{locale === "en" ? "Home" : "主页"}</a>
+            <span aria-hidden="true">›</span>
+            <span aria-current="page">financial-work</span>
+          </nav>
+          <a className="workspace-bot-link" href="/bot?mode=use&mausbot=1">
+            {locale === "en" ? "Enter bot" : "进入使用 bot"} <span aria-hidden="true">→</span>
+          </a>
+          <button className="workspace-icon-button workspace-panel-toggle" type="button" aria-expanded={rightPanelOpen} aria-controls="research-drawer" onClick={() => { const open = !rightPanelOpen; setRightPanelOpen(open); if (compactViewport) setLeftPanelOpen(false); else updatePreferences({showResearchPanel: open}); }}>
+            <span className="workspace-panel-toggle-label">{rightPanelOpen ? (locale === "en" ? "Hide panel" : "隐藏面板") : (locale === "en" ? "Show panel" : "显示面板")}</span>
           </button>
         </div>
       </header>
@@ -642,16 +598,12 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
 
             <WorkspaceTools activeType={activeContext?.type} onOpen={openResearchTool} />
 
-            <form className="workspace-watch-search" onSubmit={addWatchItem}>
-              <span aria-hidden="true">⌕</span>
-              <input
-                disabled={watchlistBusy || !watchlistLoaded}
-                value={watchlistInput}
-                onChange={(event) => setWatchlistInput(event.target.value)}
-                placeholder={t("添加股票或代码")}
-                aria-label={t("添加股票或代码")}
-              />
-            </form>
+            <p className="workspace-empty-copy" role="status">
+              {locale === "en" ? "Stock search and adding are temporarily unavailable." : "股票搜索和新增自选股暂时关闭。"}
+            </p>
+            <p className="workspace-empty-copy">
+              {locale === "en" ? "Saved stocks stay in this browser; cloud sync is paused." : "现有自选股保存在当前浏览器，云端同步已暂停。"}
+            </p>
             {watchlistError ? <p className="workspace-empty-copy" role="alert">{watchlistError}</p> : null}
 
             <section className="workspace-list-section">
@@ -661,9 +613,9 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
               </div>
               <div className="workspace-watchlist">
                 {watchlist.map((item) => (
-                  <div className={`workspace-watch-item ${selectedSymbol === item.code ? "active" : ""}`} key={item.code}>
+                  <div className={`workspace-watch-item ${selectedSymbol && normalizeSymbol(selectedSymbol).toUpperCase() === normalizeSymbol(item.code).toUpperCase() ? "active" : ""}`} key={item.code}>
                     <button type="button" onClick={() => openStock(item.code, item.name)}
-                      aria-current={selectedSymbol === item.code ? "true" : undefined}
+                      aria-current={selectedSymbol && normalizeSymbol(selectedSymbol).toUpperCase() === normalizeSymbol(item.code).toUpperCase() ? "true" : undefined}
                       title={`${t(isUnknownStockName(item.name) ? item.code : item.name)} · ${item.code.toUpperCase()}`}>
                       <span className="workspace-watch-symbol">{item.code.toUpperCase()}</span>
                       <span className="workspace-watch-name">{t(isUnknownStockName(item.name) ? item.code : item.name)}</span>
@@ -777,7 +729,7 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
                     <SupabaseAuthPanel placement="profile" onAuthChange={handleSupabaseAuth} />
                     <p className="workspace-account-status">{cloudStatus === "connected" ? t("云端已连接") : cloudStatus === "syncing" ? t("同步中") : cloudStatus === "error" ? t("云端同步未完成") : t("本地模式")}</p>
                     {cloudError ? <p className="workspace-account-status">{t("使用本地记录")}</p> : null}
-                    <p className="workspace-account-status">{creditBalance?.unlimited ? t("本地模式 · Credits 不限") : `${creditBalance?.balance ?? "—"} Credits`}</p>
+                    <p className="workspace-account-status">{locale === "en" ? "Credit balance temporarily unavailable" : "额度信息暂时不可用"}</p>
                   </div>
                 ) : null}
                 <button
@@ -813,14 +765,6 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
             onCurrentSessionChange={setActiveSessionId}
             onContextUpdate={handleContextUpdate}
             onLabTrace={labMode ? handleLabTrace : undefined}
-            onCreditUpdate={(usage) => {
-              if (usage.remaining == null || usage.unlimited) return;
-              setCreditBalance((current) => current ? {
-                ...current,
-                balance: usage.remaining ?? current.balance,
-                lifetime_used: current.lifetime_used + usage.charged,
-              } : current);
-            }}
           />
         </section>
 
@@ -994,6 +938,7 @@ function ResearchContextPanel({
 
   useEffect(() => {
     let cancelled = false;
+    const controller = new AbortController();
     setError("");
     setStock(null);
     setResolvedStockName(null);
@@ -1014,27 +959,23 @@ function ResearchContextPanel({
         if (context.type === "stock" && context.entityId) {
           const requestedSymbol = context.entityId;
           const payloadStock = payloadToStock(context.payload);
-          let searchResults: Awaited<ReturnType<typeof searchStocks>> = [];
-          try {
-            searchResults = await searchStocks(requestedSymbol);
-          } catch {
-            // A temporary search outage should not block a request that already has a code.
-          }
-          const exactMatch = searchResults.find((item) =>
-            item.match_type !== "code_validation" &&
-            !isUnknownStockName(item.name) &&
-            (item.code.toLowerCase() === requestedSymbol.toLowerCase() ||
-              item.name.trim().toLowerCase() === requestedSymbol.trim().toLowerCase()),
-          );
-          const stockCode = exactMatch?.code ?? payloadStock?.stock_code ?? requestedSymbol;
+          if (cancelled || controller.signal.aborted) return;
+          const stockCode = payloadStock?.stock_code ?? requestedSymbol;
           const payloadName = payloadStock?.stock_name;
-          const stockName = exactMatch?.name ?? (payloadName && !isUnknownStockName(payloadName) ? payloadName : undefined);
+          const stockName = payloadName && !isUnknownStockName(payloadName) ? payloadName : undefined;
           if (stockName && stockName !== stockCode) setResolvedStockName(stockName);
-          const [analysis, relatedNews] = await Promise.all([
-            getStockAnalysis(stockCode, { includeAi: false, language: locale === "en" ? "en-US" : "zh-CN" }),
-            getStockNews(stockCode),
-          ]);
-          if (!cancelled) {
+          // News is best-effort: a hung HK/CN news provider must not blank the quote/chart panel.
+          const analysisPromise = getStockAnalysis(stockCode, {
+            includeAi: false,
+            language: locale === "en" ? "en-US" : "zh-CN",
+            requestInit: { signal: controller.signal },
+            timeoutMs: 12000,
+          });
+          const newsPromise = getStockNews(stockCode, { requestInit: { signal: controller.signal }, timeoutMs: 8000 })
+            .catch(() => [] as Awaited<ReturnType<typeof getStockNews>>);
+          const analysis = await analysisPromise;
+          const relatedNews = await newsPromise;
+          if (!cancelled && !controller.signal.aborted) {
             setStock(analysis);
             setResolvedStockName(isUnknownStockName(analysis.stock_name) ? null : analysis.stock_name);
             setNews(relatedNews);
@@ -1046,11 +987,11 @@ function ResearchContextPanel({
           const items = marketScope === "hk" ? [] : await getGlobalNews(marketScope === "us" ? "us" : "global");
           if (!cancelled) setGlobalNews(items);
         } else if (context.type === "portfolio") {
-          const analysis = await getPortfolioAnalysis({language: locale === "en" ? "en-US" : "zh-CN"});
+          const analysis = await getPortfolioAnalysis({language: locale === "en" ? "en-US" : "zh-CN", requestInit: { signal: controller.signal }});
           if (!cancelled) setPortfolio(analysis ?? null);
         } else {
           for (let attempt = 0; attempt < 16 && !cancelled; attempt++) {
-            const regime = await getMarketRegime({market: marketScope, language: locale === "en" ? "en-US" : "zh-CN"});
+            const regime = await getMarketRegime({market: marketScope, language: locale === "en" ? "en-US" : "zh-CN", requestInit: { signal: controller.signal }});
             if (cancelled) return;
             setMarket(regime);
             setLoading(false);
@@ -1060,7 +1001,29 @@ function ResearchContextPanel({
           }
         }
       } catch (loadError) {
-        if (!cancelled) setError(loadError instanceof Error ? loadError.message : locale === "en" ? "Research data is temporarily unavailable." : "研究数据暂时不可用");
+        if (!cancelled && !controller.signal.aborted) {
+          const raw = loadError instanceof Error ? loadError.message : String(loadError || "");
+          const lower = raw.toLowerCase();
+          let friendly = raw || (locale === "en" ? "Research data is temporarily unavailable." : "研究数据暂时不可用");
+          if (/4318|quota|额度|月度/.test(raw)) {
+            friendly = locale === "en"
+              ? "iFinD monthly history quota is exhausted (-4318). Trying Fuyao/other fallbacks when available."
+              : "iFinD 历史额度已用尽（-4318）。可用时会自动走扶摇等备用源。";
+          } else if (/524|timeout|timed out|abort|超时/.test(lower)) {
+            friendly = locale === "en"
+              ? "Stock/news fetch timed out. Retry, or pick another ticker."
+              : "行情/新闻请求超时。可重试，或换一只股票。";
+          } else if (/400|not found|unknown|invalid/.test(lower)) {
+            friendly = locale === "en"
+              ? "Could not load this symbol. Check the code, retry, or pick another ticker."
+              : "这只股票加载失败。请核对代码后重试，或换一只股票。";
+          } else if (!raw || /failed to fetch|network|unreachable/.test(lower)) {
+            friendly = locale === "en"
+              ? "Could not reach the data provider. Retry later, or pick another ticker."
+              : "数据源连不上。可稍后再试，或换一只股票。";
+          }
+          setError(friendly);
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -1068,6 +1031,7 @@ function ResearchContextPanel({
     void load();
     return () => {
       cancelled = true;
+      controller.abort();
     };
   }, [context, locale, marketScope, reload]);
 
@@ -1127,7 +1091,7 @@ function ResearchContextPanel({
 
       {!context ? <EmptyResearchContext onOpen={onOpenTool} /> : null}
       {loading ? <ContextLoading /> : null}
-      {error ? <div className="research-error" role="alert">{error}<button type="button" onClick={() => setReload(v => v+1)}>{locale === "en" ? "Retry" : "重试"}</button></div> : null}
+      {error ? <div className="research-error" role="alert"><p>{error}</p><div className="research-error-actions"><button type="button" onClick={() => setReload(v => v+1)}>{locale === "en" ? "Retry" : "重试"}</button>{context?.type === "stock" ? <button type="button" onClick={() => onOpenTool("stock")}>{locale === "en" ? "Pick another stock" : "换一只股票"}</button> : null}</div></div> : null}
       {!loading && !error && context?.type === "stock" && !context.entityId ? (
         <div className="research-empty-state"><h3>{locale === "en" ? "Choose a stock to research" : "选择一只股票开始研究"}</h3><p>{locale === "en" ? "Select a saved stock or search for a ticker in the left panel." : "请从左侧自选股中选择，或搜索代码后添加。"}</p></div>
       ) : null}
@@ -1205,7 +1169,7 @@ function StockContext({
     update();
     previewCleanupRef.current = () => scale.unsubscribeVisibleLogicalRangeChange(update);
   }, [fullSeries, range]);
-  const annotationStorageKey = `openashare.chart.annotations.v1.${data?.stock_code ?? ""}`;
+  const annotationStorageKey = `financial-bot.chart.annotations.v1.${data?.stock_code ?? ""}`;
   useEffect(() => {
     try {
       const saved: unknown = JSON.parse(localStorage.getItem(annotationStorageKey) ?? "[]");
@@ -1242,6 +1206,7 @@ function StockContext({
   const currency = data.market === "us" ? "USD" : data.market === "hk" ? "HKD" : "CNY";
   const series = fullSeries;
   const asOf = String(data.metadata?.data_as_of ?? series.at(-1)?.date ?? (locale === "en" ? "Date unknown" : "日期未知"));
+  const quoteProvider = typeof data.metadata?.quote_provider === "string" ? data.metadata.quote_provider : null;
   const chartData = filterChartRange(series, range);
   const chartName = displayName ?? data.stock_name;
 
@@ -1303,7 +1268,7 @@ function StockContext({
           <div><span className="research-label">{t("最新价")} · {currency}</span><strong className="research-price">{data.quote.current_price.toFixed(2)}</strong></div>
           <div className={`research-change ${direction}`}>{data.quote.change_pct >= 0 ? "+" : ""}{data.quote.change_pct.toFixed(2)}%</div>
         </div>
-        <div className="stock-quote-caption"><button type="button" className="stock-watch-button" disabled={watchlistBusy} aria-pressed={watched} aria-label={watched ? (locale === "en" ? "Remove from watchlist" : "移出自选股") : (locale === "en" ? "Add to watchlist" : "加入自选股")} onClick={() => { void onToggleWatch(data.stock_code); }}><span aria-hidden="true">{watched ? "★" : "☆"}</span>{watched ? (locale === "en" ? "Watching" : "已关注") : (locale === "en" ? "Watch" : "关注")}</button><span>{locale === "en" ? "Delayed daily data" : "延迟日线"} · {asOf}</span></div>
+        <div className="stock-quote-caption"><button type="button" className="stock-watch-button" disabled={watchlistBusy} aria-pressed={watched} aria-label={watched ? (locale === "en" ? "Remove from watchlist" : "移出自选股") : (locale === "en" ? "Add to watchlist" : "加入自选股")} onClick={() => { void onToggleWatch(data.stock_code); }}><span aria-hidden="true">{watched ? "★" : "☆"}</span>{watched ? (locale === "en" ? "Watching" : "已关注") : (locale === "en" ? "Watch" : "关注")}</button><span>{quoteProvider ? (locale === "en" ? `Delayed snapshot · ${quoteProvider}` : `延迟快照 · ${quoteProvider}`) : (locale === "en" ? "Delayed daily data" : "延迟日线")} · {asOf}</span></div>
         {watchlistError ? <p className="stock-watch-error" role="alert">{watchlistError}</p> : null}
       </div>
       {series.length ? <section className="stock-chart-surface" aria-label={locale === "en" ? "Price chart" : "价格图表"}>
@@ -1312,7 +1277,7 @@ function StockContext({
           <div className="stock-chart-view"><select aria-label={locale === "en" ? "Chart type" : "图表类型"} value={chartType} onChange={event => setChartType(event.target.value as typeof chartType)}><option value="candles">{locale === "en" ? "Candles" : "K线"}</option><option value="line">{locale === "en" ? "Line" : "折线"}</option></select><button ref={expandButtonRef} type="button" aria-label={t("展开 K 线")} title={t("展开 K 线")} onClick={showExpandedChart}>↗</button></div>
         </div>
         <CandlestickChart data={series} height={260} surface chartType={chartType} onReady={handlePreviewChartReady} />
-        <div className="stock-chart-caption"><span>{previewDates?.from ?? chartData[0]?.date.slice(0, 10)} — {previewDates?.to ?? chartData.at(-1)?.date.slice(0, 10)}</span><span>{currency} · {locale === "en" ? "Daily" : "日线"}</span></div>
+        <div className="stock-chart-caption"><span>{previewDates?.from ?? chartData[0]?.date.slice(0, 10)} — {previewDates?.to ?? chartData.at(-1)?.date.slice(0, 10)}</span><span>{currency} · {locale === "en" ? "Daily" : "日线"}{typeof data.metadata?.source === "string" ? ` · ${data.metadata.source}` : ""}</span></div>
       </section> : <p className="research-muted">{locale === "en" ? "Price history unavailable." : "历史价格暂不可用。"}</p>}
       {chartExpanded && series.length ? createPortal(<div className="research-chart-overlay" role="dialog" aria-modal="true" aria-label={`${chartName} · ${t("K 线")}`} onClick={event => { if (event.target === event.currentTarget) setChartExpanded(false); }}>
         <div ref={chartDialogRef} className="research-chart-dialog">
@@ -1344,7 +1309,7 @@ function StockContext({
       <dl className="stock-metrics">{metrics.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>
       {!!data.technical_commentary?.length && <section className="stock-observations"><h3>{t("技术观察")}</h3>{data.technical_commentary.slice(0, 2).map(item => <p key={item}>{item}</p>)}</section>}
       <section className="stock-news"><h3>{locale === "en" ? "News & market context" : "新闻与市场背景"}</h3>{news.slice(0, 3).map(item => <article className="research-news-item" key={item.id}><SourceHeadline title={item.title} url={item.url}/><span>{item.source} · {item.published_at.slice(0, 10)}</span>{item.relation_type !== "direct" ? <small>{locale === "en" ? "Market context · company link unconfirmed" : "市场背景 · 公司关联未确认"}</small> : null}</article>)}{!news.length ? <p className="research-muted">{t("暂无相关新闻")}</p> : null}</section>
-      <details className="stock-data-disclosure"><summary>{locale === "en" ? "Data & sources" : "数据与来源"}<span>{String(data.metadata?.source ?? "—")}</span></summary><div className="stock-source-meta"><span>{locale === "en" ? "Data date" : "数据日期"}: {asOf}</span><span>{locale === "en" ? "Retrieved" : "获取时间"}: {String(data.metadata?.generated_at ?? "—")}</span><p>{locale === "en" ? "Historical / delayed prices. Retrieval time is not the exchange quote time. Indicators describe the full available daily series." : "历史／延迟价格；获取时间并非交易所报价时间。指标使用完整的可用日线数据。"}</p></div>{series.length ? <table className="stock-data-table"><caption>{locale === "en" ? "Latest available trading days" : "最近可用交易日"}</caption><thead><tr><th>{locale === "en" ? "Date" : "日期"}</th><th>{locale === "en" ? "Close" : "收盘"} · {currency}</th><th>{locale === "en" ? "Volume" : "成交量"}</th></tr></thead><tbody>{series.slice(-5).reverse().map(point => <tr key={point.date}><td>{point.date.slice(0, 10)}</td><td>{point.close?.toFixed(2) ?? "—"}</td><td>{point.volume == null ? "—" : formatQuantity(point.volume, locale)}</td></tr>)}</tbody></table> : null}</details>
+      <details className="stock-data-disclosure"><summary>{locale === "en" ? "Data & sources" : "数据与来源"}<span>{String(data.metadata?.source ?? "—")}</span></summary><div className="stock-source-meta"><span>{locale === "en" ? "Quote date" : "快照日期"}: {asOf}</span><span>{locale === "en" ? "Retrieved" : "获取时间"}: {String(data.metadata?.generated_at ?? "—")}</span><p>{locale === "en" ? "Historical / delayed prices. Retrieval time is not the exchange quote time. Indicators describe the full available daily series." : "历史／延迟价格；获取时间并非交易所报价时间。指标使用完整的可用日线数据。"}{quoteProvider ? (locale === "en" ? " The quote snapshot and daily history may come from different sources and times." : " 快照与日线可能来自不同来源、时间，成交量不宜直接对比。") : ""}</p></div>{series.length ? <table className="stock-data-table"><caption>{locale === "en" ? "Latest available trading days" : "最近可用交易日"}</caption><thead><tr><th>{locale === "en" ? "Date" : "日期"}</th><th>{locale === "en" ? "Close" : "收盘"} · {currency}</th><th>{locale === "en" ? "Volume" : "成交量"}</th></tr></thead><tbody>{series.slice(-5).reverse().map(point => <tr key={point.date}><td>{point.date.slice(0, 10)}</td><td>{point.close?.toFixed(2) ?? "—"}</td><td>{point.volume == null ? "—" : formatQuantity(point.volume, locale)}</td></tr>)}</tbody></table> : null}</details>
       <button className="stock-refresh" type="button" onClick={() => onSelectStock(data.stock_code, data.stock_name)}>{locale === "en" ? "Refresh data" : "刷新数据"}<span aria-hidden="true">↻</span></button>
     </div>
   );
@@ -1471,6 +1436,11 @@ function normalizeSymbol(value: string) {
   if (/^(sh|sz)\d{6}$/i.test(trimmed)) return trimmed.toLowerCase();
   if (/^6\d{5}$/.test(trimmed)) return `sh${trimmed}`;
   if (/^\d{6}$/.test(trimmed)) return `sz${trimmed}`;
+  const upper = trimmed.toUpperCase();
+  if (upper === "HSI" || upper === "HK.HSI" || upper === "^HSI") return "HK.HSI";
+  if (/^\d{1,5}\.HK$/.test(upper)) return `${upper.split(".")[0].padStart(5, "0")}.HK`;
+  const hkPrefix = upper.match(/^HK\.?(\d{1,5})$/);
+  if (hkPrefix) return `${hkPrefix[1].padStart(5, "0")}.HK`;
   return trimmed;
 }
 

@@ -1,4 +1,4 @@
-# OpenAshare Supabase setup
+# Financial Bot Supabase setup
 
 The first integration phase stores user-owned workspace data in Supabase while
 keeping the current SQLite/localStorage path as the development fallback.

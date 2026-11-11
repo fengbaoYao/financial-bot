@@ -5,8 +5,8 @@ import { LandingDemoPlayer } from "@/components/landing-demo-player";
 import styles from "@/app/landing.module.css";
 
 const demoMedia = {
-  src: "/marketing/openashare-30s-product.mp4",
-  poster: "/marketing/openashare-30s-product.jpg",
+  src: "/marketing/financial-bot-30s-product.mp4",
+  poster: "/marketing/financial-bot-30s-product.jpg",
   duration: 30,
 };
 

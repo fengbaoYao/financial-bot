@@ -233,7 +233,6 @@ export function SignalRibbon({ language }: { language: LandingLanguage }) {
       </div>
     </div>
     <figcaption className={styles.ribbonTools}>
-      <a href="#demo" className={styles.ribbonScroll}>{copy.watchDemo}<span aria-hidden="true">↓</span></a>
       <button type="button" className={styles.motionButton} onClick={toggleMotion} aria-pressed={paused || reduced || unavailable} disabled={reduced || unavailable}>{reduced || unavailable ? copy.staticMotion : paused ? copy.playMotion : copy.pauseMotion}</button>
     </figcaption>
   </figure>;

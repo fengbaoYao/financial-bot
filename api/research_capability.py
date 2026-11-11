@@ -1,5 +1,7 @@
 """PydanticAI V2 research hooks: scoped tools and per-run retrieval reuse."""
 from dataclasses import replace
+import os
+import re
 from pydantic_ai.capabilities import Capability
 from ashare.stock_pool import normalize_stock_code
 from api.company_research import ensure_identity
@@ -34,9 +36,19 @@ class ResearchCapability(Capability):
 
     async def prepare_tools(self, ctx, tool_defs):
         reason = ctx.deps.synthesis_reason()
+        # Leave room for the final answer and validation retries. Specialist
+        # reviews share this same usage counter with the parent agent.
+        limit = getattr(ctx.deps, "model_request_limit", None)
+        usage = getattr(ctx, "usage", None)
+        if (not reason and getattr(ctx.deps, "research_mode", "quick") == "deep"
+                and limit is not None and getattr(usage, "requests", 0) >= max(1, limit - 3)):
+            reason = "request_reserved_for_synthesis"
         if reason:
             ctx.deps.finish_reason = reason
             return []  # Output tools remain available, including validation repair.
+        gated = self._apply_ifind_primary_gate(ctx, tool_defs)
+        if gated is not None:
+            return gated
         if is_first_pass_investor_brief(ctx.deps.user_query):
             results = ctx.deps.tool_results
             searches = [item for item in results if item.get("tool") == "search_stocks"]
@@ -64,6 +76,10 @@ class ResearchCapability(Capability):
                                            for row in web_results.get("data", []) if isinstance(row, dict)))
             if has_web_sources and "read_public_source" not in completed:
                 return [tool for tool in tool_defs if tool.name == "read_public_source"]
+            if (ctx.deps.research_mode == "deep" and "research_company" not in completed
+                    and any(item.get("evidence") and item.get("tool") != "search_stocks"
+                            and item.get("status") != "unavailable" for item in results)):
+                return [tool for tool in tool_defs if tool.name == "research_company"]
             return []
         if is_broad_stock_comparison(ctx.deps.user_query):
             comparison = next((item for item in reversed(ctx.deps.tool_results)
@@ -94,6 +110,9 @@ class ResearchCapability(Capability):
             # without reopening unrelated SEC-only or single-company routes.
             return [tool for tool in tool_defs if tool.name in {"web_search", "read_public_source"}]
         if is_financial_stock_comparison(ctx.deps.user_query):
+            if "@" not in os.environ.get("SEC_USER_AGENT", ""):
+                ctx.deps.finish_reason = "sec_not_configured"
+                return []
             searches = [item for item in ctx.deps.tool_results if item.get("tool") == "search_stocks"]
             resolved = resolved_codes(ctx.deps)
             verified = resolved & ctx.deps.verified_us_codes
@@ -122,10 +141,64 @@ class ResearchCapability(Capability):
                 return []
             return [tool for tool in tool_defs if tool.name == "get_stock_news"]
         verified = ctx.deps.verified_us_codes
+        sec_ready = "@" in os.environ.get("SEC_USER_AGENT", "")
         return [tool for tool in tool_defs
-                if (tool.name != "get_sec_company_data" or verified)
-                and (tool.name != "compare_companies" or len(verified) >= 2)
+                if (tool.name != "get_sec_company_data" or (verified and sec_ready))
+                and (tool.name != "compare_companies" or (len(verified) >= 2 and sec_ready))
                 and (tool.name != "research_company" or ctx.deps.research_mode == "deep")]
+
+
+    # Competing market/fundamentals providers. Kept closed for single-security
+    # quote/fundamental questions until iFinD skill has failed.
+    _IFIND_FALLBACK_MARKET_TOOLS = frozenset({
+        "get_stock_analysis",
+        "get_company_fundamentals",
+        "get_financial_statements",
+        "get_valuations",
+        "get_consensus_estimates",
+        "get_analyst_estimates",
+        "get_cninfo_announcements",
+    })
+
+    def _apply_ifind_primary_gate(self, ctx, tool_defs):
+        """Hard-prefer iFinD for single-name quote/fundamental questions.
+
+        Comparisons, investor briefs, technical-signal-only asks, and non-market
+        chat stay on the existing soft path. Failure opens the competing tools.
+        """
+        try:
+            from api.datasources.flags import ifind_enabled, ifind_primary
+            from api.agent_pydantic import should_prefetch_ifind
+        except Exception:
+            return None
+        query = str(getattr(ctx.deps, "user_query", "") or "")
+        if not (ifind_enabled() and ifind_primary() and should_prefetch_ifind(query)):
+            return None
+        # Technical-signal asks still prefetch iFinD for context, but need local
+        # analysis tools; do not hard-block them.
+        if re.search(r"技术面|技术分析|\bMACD\b|\bRSI\b|均线|信号评分|买卖点", query, re.I):
+            return None
+        if (is_first_pass_investor_brief(query)
+                or is_broad_stock_comparison(query)
+                or is_financial_stock_comparison(query)):
+            return None
+        results = list(getattr(ctx.deps, "tool_results", None) or [])
+        ifind_rows = [item for item in results if item.get("tool") == "ifind_smart_query"]
+        if not ifind_rows:
+            only = [tool for tool in tool_defs if tool.name == "ifind_smart_query"]
+            return only or None
+        if any(item.get("status") == "unavailable" for item in ifind_rows):
+            return None  # failure → normal tool set
+        # Success: keep competing market providers closed; leave identity/web/etc.
+        verified = getattr(ctx.deps, "verified_us_codes", set()) or set()
+        sec_ready = "@" in os.environ.get("SEC_USER_AGENT", "")
+        return [
+            tool for tool in tool_defs
+            if tool.name not in self._IFIND_FALLBACK_MARKET_TOOLS
+            and (tool.name != "get_sec_company_data" or (verified and sec_ready))
+            and (tool.name != "compare_companies" or (len(verified) >= 2 and sec_ready))
+            and (tool.name != "research_company" or getattr(ctx.deps, "research_mode", "quick") == "deep")
+        ]
 
     async def wrap_tool_execute(self, ctx, *, call, tool_def, args, handler):
         # Mutations and list reads must see the current persisted workspace state.

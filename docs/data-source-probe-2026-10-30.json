@@ -1,0 +1,194 @@
+[
+  {
+    "source": "fuyao_quote",
+    "status": "ok",
+    "latency_ms": 144,
+    "detail": "1371.51 @ 2026-10-30"
+  },
+  {
+    "source": "fuyao_history",
+    "status": "ok",
+    "latency_ms": 69,
+    "detail": "27 bars, last 2026-10-30"
+  },
+  {
+    "source": "fuyao_financials",
+    "status": "ok",
+    "latency_ms": 160,
+    "detail": "2025-12-31 revenue=168838102514.79"
+  },
+  {
+    "source": "fuyao_valuations",
+    "status": "ok",
+    "latency_ms": 62,
+    "detail": "2 items"
+  },
+  {
+    "source": "fuyao_search",
+    "status": "ok",
+    "latency_ms": 76,
+    "detail": "1 items"
+  },
+  {
+    "source": "fuyao_calendar",
+    "status": "ok",
+    "latency_ms": 64,
+    "detail": "9 days"
+  },
+  {
+    "source": "fuyao_index",
+    "status": "ok",
+    "latency_ms": 82,
+    "detail": "300 members"
+  },
+  {
+    "source": "sina_history",
+    "status": "ok",
+    "latency_ms": 241,
+    "detail": "5 rows"
+  },
+  {
+    "source": "tencent_history",
+    "status": "ok",
+    "latency_ms": 259,
+    "detail": "6 rows"
+  },
+  {
+    "source": "akshare_history",
+    "status": "error",
+    "latency_ms": 306,
+    "detail": "ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))"
+  },
+  {
+    "source": "yfinance_us",
+    "status": "ok",
+    "latency_ms": 1865,
+    "detail": "5 rows"
+  },
+  {
+    "source": "yfinance_hk",
+    "status": "ok",
+    "latency_ms": 268,
+    "detail": "5 rows"
+  },
+  {
+    "source": "cninfo_announcements",
+    "status": "ok",
+    "latency_ms": 5492,
+    "detail": "3 announcements"
+  },
+  {
+    "source": "ths_consensus",
+    "status": "ok",
+    "latency_ms": 608,
+    "detail": "3 years"
+  },
+  {
+    "source": "csi_constituents",
+    "status": "ok",
+    "latency_ms": 3353,
+    "detail": "300 members"
+  },
+  {
+    "source": "cni_constituents",
+    "status": "error",
+    "latency_ms": 265,
+    "detail": "LocalDataError: 国证指数成分文件不是可解析的 Excel；可能未发布或结构已变"
+  },
+  {
+    "source": "sina_financials",
+    "status": "ok",
+    "latency_ms": 346,
+    "detail": "2026-06-30 revenue=90703260964.48"
+  },
+  {
+    "source": "eastmoney_news",
+    "status": "ok",
+    "latency_ms": 197,
+    "detail": "10 rows"
+  },
+  {
+    "source": "cls_news",
+    "status": "ok",
+    "latency_ms": 324,
+    "detail": "20 rows"
+  },
+  {
+    "source": "sina_news",
+    "status": "ok",
+    "latency_ms": 403,
+    "detail": "20 rows"
+  },
+  {
+    "source": "ths_news",
+    "status": "ok",
+    "latency_ms": 393,
+    "detail": "20 rows"
+  },
+  {
+    "source": "eastmoney_search",
+    "status": "ok",
+    "latency_ms": 3,
+    "detail": "1 rows"
+  },
+  {
+    "source": "web_search",
+    "status": "ok",
+    "latency_ms": 1891,
+    "detail": "3 results; gaps=1"
+  },
+  {
+    "source": "google_news_rss",
+    "status": "ok",
+    "latency_ms": 713,
+    "detail": "3 results"
+  },
+  {
+    "source": "duckduckgo_html",
+    "status": "error",
+    "latency_ms": 321,
+    "detail": "ValueError: Search provider requires an interactive challenge."
+  },
+  {
+    "source": "bing_rss",
+    "status": "ok",
+    "latency_ms": 253,
+    "detail": "3 results"
+  },
+  {
+    "source": "brave_search",
+    "status": "not_configured",
+    "latency_ms": null,
+    "detail": "missing key/config"
+  },
+  {
+    "source": "finnhub_news",
+    "status": "not_configured",
+    "latency_ms": null,
+    "detail": "missing key/config"
+  },
+  {
+    "source": "sec_edgar",
+    "status": "not_configured",
+    "latency_ms": null,
+    "detail": "missing key/config"
+  },
+  {
+    "source": "eastmoney_consensus",
+    "status": "ok",
+    "latency_ms": 2929,
+    "detail": "4 years"
+  },
+  {
+    "source": "eastmoney_us_fundamentals",
+    "status": "ok",
+    "latency_ms": 1485,
+    "detail": "2 periods"
+  },
+  {
+    "source": "eastmoney_hk_fundamentals",
+    "status": "ok",
+    "latency_ms": 508,
+    "detail": "2 periods"
+  }
+]

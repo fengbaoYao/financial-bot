@@ -130,7 +130,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const isLanding = pathname === "/" || pathname === "/landing";
   const isJournalArticle = pathname.startsWith("/journal/");
   const isEditorialPage = isLanding || isJournalArticle;
-  const isWorkspace = pathname === "/work";
+  const isWorkspace = pathname === "/work" || pathname === "/bot";
   const isWaitlistFlow = pathname === "/waitlist" || pathname.startsWith("/admin");
   const isPreviewCapture = searchParams.get("preview") === "1";
   const { sidebarOpen, isMobile, sidebarWidth, isResizing, startResize } = useAppShell();

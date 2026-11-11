@@ -148,9 +148,9 @@ export function AdminWaitlistClient() {
   return (
     <main className={styles.page}>
       <header className={styles.header}>
-        <a className={styles.brand} href={`/landing?lang=${locale}`} aria-label={en ? "Open the OpenAshare home page" : "前往 OpenAshare 首页"}>
+        <a className={styles.brand} href={`/landing?lang=${locale}`} aria-label={en ? "Open the Financial Bot home page" : "前往 Financial Bot 首页"}>
           <img src="/favicon.svg" alt="" width="32" height="32" />
-          <span>OpenAshare <small>ADMIN</small></span>
+          <span>Financial Bot <small>ADMIN</small></span>
         </a>
         <SupabaseAuthPanel placement="header" onAuthChange={handleAuthChange} />
       </header>

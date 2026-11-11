@@ -12,6 +12,7 @@ from api.agent_pydantic import AgentOutput, create_agent, run_agent_async
 from ashare.config import Config
 from api.services import WebSearchService
 from api.comparison_research import comparison_source_priority
+from api.relevance import web_result_is_relevant
 from api.web_research import PublicDocumentReader, SourceUnavailable, public_address, read_public_source, search_public_sources
 from tests.test_company_research import dependencies, final
 
@@ -73,7 +74,8 @@ def test_company_search_filter_marks_irrelevant_hits_and_provider_errors_separat
         result = json.loads(await search_public_sources(deps, '"Applied Materials" AMAT', market="us",
                                                         accept_result=lambda row: False))
         assert result["status"] == "unavailable"
-        assert result["reason_code"] == "provider_error"
+        assert result["reason_code"] == "no_company_match"
+        assert any("DuckDuckGo unavailable" in gap for gap in result["data_gaps"])
         assert result["data"] == []
         assert any("Excluded 1" in gap for gap in result["data_gaps"])
 
@@ -99,11 +101,49 @@ def test_company_comparison_search_sorts_issuer_ahead_of_sec_and_media():
         deps.web_search_service = SimpleNamespace(search_report=lambda *args, **kwargs: {"results": rows, "data_gaps": []})
         result = json.loads(await search_public_sources(
             deps, '"Applied Materials" earnings', market="us",
+            accept_result=lambda row: True,
             source_priority=lambda row: comparison_source_priority(row, "Applied Materials Inc /DE"),
         ))
         assert [row["source"] for row in result["data"]] == ["Applied Materials IR", "SEC", "The Motley Fool"]
         assert [source["title"] for source in result["evidence"]] == [row["title"] for row in result["data"]]
     asyncio.run(run())
+
+
+def test_search_filters_a_bounded_candidate_pool_before_applying_result_limit():
+    async def run():
+        deps = dependencies()
+        candidates = [
+            {"title": "Unrelated company", "url": f"https://example.org/no-{i}"}
+            for i in range(3)
+        ] + [
+            {"title": "Tencent official announcement", "url": "https://example.org/tencent"},
+            {"title": "Tencent news", "url": "https://example.org/tencent-news"},
+        ]
+        calls = []
+        def search_report(query, limit, **kwargs):
+            calls.append(limit)
+            return {"results": candidates[:limit], "data_gaps": []}
+        deps.web_search_service = SimpleNamespace(search_report=search_report)
+        result = json.loads(await search_public_sources(
+            deps, "Tencent", limit=1, accept_result=lambda row: "Tencent" in row["title"]
+        ))
+        assert calls == [8]
+        assert [row["title"] for row in result["data"]] == ["Tencent official announcement"]
+    asyncio.run(run())
+
+
+def test_relevant_news_is_not_crowded_out_by_unrelated_fallback_results():
+    from api.schemas import WebSearchResult
+
+    service = WebSearchService(SimpleNamespace(web_search_enabled=True, web_search_timeout=1))
+    def item(title, provider, suffix):
+        return WebSearchResult(id=suffix, title=title, snippet=title,
+            url=f"https://example.org/{suffix}", source="fixture", provider=provider, query="腾讯控股")
+    service._search_google_news = lambda *args: [item("腾讯控股发布业绩", "google_news_rss", "relevant")]
+    service._search_duckduckgo = lambda *args: []
+    service._search_bing_rss = lambda *args: [item("Google Maps", "bing_rss", str(i)) for i in range(8)]
+    result = service.search_report("腾讯控股 业绩", limit=8, language="zh-CN", market="hk")
+    assert any(row["title"] == "腾讯控股发布业绩" for row in result["results"])
 
 
 @pytest.mark.parametrize("url", ["http://example.org/doc", "https://user:pass@example.org/doc", "https://example.org:8000/doc", "https://127.0.0.1/doc", "https://169.254.169.254/doc", "https://[::1]/doc"])
@@ -169,8 +209,9 @@ def test_source_reader_never_fetches_guessed_links_and_preserves_actual_excerpts
     asyncio.run(run())
 
 
-def test_research_has_no_model_request_or_tool_call_count_cap(tmp_path, monkeypatch):
+def test_deep_research_has_model_limits_and_quick_remains_unlimited(tmp_path, monkeypatch):
     monkeypatch.setenv("RESEARCH_RUN_DIR", str(tmp_path))
+    monkeypatch.setenv("FINANCIAL_BOT_DEEP_MODEL_REQUEST_LIMIT", "12")
     async def run():
         deps = dependencies()
         # Counts and cumulative context tokens do not force synthesis. The
@@ -206,6 +247,7 @@ def test_research_has_no_model_request_or_tool_call_count_cap(tmp_path, monkeypa
         response = await run_agent_async(agent, deps, "Compare North Huachuang and AMAT")
         assert observed["settings"][1]["timeout"] == 180
         assert observed["settings"][1]["max_tokens"] == 10000
+        assert observed["usage_limits"].request_limit == 12
         assert observed["usage_limits"].total_tokens_limit is None
         assert response.payload["_meta"]["finish_reason"] == "completed"
     asyncio.run(run())
@@ -265,7 +307,7 @@ def test_policy_compound_collects_sources_and_specialist_failure_is_isolated(tmp
         agent = create_agent(api_key="offline", model="offline-model")
         agent.model = FunctionModel(model)
         response = await run_agent_async(agent, deps, "How does FCC testing policy affect Moderna?")
-        assert len(calls) == 6 and "company exposure remains unverified" in response.summary
+        assert len(calls) == 8 and "company exposure remains unverified" in response.summary
         assert any(step.tool == "review_policy_exposure" and step.status == "unavailable" for step in response.research_steps)
         assert any(source.excerpts for source in response.evidence)
         assert not response.payload["_meta"]["usage_unresolved"]  # Completed, invalid output has known usage.
@@ -320,4 +362,52 @@ def test_final_synthesis_uses_output_allowance_without_another_thinking_pass():
         assert result.model_settings["extra_body"]["thinking"]["type"] == "disabled"
         assert result.model_settings["max_tokens"] == 2500
         assert "openai_reasoning_effort" not in result.model_settings
+    asyncio.run(run())
+
+
+
+def test_generic_web_search_omits_off_topic_results_and_evidence():
+    async def run():
+        deps = dependencies()
+        deps.web_search_service = SimpleNamespace(search_report=lambda *args, **kwargs: {
+            "results": [
+                {"title": "NVIDIA earnings beat expectations", "url": "https://example.org/nvda", "source": "Example"},
+                {"title": "Celebrity dinner photos", "url": "https://example.org/celebrity", "source": "Example"},
+            ],
+            "data_gaps": [],
+        })
+        result = json.loads(await search_public_sources(deps, "NVIDIA earnings"))
+        assert [row["title"] for row in result["data"]] == ["NVIDIA earnings beat expectations"]
+        assert [source["title"] for source in result["evidence"]] == ["NVIDIA earnings beat expectations"]
+        assert any("Excluded 1" in gap for gap in result["data_gaps"])
+    asyncio.run(run())
+
+
+def test_relevance_rejects_generic_word_collision():
+    assert web_result_is_relevant(
+        {"title": "Applied Industrial Technologies", "snippet": "industrial distributor"},
+        "Applied Materials semiconductor",
+    ) is False
+    assert web_result_is_relevant(
+        {"title": "NVIDIA launches new chip", "snippet": "AI accelerators"},
+        "NVIDIA latest chip news",
+    ) is True
+
+
+def test_search_year_is_not_mistaken_for_stock_code():
+    result = {'title': '腾讯控股 财报与公告', 'snippet': '腾讯公司发布财务报告', 'url': 'https://example.com/filing'}
+    assert web_result_is_relevant(result, '腾讯控股 2026 财报 公告')
+    assert not web_result_is_relevant(result, '股票 2026.HK 公告')
+
+
+def test_filtered_results_are_not_misreported_as_total_provider_failure():
+    async def run():
+        deps = dependencies()
+        deps.web_search_service = SimpleNamespace(search_report=lambda *args, **kwargs: {
+            'results': [{'title': 'Unrelated article', 'url': 'https://example.org/other'}],
+            'data_gaps': ['One provider unavailable (TimeoutError).'],
+        })
+        result = json.loads(await search_public_sources(deps, 'NVIDIA earnings'))
+        assert result['status'] == 'unavailable'
+        assert result['reason_code'] == 'no_company_match'
     asyncio.run(run())

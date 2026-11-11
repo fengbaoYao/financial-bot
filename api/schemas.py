@@ -343,10 +343,18 @@ class AgentHistoryTurn(BaseModel):
 class AgentQuery(BaseModel):
     query: str
     session_id: Optional[str] = None
+    bot_id: Optional[str] = None
+    bot_name: Optional[str] = None
+    bot_instructions: Optional[str] = None
+    bot_prompt: Optional[str] = None
+    bot_capabilities: Optional[Dict[str, bool]] = None
+    ui_context: Optional[Dict[str, Any]] = None
+    model_approved: bool = False
     request_id: Optional[str] = None
     history: List[AgentHistoryTurn] = Field(default_factory=list)
     language: Literal["auto", "en-US", "zh-CN"] = "auto"
     research_mode: Literal["quick", "deep"] = "quick"
+    model_provider: Literal["deepseek", "chatgpt"] = "deepseek"
 
 
 class AgentResearchCapabilities(BaseModel):
@@ -388,6 +396,7 @@ class ResearchStep(BaseModel):
     retrieved_at: str
     evidence_count: int = 0
     reason_code: Optional[str] = None
+    endpoint: Optional[str] = None
 
 
 class ResearchEvidence(BaseModel):
@@ -399,6 +408,13 @@ class ResearchEvidence(BaseModel):
     freshness: str = "unknown"
     title: Optional[str] = None
     excerpts: List[Dict[str, str]] = Field(default_factory=list)
+    # Provenance fields required when a tool mixes providers or periods.
+    provider_endpoint: Optional[str] = None
+    currency: Optional[str] = None
+    adjustment: Optional[str] = None
+    raw_ref: Optional[str] = None
+    raw_sha256: Optional[str] = None
+    record_key: Optional[str] = None
 
 
 class AgentClarification(BaseModel):

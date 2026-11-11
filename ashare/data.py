@@ -5,7 +5,7 @@
 """
 
 import pandas as pd
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from ashare.logging import get_logger
 from ashare.stock_pool import (
     extract_symbol,
@@ -74,8 +74,334 @@ class DataFetcher:
         """
         self.default_count = default_count
         self.data_cache = {}
+        # Actual provider provenance of the last successful fetch. The analysis
+        # layer must never infer a provider from the market.
+        self.source_by_code: Dict[str, str] = {}
+        self.adjustment_by_code: Dict[str, str] = {}
+        self.stale_by_code: Dict[str, bool] = {}
+        self.data_as_of_by_code: Dict[str, str] = {}
+        self._last_fetch_source: Optional[str] = None
+        self._last_fetch_adjustment: Optional[str] = None
         logger.info(f"数据获取器已初始化，默认获取{default_count}条数据")
+
+    def _mark_source(self, source: str, adjustment: str = "unknown") -> None:
+        self._last_fetch_source = source
+        self._last_fetch_adjustment = adjustment
+
+    def provider_info(self, code: str) -> Dict[str, str]:
+        normalized = normalize_stock_code(code)
+        return {
+            "provider": self.source_by_code.get(normalized, "unknown"),
+            "adjustment": self.adjustment_by_code.get(normalized, "unknown"),
+        }
+
+    def freshness_info(self, code: str) -> Dict[str, Any]:
+        normalized = normalize_stock_code(code)
+        return {
+            "stale": bool(self.stale_by_code.get(normalized)),
+            "data_as_of": self.data_as_of_by_code.get(normalized),
+        }
     
+    def _fetch_a_share_fuyao(self, code: str, count: int, frequency: str) -> Optional[pd.DataFrame]:
+        """Fetch A-share daily bars from Fuyao when configured.
+
+        Fuyao exposes daily bars only. Weekly/monthly requests are resampled
+        locally so the public DataFetcher contract stays unchanged. If the
+        adapter is absent, unconfigured, or fails, the caller falls back to the
+        existing Sina/Tencent/akshare chain.
+        """
+        if frequency not in {"1d", "1w", "1M"}:
+            return None
+        try:
+            from api.datasources.flags import fuyao_primary_a_share
+
+            if not fuyao_primary_a_share():
+                return None
+            from api.datasources.fuyao_provider import get_fuyao_provider, FuyaoError
+
+            provider = get_fuyao_provider()
+            if not provider.configured:
+                return None
+            lookback = max(14, int(count * 2.2))
+            end = pd.Timestamp.now().normalize() + pd.Timedelta(days=1)
+            start = end - pd.Timedelta(days=lookback)
+            payload = provider.history(
+                code,
+                int(start.timestamp() * 1000),
+                int(end.timestamp() * 1000),
+                adjust="forward",
+                interval="1d",
+            )
+            bars = payload.get("bars") or []
+            if not bars:
+                return None
+            frame = pd.DataFrame(
+                [
+                    {
+                        "open": bar.get("open"),
+                        "close": bar.get("close"),
+                        "high": bar.get("high"),
+                        "low": bar.get("low"),
+                        "volume": bar.get("volume"),
+                    }
+                    for bar in bars
+                ],
+                index=pd.DatetimeIndex([pd.Timestamp(bar["date"]) for bar in bars]),
+            ).astype(float)
+            frame = frame.dropna()
+            if frame.empty:
+                return None
+            if frequency == "1w":
+                frame = frame.resample("W-FRI").agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna()
+            elif frequency == "1M":
+                frame = frame.resample("ME").agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna()
+            frame = frame.tail(count)
+            if frame.empty:
+                return None
+            frame.index = frame.index.tz_localize(None) if getattr(frame.index, "tz", None) is not None else frame.index
+            frame.index.name = ""
+            frame.columns.name = None
+            self._mark_source("fuyao", "qfq")
+            logger.info("fuyao A-share history succeeded for %s, %d rows", code, len(frame))
+            return frame
+        except Exception as exc:
+            logger.warning("fuyao A-share history failed for %s: %s", code, type(exc).__name__)
+            return None
+
+    def _fetch_stock_data_ifind(self, code: str, count: int, frequency: str) -> Optional[pd.DataFrame]:
+        """iFinD daily bars - the product's highest-priority source.
+
+        Only A-share and HK codes map deterministically to iFinD symbols; an
+        unmapped market returns None so the existing chain keeps working.
+        """
+        if frequency not in {"1d", "1w", "1M"}:
+            return None
+        try:
+            from api.datasources.flags import ifind_history_enabled, ifind_primary
+            from api.datasources.ifind_provider import (
+                IfindProvider,
+                IfindUnavailable,
+                history_quota_exhausted,
+                is_history_quota_error,
+            )
+
+            if not ifind_primary() or not ifind_history_enabled():
+                return None
+            if history_quota_exhausted():
+                logger.info(
+                    "iFinD history skipped for %s: history_quota_exhausted (prefer realtime/fundamentals/fallback)",
+                    code,
+                )
+                return None
+            provider = IfindProvider()
+            if not provider.is_configured:
+                return None
+            # A fixed window per (code, adjustment) so repeated calls in one task
+            # hit the provider cache instead of re-buying the same bars. Every
+            # request is billed as data cells, and per-count windows used to
+            # multiply the bill by the number of different counts asked for.
+            import os as _os
+
+            window = max(120, int(_os.getenv("IFIND_HISTORY_DAYS", "420")))
+            end = pd.Timestamp.now().normalize() + pd.Timedelta(days=1)
+            start = end - pd.Timedelta(days=window)
+            payload = provider.history(
+                code,
+                start=start.strftime("%Y-%m-%d"),
+                end=end.strftime("%Y-%m-%d"),
+                adjust="forward",
+            )
+            bars = payload.get("bars") or []
+            if not bars:
+                return None
+            frame = pd.DataFrame(
+                [
+                    {
+                        "open": bar.get("open"),
+                        "close": bar.get("close"),
+                        "high": bar.get("high"),
+                        "low": bar.get("low"),
+                        "volume": bar.get("volume"),
+                    }
+                    for bar in bars
+                ],
+                index=pd.DatetimeIndex([pd.Timestamp(bar["date"]) for bar in bars]),
+            ).astype(float)
+            frame = frame.dropna()
+            if frame.empty:
+                return None
+            if frequency == "1w":
+                frame = frame.resample("W-FRI").agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna()
+            elif frequency == "1M":
+                frame = frame.resample("ME").agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}).dropna()
+            frame = frame.tail(count)
+            if frame.empty:
+                return None
+            if getattr(frame.index, "tz", None) is not None:
+                frame.index = frame.index.tz_localize(None)
+            frame.index.name = ""
+            frame.columns.name = None
+            self._mark_source("ifind", "qfq")
+            logger.info("iFinD history succeeded for %s, %d rows", code, len(frame))
+            return frame
+        except IfindUnavailable as exc:
+            if is_history_quota_error(exc.reason) or getattr(exc, "quota_exhausted", False):
+                logger.info("iFinD history quota exhausted for %s: %s", code, exc.reason)
+            else:
+                logger.info("iFinD skipped for %s: %s", code, exc.reason)
+            return None
+        except Exception as exc:  # noqa: BLE001 - provider boundary
+            logger.warning("iFinD history failed for %s: %s", code, type(exc).__name__)
+            return None
+
+    def _fetch_a_share(self, code: str, count: int, frequency: str) -> Optional[pd.DataFrame]:
+        """A-share fetch with explicit provenance.
+
+        Ashare.get_price itself tries Sina (unadjusted) first and Tencent qfq as
+        fallback, but hides which one succeeded. We call the two paths directly
+        so source and adjustment cannot be mixed under a generic "ashare" label.
+        """
+        if as_api is None:
+            return None
+        if frequency in {"1d", "1w", "1M"}:
+            return self._try_ashare_paths(
+                code,
+                count,
+                frequency,
+                (("get_price_sina", "sina", "none"), ("get_price_day_tx", "tencent", "qfq")),
+            )
+        if frequency == "1m":
+            return self._try_ashare_paths(
+                code,
+                count,
+                frequency,
+                (("get_price_min_tx", "tencent", "none"),),
+            )
+        return self._try_ashare_paths(
+            code,
+            count,
+            frequency,
+            (("get_price_sina", "sina", "none"), ("get_price_min_tx", "tencent", "none")),
+        )
+
+    def _try_ashare_paths(self, code, count, frequency, paths) -> Optional[pd.DataFrame]:
+        from api.datasources import health
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
+        # Sina/Tencent can hang without a socket timeout; keep /bot analysis moving
+        # when iFinD history is skipped and Fuyao is down.
+        call_timeout = 8.0
+
+        for function_name, source, adjustment in paths:
+            function = getattr(as_api, function_name, None)
+            if not callable(function):
+                continue
+            if not health.is_available(source, "a_share_history"):
+                logger.info("Skipping %s for %s: circuit open", source, code)
+                continue
+            pool = ThreadPoolExecutor(max_workers=1)
+            try:
+                fut = pool.submit(function, code, end_date="", count=count, frequency=frequency)
+                frame = fut.result(timeout=call_timeout)
+            except FuturesTimeout:
+                health.record_failure(source, "a_share_history", "timeout")
+                logger.warning("Ashare.%s timed out for %s after %.0fs", function_name, code, call_timeout)
+                continue
+            except Exception as exc:
+                health.record_failure(source, "a_share_history", type(exc).__name__)
+                logger.warning("Ashare.%s failed for %s: %s", function_name, code, exc)
+                continue
+            finally:
+                # Do not wait for a hung Sina/Tencent socket — that blocked analysis for minutes.
+                pool.shutdown(wait=False, cancel_futures=True)
+            if frame is not None and not frame.empty:
+                health.record_success(source, "a_share_history")
+                self._mark_source(source, adjustment)
+                return frame
+            health.record_failure(source, "a_share_history", "empty")
+        # Compatibility with older/fake Ashare modules that only expose get_price.
+        get_price = getattr(as_api, "get_price", None)
+        if callable(get_price):
+            if not health.is_available("ashare", "a_share_history"):
+                return None
+            try:
+                frame = get_price(code, count=count, frequency=frequency)
+            except Exception as exc:
+                health.record_failure("ashare", "a_share_history", type(exc).__name__)
+                logger.warning("Ashare.get_price failed for %s: %s", code, exc)
+                return None
+            if frame is not None and not frame.empty:
+                health.record_success("ashare", "a_share_history")
+                self._mark_source("ashare", "unknown")
+                return frame
+            health.record_failure("ashare", "a_share_history", "empty")
+        return None
+
+    def _remember_last_good(self, code: str, frequency: str, frame: pd.DataFrame) -> None:
+        try:
+            from api.datasources.last_good import put
+
+            bars = []
+            for index, row in frame.tail(2000).iterrows():
+                bars.append({
+                    "date": str(index)[:10],
+                    "open": float(row["open"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "close": float(row["close"]),
+                    "volume": float(row["volume"]),
+                })
+            put(
+                "price_history",
+                f"{code}:{frequency}",
+                {"bars": bars},
+                provider=self._last_fetch_source or "unknown",
+                adjustment=self._last_fetch_adjustment or "unknown",
+                data_as_of=bars[-1]["date"] if bars else None,
+            )
+        except Exception:
+            logger.debug("last-good cache write skipped for %s", code, exc_info=True)
+
+    def _restore_last_good(self, code: str, frequency: str, count: int) -> Optional[pd.DataFrame]:
+        try:
+            from api.datasources.last_good import get
+
+            cached = get("price_history", f"{code}:{frequency}")
+            if not cached or not isinstance(cached.get("value"), dict):
+                return None
+            bars = cached["value"].get("bars") or []
+            if not bars:
+                return None
+            frame = pd.DataFrame(
+                [
+                    {
+                        "open": bar.get("open"),
+                        "close": bar.get("close"),
+                        "high": bar.get("high"),
+                        "low": bar.get("low"),
+                        "volume": bar.get("volume"),
+                    }
+                    for bar in bars
+                ],
+                index=pd.DatetimeIndex([pd.Timestamp(bar["date"]) for bar in bars]),
+            ).astype(float).tail(count)
+            if frame.empty:
+                return None
+            frame.index.name = ""
+            frame.columns.name = None
+            self.source_by_code[code] = f"last_good_cache({cached.get('provider') or 'unknown'})"
+            self.adjustment_by_code[code] = cached.get("adjustment") or "unknown"
+            self.data_as_of_by_code[code] = str(cached.get("data_as_of") or "")
+            self.stale_by_code[code] = True
+            logger.warning(
+                "Using stale last-good price for %s (%s, as_of=%s)",
+                code, cached.get("provider"), cached.get("data_as_of"),
+            )
+            return frame
+        except Exception:
+            logger.debug("last-good cache read skipped for %s", code, exc_info=True)
+            return None
+
     def fetch_stock_data(self, code: str, count: Optional[int] = None, 
                         frequency: str = '1d') -> Optional[pd.DataFrame]:
         """
@@ -101,29 +427,67 @@ class DataFetcher:
         try:
             logger.info(f"正在获取股票 {code} 的数据...")
             df = None
+            self._last_fetch_source = None
+            self._last_fetch_adjustment = None
             if is_hk_index(code):
                 df = self._fetch_stock_data_hk_index(code, count, frequency)
             elif is_hk_stock(code):
-                df = self._fetch_stock_data_hk(code, count, frequency)
+                df = self._fetch_stock_data_ifind(code, count, frequency)
+                if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+                    df = self._fetch_stock_data_hk(code, count, frequency)
             elif is_us_stock(code):
                 # 美股走独立链路：yfinance 主源，Finnhub 备选
                 df = self._fetch_stock_data_us(code, count, frequency)
             else:
-                if as_api is not None and hasattr(as_api, "get_price"):
-                    try:
-                        df = as_api.get_price(code, count=count, frequency=frequency)
-                    except Exception as ex:
-                        logger.warning("Ashare.get_price failed for %s: %s", code, ex)
-                        df = None
-                if (df is None or (isinstance(df, pd.DataFrame) and df.empty)) and frequency == "1d":
+                df = self._fetch_stock_data_ifind(code, count, frequency)
+                if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+                    df = self._fetch_a_share_fuyao(code, count, frequency)
+                # When iFinD 历史数据 is exhausted, Sina/Tencent often stall; prefer
+                # akshare/yfinance before the legacy Ashare HTTP paths.
+                prefer_alt = False
+                try:
+                    from api.datasources.flags import ifind_history_enabled
+                    from api.datasources.ifind_provider import history_quota_exhausted
+                    prefer_alt = (not ifind_history_enabled()) or history_quota_exhausted()
+                except Exception:
+                    prefer_alt = False
+                if prefer_alt:
+                    if (df is None or (isinstance(df, pd.DataFrame) and df.empty)) and frequency == "1d":
+                        df = self._fetch_stock_data_akshare(code, count)
+                    if (df is None or (isinstance(df, pd.DataFrame) and df.empty)) and frequency == "1d":
+                        try:
+                            from api.datasources.flags import yfinance_a_share_fallback
+                            if yfinance_a_share_fallback():
+                                df = self._fetch_stock_data_yfinance_adapter(code, count, frequency, auto_adjust=False)
+                        except Exception:
+                            logger.debug("A-share yfinance fallback failed for %s", code, exc_info=True)
+                if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+                    df = self._fetch_a_share(code, count, frequency)
+                if (df is None or (isinstance(df, pd.DataFrame) and df.empty)) and frequency == "1d" and not prefer_alt:
                     df = self._fetch_stock_data_akshare(code, count)
+                if (df is None or (isinstance(df, pd.DataFrame) and df.empty)) and frequency == "1d" and not prefer_alt:
+                    try:
+                        from api.datasources.flags import yfinance_a_share_fallback
+
+                        if yfinance_a_share_fallback():
+                            df = self._fetch_stock_data_yfinance_adapter(code, count, frequency, auto_adjust=False)
+                    except Exception:
+                        logger.debug("A-share yfinance fallback failed for %s", code, exc_info=True)
             
             # 检查数据是否有效
             if df is None or df.empty:
                 logger.warning(f"股票 {code} 返回空数据")
+                stale = self._restore_last_good(code, frequency, count)
+                if stale is not None:
+                    self.data_cache[cache_key] = stale
+                    return stale
                 self._log_stock_code_help(code)
                 return None
-            
+            self.source_by_code[code] = self._last_fetch_source or "unknown"
+            self.adjustment_by_code[code] = self._last_fetch_adjustment or "unknown"
+            self.stale_by_code[code] = False
+            self.data_as_of_by_code[code] = str(df.index[-1])[:10] if len(df.index) else ""
+            self._remember_last_good(code, frequency, df)
             logger.info(f"成功获取 {code} 数据，共 {len(df)} 条记录")
             logger.info(f"数据时间范围: {df.index[0]} 到 {df.index[-1]}")
             
@@ -133,6 +497,10 @@ class DataFetcher:
             
         except Exception as e:
             logger.error(f"获取股票 {code} 数据失败: {str(e)}")
+            stale = self._restore_last_good(code, frequency, count)
+            if stale is not None:
+                self.data_cache[cache_key] = stale
+                return stale
             self._log_stock_code_help(code)
             return None
     
@@ -259,6 +627,37 @@ class DataFetcher:
         return self._fetch_stock_data_yfinance_symbol(self._us_yf_symbol(code), count, frequency)
 
     def _fetch_stock_data_yfinance_symbol(self, symbol: str, count: int, frequency: str) -> Optional[pd.DataFrame]:
+        # Phase 3b: adapter first for US/HK history. The old yf.download path
+        # remains as a fallback, so an adapter change cannot take quotes offline.
+        # Yahoo/network stalls must not leave /work research panel spinning forever.
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
+        call_timeout = 10.0
+
+        def _call_adapter():
+            from api.datasources.flags import yfinance_primary_us_hk
+
+            if not yfinance_primary_us_hk():
+                return None
+            return self._fetch_stock_data_yfinance_adapter(symbol, count, frequency)
+
+        try:
+            pool = ThreadPoolExecutor(max_workers=1)
+            try:
+                adapted = pool.submit(_call_adapter).result(timeout=call_timeout)
+            except FuturesTimeout:
+                logger.warning("yfinance adapter timed out for %s after %.0fs", symbol, call_timeout)
+                adapted = None
+            except Exception:
+                logger.debug("yfinance adapter path failed for %s; falling back", symbol, exc_info=True)
+                adapted = None
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
+            if adapted is not None:
+                return adapted
+        except Exception:
+            logger.debug("yfinance adapter path failed for %s; falling back", symbol, exc_info=True)
+
         try:
             import yfinance as yf
         except ImportError:
@@ -273,15 +672,79 @@ class DataFetcher:
         lookback = max(7, count * self._LOOKBACK_DAYS_PER_BAR.get(frequency, 2))
         start = (pd.Timestamp.now() - pd.Timedelta(days=lookback)).strftime("%Y-%m-%d")
         end = (pd.Timestamp.now() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-        try:
-            raw = yf.download(
+
+        def _download():
+            return yf.download(
                 symbol, start=start, end=end, interval=interval,
                 auto_adjust=True, progress=False, threads=False,
             )
+
+        try:
+            pool = ThreadPoolExecutor(max_workers=1)
+            try:
+                raw = pool.submit(_download).result(timeout=call_timeout)
+            except FuturesTimeout:
+                logger.warning("yfinance download timed out for %s after %.0fs", symbol, call_timeout)
+                return None
+            except Exception as e:
+                logger.warning("yfinance download failed %s: %s", symbol, e)
+                return None
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
         except Exception as e:
             logger.warning("yfinance download failed %s: %s", symbol, e)
             return None
         return self._normalize_us_dataframe(raw, count, source=f"yfinance({symbol})")
+
+    def _fetch_stock_data_yfinance_adapter(self, symbol: str, count: int, frequency: str, auto_adjust: bool = True) -> Optional[pd.DataFrame]:
+        from api.datasources.yfinance_provider import get_yfinance_provider, to_yahoo_symbol
+
+        canonical_symbol = to_yahoo_symbol(symbol)
+        interval = self._YF_INTERVAL.get(frequency)
+        if interval is None:
+            return None
+        lookback = max(7, count * self._LOOKBACK_DAYS_PER_BAR.get(frequency, 2))
+        start = (pd.Timestamp.now() - pd.Timedelta(days=lookback)).strftime("%Y-%m-%d")
+        end = (pd.Timestamp.now() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        from api.datasources import health
+
+        if not health.is_available("yfinance", "a_share_history"):
+            return None
+        try:
+            data = get_yfinance_provider().history(canonical_symbol, interval=interval, start=start, end=end, auto_adjust=auto_adjust)
+        except Exception:
+            health.record_failure("yfinance", "a_share_history", "adapter_error")
+            raise
+        bars = data.get("bars") or []
+        if not bars:
+            return None
+        frame = pd.DataFrame(
+            [
+                {
+                    "open": bar.get("open"),
+                    "close": bar.get("close"),
+                    "high": bar.get("high"),
+                    "low": bar.get("low"),
+                    "volume": bar.get("volume"),
+                }
+                for bar in bars
+            ],
+            index=pd.DatetimeIndex([
+                pd.Timestamp(bar.get("date")).tz_localize(None)
+                if pd.Timestamp(bar.get("date")).tzinfo is not None
+                else pd.Timestamp(bar.get("date"))
+                for bar in bars
+            ]),
+        ).astype(float)
+        frame = frame.dropna().tail(count)
+        if frame.empty:
+            return None
+        frame.index.name = ""
+        frame.columns.name = None
+        health.record_success("yfinance", "a_share_history")
+        self._mark_source(f"yfinance_adapter({canonical_symbol})", "auto_adjust" if auto_adjust else "none")
+        logger.info("yfinance_adapter(%s) 成功，共 %d 条", canonical_symbol, len(frame))
+        return frame
 
     def _normalize_us_dataframe(self, raw, count: int, source: str) -> Optional[pd.DataFrame]:
         if raw is None or raw.empty:
@@ -304,6 +767,7 @@ class DataFetcher:
         df = df.dropna().tail(count)
         if df.empty:
             return None
+        self._mark_source(source, "auto_adjust")
         logger.info("%s 成功，共 %d 条", source, len(df))
         return df
 
@@ -361,6 +825,7 @@ class DataFetcher:
         df = df.dropna().tail(count)
         if df.empty:
             return None
+        self._mark_source("finnhub", "unknown")
         logger.info("Finnhub(%s) 成功，共 %d 条", symbol, len(df))
         return df
 
@@ -377,12 +842,34 @@ class DataFetcher:
         if not (code.startswith("sh") or code.startswith("sz")) or len(code) < 8:
             return None
         symbol = code[2:8]  # 600036
+        from api.datasources import health
+
+        if not health.is_available("akshare", "a_share_history"):
+            return None
         try:
             # 多取一些再 tail，避免节假日导致条数不足
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
             end = pd.Timestamp.now().strftime("%Y%m%d")
             start = (pd.Timestamp.now() - pd.Timedelta(days=count * 3)).strftime("%Y%m%d")
-            df = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=start, end_date=end, adjust="qfq")
+            pool = ThreadPoolExecutor(max_workers=1)
+            try:
+                fut = pool.submit(
+                    ak.stock_zh_a_hist,
+                    symbol=symbol,
+                    period="daily",
+                    start_date=start,
+                    end_date=end,
+                    adjust="qfq",
+                )
+                df = fut.result(timeout=15.0)
+            except FuturesTimeout as e:
+                health.record_failure("akshare", "a_share_history", "timeout")
+                logger.warning("akshare stock_zh_a_hist timed out for %s", code)
+                return None
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
         except Exception as e:
+            health.record_failure("akshare", "a_share_history", type(e).__name__)
             logger.warning("akshare stock_zh_a_hist failed %s: %s", code, e)
             return None
         if df is None or df.empty:
@@ -411,6 +898,8 @@ class DataFetcher:
         df = df.tail(count)
         if df.empty:
             return None
+        health.record_success("akshare", "a_share_history")
+        self._mark_source("akshare", "qfq")
         logger.info(f"akshare 备选成功 {code} 共 {len(df)} 条")
         return df
 

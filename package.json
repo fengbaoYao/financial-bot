@@ -5,9 +5,13 @@
     "build": "next build",
     "start": "next start",
     "pm2:start": "pm2 start ecosystem.config.cjs",
-    "pm2:stop": "pm2 delete openashare-api openashare-web",
+    "pm2:stop": "pm2 delete financial-bot-api financial-bot-web",
     "pm2:flush": "pm2 flush",
-    "lint": "eslint app components lib next.config.ts"
+    "lint": "eslint app components lib next.config.ts",
+    "css:bundle": "node scripts/bundle-financial-bot-css.mjs",
+    "typecheck": "tsc --noEmit --incremental false",
+    "check:css": "node scripts/check-css-modules.mjs",
+    "verify": "npm run typecheck && npm run lint && npm run check:css"
   },
   "engines": {
     "node": "22.x"
@@ -19,6 +23,7 @@
     "@types/react-dom": "^19.2.3",
     "eslint": "^9.39.4",
     "eslint-config-next": "^16.1.6",
+    "flubber": "^0.4.2",
     "lightweight-charts": "^5.1.0",
     "next": "^16.3.1",
     "react": "^19.2.4",
@@ -31,5 +36,6 @@
   "devDependencies": {
     "@types/node": "^25.3.5",
     "@types/three": "0.186.0"
-  }
+  },
+  "name": "financial-bot"
 }

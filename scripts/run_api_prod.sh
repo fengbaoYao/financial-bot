@@ -25,4 +25,5 @@ mkdir -p "$MPLCONFIGDIR" "$XDG_CACHE_HOME" "$ROOT_DIR/data" "$ROOT_DIR/logs"
 exec ./.venv/bin/uvicorn api.main:app \
   --host "$HOST" \
   --port "$PORT" \
-  --workers "$WORKERS"
+  --workers "$WORKERS" \
+  --no-proxy-headers

@@ -17,7 +17,7 @@ async function getLanguage(searchParams: Props["searchParams"]): Promise<Landing
   const { lang } = await searchParams;
   const requested = Array.isArray(lang) ? lang[0] : lang;
   if (requested === "en" || requested === "zh") return requested;
-  return (await cookies()).get("openashare-language")?.value === "zh" ? "zh" : "en";
+  return (await cookies()).get("financial-bot-language")?.value === "zh" ? "zh" : "en";
 }
 
 export async function generateMetadata({ searchParams }: Props): Promise<Metadata> {
@@ -30,6 +30,9 @@ export default async function LandingPage({ searchParams }: Props) {
   const language = await getLanguage(searchParams);
   const copy = landingCopy[language];
   const detail = landingDetails[language];
+  // Product hierarchy: 主页 → Work `/work` 与 Bot `/bot?mode=use` 同权入口。
+  // Hero / closing 双 CTA；经典研究台不再出现在顶栏。
+  const useHref = `/bot?mode=use&mausbot=1&lang=${language}`;
   const workHref = `/work?lang=${language}`;
   const structuredData = landingStructuredData(language, copy.description);
   const faqData = { "@context": "https://schema.org", "@type": "FAQPage", inLanguage: language === "zh" ? "zh-CN" : "en", mainEntity: detail.faqs.map(item => ({ "@type": "Question", name: item.title, acceptedAnswer: { "@type": "Answer", text: item.body } })) };
@@ -42,7 +45,10 @@ export default async function LandingPage({ searchParams }: Props) {
           <p className={content.beta}>{detail.beta}</p>
           <h1 id="hero-title">{copy.headline}</h1>
           <p className={content.support}>{copy.support}</p>
-          <div className={content.actions}><Link className={styles.primary} href={workHref}>{copy.primary}</Link><a className={styles.textButton} href="#demo">{copy.secondary}<span aria-hidden="true">↓</span></a></div>
+          <div className={content.actions}>
+            <Link className={styles.ctaWork} href={workHref}>{copy.workMode}</Link>
+            <Link className={styles.ctaBot} href={useHref}>{copy.botMode}</Link>
+          </div>
           <p className={content.trust}>{detail.trust}</p>
         </div>
         <SignalRibbon language={language}/>
@@ -62,8 +68,8 @@ export default async function LandingPage({ searchParams }: Props) {
         <div className={content.faq}>{detail.faqs.map((item, index) => <details key={item.title} id={index === 5 ? "data-handling" : undefined}><summary>{item.title}<span aria-hidden="true">+</span></summary><p>{item.body}</p></details>)}</div>
       </section>
       <section className={`${content.section} ${styles.wrap}`} id="journal" aria-labelledby="journal-title"><div className={content.sectionHeading}><h2 id="journal-title">{detail.journal}</h2></div><LandingJournal language={language}/></section>
-      <section className={`${content.closing} ${styles.wrap}`}><div><h2>{detail.closing}</h2><p>{detail.closingBody}</p></div><Link className={styles.primary} href={workHref}>{copy.primary}</Link></section>
+      <section className={`${content.closing} ${styles.wrap}`}><div><h2>{detail.closing}</h2><p>{detail.closingBody}</p></div><div className={content.closingActions}><Link className={styles.ctaWork} href={workHref}>{copy.workMode}</Link><Link className={styles.ctaBot} href={useHref}>{copy.botMode}</Link></div></section>
     </main>
-    <footer className={content.footer}><div className={styles.wrap}><div className={content.footerTop}><Link href={`/landing?lang=${language}`} className={styles.footerBrand}>OpenAshare</Link><div><a href="#data-handling">{detail.data}</a><a href={`${repository}/issues`} target="_blank" rel="noopener noreferrer">{detail.contact} ↗</a><a href={repository} target="_blank" rel="noopener noreferrer">GitHub ↗</a><Link href={`/landing?lang=${language === "en" ? "zh" : "en"}`}>{language === "en" ? "中文" : "English"}</Link></div></div><p>{detail.risk}</p><p>{detail.credits}</p><a href="https://github.com/ZhiweiChen-coder" target="_blank" rel="noopener noreferrer">{detail.maintainer} ↗</a></div></footer>
+    <footer className={content.footer}><div className={styles.wrap}><div className={content.footerTop}><Link href={`/landing?lang=${language}`} className={styles.footerBrand}>Financial Bot</Link><div><Link href={workHref}>{copy.classicDesk}</Link><a href="#data-handling">{detail.data}</a><a href={`${repository}/issues`} target="_blank" rel="noopener noreferrer">{detail.contact} ↗</a><a href={repository} target="_blank" rel="noopener noreferrer">GitHub ↗</a><Link href={`/landing?lang=${language === "en" ? "zh" : "en"}`}>{language === "en" ? "中文" : "English"}</Link></div></div><p>{detail.risk}</p><p>{detail.credits}</p><a href="https://github.com/ZhiweiChen-coder" target="_blank" rel="noopener noreferrer">{detail.maintainer} ↗</a></div></footer>
   </div>;
 }

@@ -285,6 +285,10 @@ def normalize_stock_code(code: str) -> str:
     if re.fullmatch(r"\d{1,4}\.HK", upper):
         symbol = upper.split(".")[0].zfill(5)
         return f"{symbol}.HK"
+    # 港股常见前缀写法：HK.00700 / hk00700
+    match_hk_prefix = re.fullmatch(r"HK\.?(\d{1,5})", upper)
+    if match_hk_prefix:
+        return f"{match_hk_prefix.group(1).zfill(5)}.HK"
     if upper in {"HSI", "HK.HSI", "^HSI"}:
         return "HK.HSI"
 

@@ -4,7 +4,7 @@ import { blockedDeepResearch, effectiveResearchMode, isPublicBetaRuntime } from 
 
 test("public deployments block Deep while local production keeps it available", () => {
   const body = JSON.stringify({ query: "Research NVIDIA", research_mode: "deep", language: "en-US" });
-  for (const environment of [{ VERCEL: "1" }, { OPENASHARE_PUBLIC_BETA: "true" }]) {
+  for (const environment of [{ VERCEL: "1" }, { FINANCIAL_BOT_PUBLIC_BETA: "true" }]) {
     assert.equal(isPublicBetaRuntime(environment), true);
     assert.equal(blockedDeepResearch(body, environment)?.code, "deep_research_unavailable");
     assert.match(blockedDeepResearch(body, environment)?.detail, /unavailable at the moment/);

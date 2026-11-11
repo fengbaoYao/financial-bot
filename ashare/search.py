@@ -260,7 +260,36 @@ class StockSearcher:
         return None
     
     def _online_search(self, query: str) -> List[Dict]:
-        """在线搜索股票，补齐本地股票库未覆盖的名称和代码映射。"""
+        """在线搜索股票，按质量策略补齐本地股票库未覆盖的标的。"""
+        try:
+            from api.datasources.flags import fuyao_enabled
+            from api.datasources.fuyao_provider import get_fuyao_provider
+
+            if fuyao_enabled():
+                provider = get_fuyao_provider()
+                if provider.configured:
+                    payload = provider.search(query, asset_type="a-share", limit=10)
+                    mapped = []
+                    for item in payload.get("items") or []:
+                        code = normalize_stock_code(str(item.get("thscode") or "").upper())
+                        if not code.lower().startswith(("sh", "sz", "bj")):
+                            continue
+                        name = str(item.get("name") or "").strip()
+                        if not name:
+                            continue
+                        mapped.append({
+                            "name": name,
+                            "code": code,
+                            "market": get_market_label(code),
+                            "category": "A股",
+                            "score": 90,
+                            "match_type": "online_fuyao",
+                        })
+                    if mapped:
+                        return self._deduplicate_results(mapped)
+        except Exception:
+            pass
+
         eastmoney_results = self._search_eastmoney(query)
         if eastmoney_results:
             return eastmoney_results

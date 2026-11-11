@@ -5,7 +5,7 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 FFMPEG_BIN="${FFMPEG_BIN:-ffmpeg}"
 OUTPUT_DIR="${REPO_ROOT}/public/marketing"
-OUTPUT_FILE="${OUTPUT_DIR}/openashare-demo.mp4"
+OUTPUT_FILE="${OUTPUT_DIR}/financial-bot-demo.mp4"
 
 INPUT_HOME="${REPO_ROOT}/public/marketing/agent-clean.png"
 INPUT_NEWS="${REPO_ROOT}/public/marketing/agent-clean.png"

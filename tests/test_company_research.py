@@ -126,7 +126,7 @@ def test_cross_currency_comparison_rejects_unsupported_size_rankings():
     validate_research_output(AgentOutput(summary="规模上应用材料更大。"), [*tool_results, {"tool": "get_fx_rate", "data": {"rate": 7.1, "date": "2026-10-12"}}])
 
 
-def test_both_modes_have_no_cumulative_token_cap_and_keep_separate_deadlines():
+def test_deep_mode_has_a_token_cap_and_modes_keep_separate_deadlines():
     quick = dependencies(research_mode="quick")
     deep = dependencies(research_mode="deep")
     assert quick.total_token_limit is None and quick.run_deadline_seconds == 180
@@ -448,7 +448,11 @@ def test_broad_cross_market_comparison_can_gather_followup_evidence_without_coun
         deps.document_reader = SimpleNamespace(read=fixture_read)
 
         requests = []
+        specialists = []
         def model(messages, info):
+            if not info.function_tools:
+                specialists.append(str(messages))
+                return ModelResponse(parts=[ToolCallPart("final_result", final(deps, summary="已有公司证据支持进一步核对"))])
             requests.append(info)
             if len(requests) == 1:
                 assert [tool.name for tool in info.function_tools] == ["research_comparison"]
@@ -494,6 +498,11 @@ def test_broad_cross_market_comparison_can_gather_followup_evidence_without_coun
         agent.model = FunctionModel(model)
         response = await run_agent_async(agent, deps, "你可以对比一下北方华创和应用材料amat这两只股票吗？")
         assert len(requests) == 4
+        assert len(specialists) == 4
+        assert "Bull Analyst advocating" in specialists[0]
+        assert "Bear Analyst making" in specialists[1]
+        assert "Conservative Risk Analyst" in specialists[2]
+        assert "Research Manager" in specialists[3]
         assert deps.retrieval_count == 10
         assert set(markets) == {"cn", "us"}
         assert set(identity_queries) == {"北方华创", "AMAT"}
@@ -584,9 +593,9 @@ def test_deep_specialists_share_usage_and_cannot_access_tools_or_mutations():
         agent = create_agent(api_key="offline", model="offline-model")
         agent.model = FunctionModel(model)
         response = await run_agent_async(agent, deps, "Research Moderna's industry advantage")
-        assert len(requests) == 4  # Parent, two specialists, parent synthesis.
-        assert requests[1] == requests[2] == []
-        assert response.payload["_meta"]["usage"]["requests"] == 4
+        assert len(requests) == 6  # Parent, four review roles, parent synthesis.
+        assert all(tools == [] for tools in requests[1:5])
+        assert response.payload["_meta"]["usage"]["requests"] == 6
         assert response.payload["_meta"]["retrieval_calls"] == 6  # Compound, identity, news, SEC, two bounded web searches.
         assert {"review_company_position", "review_catalysts_risks", "research_company"} <= {step.tool for step in response.research_steps}
         assert response.evidence
@@ -686,7 +695,7 @@ def test_deep_review_uses_sec_facts_when_news_is_missing():
         agent = create_agent(api_key="offline", model="offline-model")
         agent.model = FunctionModel(model)
         response = await run_agent_async(agent, deps, "Review Moderna's financial resilience")
-        assert len(requests) == 4
+        assert len(requests) == 6
         assert {"review_company_position", "review_catalysts_risks"} <= {step.tool for step in response.research_steps}
         assert any(source.source.startswith("SEC") for source in response.evidence)
         assert any("get_stock_news" in gap for gap in response.data_gaps)
@@ -768,12 +777,12 @@ def test_deep_streaming_adapter_accounts_for_all_specialists(monkeypatch):
         monkeypatch.setattr("api.agent_pydantic.AsyncOpenAI", lambda **kwargs: client)
         agent = create_agent(api_key="offline", model="deepseek-flash")
         response = await run_agent_async(agent, deps, "Research Moderna's industry advantage", lambda *args: events.append(args))
-        assert len(requests) == 4
-        assert [body.get("stream", False) for body in requests] == [True, False, False, True]
-        assert all(body.get("max_tokens", body.get("max_completion_tokens")) == 8000 for body in requests[1:3])
-        assert all(body["thinking"]["type"] == "enabled" for body in requests[1:3])
-        assert all(body["reasoning_effort"] == "high" for body in requests[1:3])
-        assert response.payload["_meta"]["usage"] == {"requests": 4, "input_tokens": 400, "output_tokens": 200}
+        assert len(requests) == 6
+        assert [body.get("stream", False) for body in requests] == [True, False, False, False, False, True]
+        assert all(body.get("max_tokens", body.get("max_completion_tokens")) == 8000 for body in requests[1:5])
+        assert all(body["thinking"]["type"] == "enabled" for body in requests[1:5])
+        assert all(body["reasoning_effort"] == "high" for body in requests[1:5])
+        assert response.payload["_meta"]["usage"] == {"requests": 6, "input_tokens": 600, "output_tokens": 300}
         assert any(event[0] == "check_facts" for event in events)
         assert not any(event[0] == "answer_delta" for event in events)
         assert "private reasoning" not in response.model_dump_json()
@@ -896,11 +905,12 @@ def test_empty_news_is_a_successful_read_with_no_results():
     assert any("no matching data" in gap for gap in response.data_gaps)
 
 
-def test_comparison_and_parallel_sec_reads_share_admission_and_sources():
+@pytest.mark.parametrize("research_mode", ["quick", "deep"])
+def test_comparison_and_parallel_sec_reads_share_admission_and_sources(research_mode):
     from tests.test_research_product import sec_fixture
     import time
     async def run():
-        deps = dependencies(); calls, requests = [], []
+        deps = dependencies(research_mode=research_mode); calls, requests, specialists = [], [], []
         deps.stock_service.search_stocks = lambda query, **kw: [StockSearchResult(name=query, code=query, market="us")]
         deps.sec_service.resolve = lambda query, *a: {"status": "ok", "candidates": [{"name": query, "code": query, "market": "us", "identity_verified": True}]}
         def company(code):
@@ -912,6 +922,9 @@ def test_comparison_and_parallel_sec_reads_share_admission_and_sources():
             return result
         deps.sec_service.company = company
         def model(messages, info):
+            if not info.function_tools and any(marker in str(messages) for marker in ("Bull Analyst advocating", "Bear Analyst making", "Conservative Risk Analyst", "Research Manager:")):
+                specialists.append(str(messages))
+                return ModelResponse(parts=[ToolCallPart("final_result", final(deps))])
             requests.append(info)
             if len(requests) == 1: return ModelResponse(parts=[ToolCallPart("search_stocks", {"query": "US.AAPL"}), ToolCallPart("search_stocks", {"query": "US.MSFT"})])
             if len(requests) == 2: return ModelResponse(parts=[ToolCallPart("compare_companies", {"stock_codes": ["US.AAPL", "US.MSFT"]})])
@@ -919,6 +932,7 @@ def test_comparison_and_parallel_sec_reads_share_admission_and_sources():
         agent = create_agent(api_key="offline", model="offline-model"); agent.model = FunctionModel(model)
         response = await asyncio.wait_for(run_agent_async(agent, deps, "Compare Apple and Microsoft annual revenue and operating cash flow"), timeout=5)
         assert sorted(calls) == ["US.AAPL", "US.MSFT"]
+        assert len(specialists) == (4 if research_mode == "deep" else 0)
         assert deps.retrieval_count == 5  # Two identities, compound operation, two actual SEC reads.
         assert next(step for step in response.research_steps if step.tool == "compare_companies").status == "completed"
         assert len(response.payload["financial_comparison"]["companies"]) == 2
@@ -941,3 +955,73 @@ def test_watchlist_add_waits_for_inflight_identity_without_caching_mutation():
         release.set(); await pending; assert await task == "saved" and len(calls) == 1
         assert all('manage_watchlist' not in key for key in deps.retrieval_cache)
     asyncio.run(run())
+
+
+def test_deep_company_research_runs_upstream_bull_and_bear_with_shared_usage():
+    async def run():
+        deps = dependencies(research_mode="deep")
+        prompts = []
+        def model(messages, info):
+            prompts.append(str(messages))
+            if len(prompts) == 1:
+                return ModelResponse(parts=[ToolCallPart("research_company", {"company": "MRNA", "focus": "advantage"})])
+            return ModelResponse(parts=[ToolCallPart("final_result", final(deps))])
+        agent = create_agent(api_key="offline", model="offline-model")
+        agent.model = FunctionModel(model)
+        response = await run_agent_async(agent, deps, "Research Moderna's industry advantage")
+        assert len(prompts) == 6
+        assert "Bull Analyst advocating" in prompts[1]
+        assert "Bear Analyst making" in prompts[2]
+        assert "Conservative Risk Analyst" in prompts[3]
+        assert "Research Manager" in prompts[4]
+        assert "你是 Financial-Bot，交互风格对标 GrokBot" not in prompts[1]
+        assert {"review_company_position", "review_catalysts_risks", "tradingagents_risk", "tradingagents_manager"} <= {step.tool for step in response.research_steps}
+        assert all(step.status != "unavailable" for step in response.research_steps
+                   if step.tool in {"review_company_position", "review_catalysts_risks"})
+        assert response.payload["_meta"]["usage"]["requests"] == 6
+    asyncio.run(run())
+
+
+def test_deep_company_collection_respects_disabled_data_capabilities():
+    async def run():
+        deps = dependencies(research_mode="deep", bot_capabilities={"web": False, "news": False, "market": False, "filings": False})
+        deps.news_service.get_stock_news = lambda *a, **kw: pytest.fail("disabled news must not be fetched")
+        deps.stock_service.get_stock_analysis = lambda *a, **kw: pytest.fail("disabled market must not be fetched")
+        deps.sec_service.company = lambda *a, **kw: pytest.fail("disabled filings must not be fetched")
+        assert await collect_company_evidence(deps, "MRNA", "catalysts") == "US.MRNA"
+        assert await collect_company_evidence(deps, "MRNA", "overview") == "US.MRNA"
+        assert await collect_company_evidence(deps, "MRNA", "advantage") == "US.MRNA"
+        assert not any(item["tool"] in {"get_stock_news", "get_stock_analysis", "get_sec_company_data", "web_search"} and item.get("status") != "unavailable" for item in deps.tool_results)
+    asyncio.run(run())
+
+
+def test_deep_comparison_does_not_fetch_quotes_when_market_disabled():
+    async def run():
+        deps = dependencies(research_mode="deep", bot_capabilities={"web": True, "market": False})
+        deps.stock_service.search_stocks = lambda query, **kw: [StockSearchResult(name=query, code=f"US.{query}", market="us")]
+        deps.stock_service.get_stock_analysis = lambda *a, **kw: pytest.fail("disabled quotes must not be fetched")
+        deps.sec_service.resolve = lambda query, codes=None: {"status": "ok", "candidates": [{"name": query, "code": f"US.{query}", "market": "us", "identity_verified": True}]}
+        deps.web_search_service = SimpleNamespace(search_report=lambda *a, **kw: {"results": [], "data_gaps": []})
+        calls = []
+        def model(messages, info):
+            calls.append(info)
+            if len(calls) == 1:
+                return ModelResponse(parts=[ToolCallPart("research_comparison", {"companies": ["AAPL", "MSFT"]})])
+            return ModelResponse(parts=[ToolCallPart("final_result", {"summary": "Available data do not establish a meaningful comparison between these companies. The permitted sources did not provide usable information.\n\n| Company | Evidence |\n| --- | --- |\n| AAPL | Unavailable |\n| MSFT | Unavailable |", "data_gaps": ["Sources unavailable."]})])
+        agent = create_agent(api_key="offline", model="offline-model")
+        agent.model = FunctionModel(model)
+        from pydantic_ai.exceptions import UnexpectedModelBehavior
+        # The deliberately empty source fixture cannot satisfy the full output validator.
+        with pytest.raises(UnexpectedModelBehavior):
+            await run_agent_async(agent, deps, "Compare AAPL and MSFT stocks")
+        assert not any(item.get("tool") == "get_stock_analysis" and item.get("status") != "unavailable" for item in deps.tool_results)
+        assert any(item.get("tool") == "tradingagents_evidence" and item.get("status") == "unavailable" for item in deps.tool_results)
+    asyncio.run(run())
+
+
+def test_cached_identity_accepts_unambiguous_chinese_name_with_hk_ticker():
+    from api.company_research import cached_identity
+    deps = dependencies()
+    deps.tool_results = [{'tool': 'search_stocks', 'data': [{'code': '00700.HK', 'name': '腾讯控股'}]}]
+    assert cached_identity(deps, '腾讯控股（00700.HK）')['code'] == '00700.HK'
+    assert cached_identity(deps, '腾讯控股（00701.HK）') is None

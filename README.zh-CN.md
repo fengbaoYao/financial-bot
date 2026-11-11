@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="public/favicon.svg" alt="OpenAshare Logo" width="128" />
+  <img src="public/favicon.svg" alt="Financial Bot Logo" width="128" />
 </p>
 
-<h1 align="center">OpenAshare</h1>
+<h1 align="center">Financial Bot</h1>
 
 <p align="center">
   <a href="README.md">English</a>
@@ -32,7 +32,7 @@
 </p>
 
 <p align="center">
-  <img src="public/marketing/homepage-zh-final.png" alt="OpenAshare 中文首页与研究工作台预览" width="960" />
+  <img src="public/marketing/homepage-zh-final.png" alt="Financial Bot 中文首页与研究工作台预览" width="960" />
 </p>
 
 > **云端 Beta 正在开放。** 也可以直接本地运行，自己掌控数据与模型。
@@ -41,13 +41,13 @@
 
 ## 加入微信群
 
-欢迎大家加入 OpenAshare 体验群，交流使用体验、研究想法和项目反馈。请使用微信扫描下方二维码加入群聊：
+欢迎大家加入 Financial Bot 体验群，交流使用体验、研究想法和项目反馈。请使用微信扫描下方二维码加入群聊：
 
 <p align="center">
-  <img src="assets/community/wechat-group.png" alt="OpenAshare 微信群活码" width="400" />
+  <img src="assets/community/wechat-group.png" alt="Financial Bot 微信群活码" width="400" />
 </p>
 
-> 这是 OpenAshare 微信群活码，欢迎扫码加入。
+> 这是 Financial Bot 微信群活码，欢迎扫码加入。
 
 > 重要提示：本项目仅用于研究、学习和工具搭建，不构成投资建议。市场有风险，所有决策请自行负责。
 
@@ -57,7 +57,7 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=ZhiweiChen-coder/OpenAshare&type=date&theme=dark&legend=top-left" />
     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=ZhiweiChen-coder/OpenAshare&type=date&legend=top-left" />
-    <img alt="OpenAshare GitHub Star History Chart" src="https://api.star-history.com/chart?repos=ZhiweiChen-coder/OpenAshare&type=date&legend=top-left" />
+    <img alt="Financial Bot GitHub Star History Chart" src="https://api.star-history.com/chart?repos=ZhiweiChen-coder/OpenAshare&type=date&legend=top-left" />
   </picture>
 </a>
 
@@ -72,7 +72,7 @@
 
 ## 产品一览
 
-[![观看 30 秒 OpenAshare 产品演示](public/marketing/openashare-30s-product.jpg)](public/marketing/openashare-30s-product.mp4)
+[![观看 30 秒 Financial Bot 产品演示](public/marketing/financial-bot-30s-product.jpg)](public/marketing/financial-bot-30s-product.mp4)
 
 ### 研究工作台与 Agent
 

@@ -11,7 +11,7 @@ client = TestClient(main.app)
 
 
 def hosted(monkeypatch, authenticated=True):
-    monkeypatch.delenv("OPENASHARE_PUBLIC_BETA", raising=False)
+    monkeypatch.delenv("FINANCIAL_BOT_PUBLIC_BETA", raising=False)
     config = SupabaseConfig(url="https://fixture.supabase.co", anon_key="fixture", require_auth=True)
     monkeypatch.setattr(main, "supabase_config", config)
     def user(*_):
@@ -44,14 +44,14 @@ def test_public_capabilities_need_no_auth_and_expose_no_workspace_data(monkeypat
     assert response.json() == {
         "quick_available": True, "deep_available": False,
         "deep_unavailable_reason": "public_beta_suspended",
-        "deep_unavailable_message": "Deep research is unavailable at the moment. Please use Quick research.",
+        "deep_unavailable_message": "深度研究暂不可用，请改用快速研究。",
     }
     assert client.post("/api/agent/query", json={"query": "Hello"}).status_code == 401
 
 
 @pytest.mark.parametrize("endpoint", ["/api/agent/query", "/api/agent/query/stream"])
 def test_local_deep_remains_available(monkeypatch, endpoint):
-    monkeypatch.delenv("OPENASHARE_PUBLIC_BETA", raising=False)
+    monkeypatch.delenv("FINANCIAL_BOT_PUBLIC_BETA", raising=False)
     monkeypatch.setattr(main, "supabase_config", SupabaseConfig())
     monkeypatch.setattr(main, "credit_service", main.CreditService(SupabaseConfig()))
     received = []
@@ -84,7 +84,7 @@ def test_hosted_quick_still_runs(monkeypatch, endpoint):
 
 
 def test_explicit_public_beta_flag_blocks_direct_origin_requests(monkeypatch):
-    monkeypatch.setenv("OPENASHARE_PUBLIC_BETA", "true")
+    monkeypatch.setenv("FINANCIAL_BOT_PUBLIC_BETA", "true")
     monkeypatch.setattr(main, "supabase_config", SupabaseConfig())
     assert client.get("/api/agent/capabilities").json()["deep_available"] is False
     assert client.post("/api/agent/query", json={"query": "Research", "research_mode": "deep"}).status_code == 503

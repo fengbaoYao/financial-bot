@@ -232,6 +232,7 @@ def test_annual_comparison_selects_only_full_year_sec_facts():
 def test_v2_capability_scopes_and_reuses_tool_execution():
     async def scenario():
         deps = AgentDeps(*[SimpleNamespace() for _ in range(5)])
+        deps.sec_service = SimpleNamespace(resolve=lambda *args, **kwargs: {"status": "none", "candidates": []})
         ctx = SimpleNamespace(deps=deps)
         capability = ResearchCapability()
         tools = [SimpleNamespace(name=name) for name in ["search_stocks", "get_sec_company_data", "compare_companies"]]

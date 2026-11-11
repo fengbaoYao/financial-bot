@@ -1,4 +1,4 @@
-# OpenAshare
+# Financial Bot
 
 <p align="center">
   <a href="README.md"><strong>English</strong></a> · <a href="README.zh-CN.md">简体中文</a>
@@ -14,17 +14,17 @@
   <a href="LICENSE">MIT License</a>
 </p>
 
-OpenAshare helps you follow a company, review the available evidence, and ask focused follow-up questions. It supports English and Simplified Chinese, with English as the default.
+Financial Bot helps you follow a company, review the available evidence, and ask focused follow-up questions. It supports English and Simplified Chinese, with English as the default.
 
 ## See it in action
 
-[![Watch the 30-second OpenAshare product demo](public/marketing/openashare-30s-product.jpg)](public/marketing/openashare-30s-product.mp4)
+[![Watch the 30-second Financial Bot product demo](public/marketing/financial-bot-30s-product.jpg)](public/marketing/financial-bot-30s-product.mp4)
 
 ## Screenshots
 
 <p align="center">
-  <a href="public/marketing/openashare-30s-product.mp4"><img src="public/marketing/demo-chart-research.jpg" alt="Researching a selected stock-chart period with market context" width="47%" /></a>
-  <a href="public/marketing/openashare-30s-product.mp4"><img src="public/marketing/demo-deep-research.jpg" alt="A cited deep-research answer alongside the stock chart" width="47%" /></a>
+  <a href="public/marketing/financial-bot-30s-product.mp4"><img src="public/marketing/demo-chart-research.jpg" alt="Researching a selected stock-chart period with market context" width="47%" /></a>
+  <a href="public/marketing/financial-bot-30s-product.mp4"><img src="public/marketing/demo-deep-research.jpg" alt="A cited deep-research answer alongside the stock chart" width="47%" /></a>
 </p>
 
 <p align="center"><sub>Select a screenshot to watch the product demo.</sub></p>
@@ -36,7 +36,7 @@ OpenAshare helps you follow a company, review the available evidence, and ask fo
 - Ask follow-up questions with research context carried through the conversation.
 - Keep watchlists, portfolio notes, and research conversations together.
 
-OpenAshare is for research only. It does not provide investment advice or place trades.
+Financial Bot is for research only. It does not provide investment advice or place trades.
 
 ## Supported markets
 
@@ -89,10 +89,10 @@ Open [http://localhost:3000](http://localhost:3000). For optional provider and S
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=ZhiweiChen-coder/OpenAshare&type=date&theme=dark&legend=top-left" />
     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=ZhiweiChen-coder/OpenAshare&type=date&legend=top-left" />
-    <img alt="OpenAshare GitHub Star History Chart" src="https://api.star-history.com/chart?repos=ZhiweiChen-coder/OpenAshare&type=date&legend=top-left" />
+    <img alt="Financial Bot GitHub Star History Chart" src="https://api.star-history.com/chart?repos=ZhiweiChen-coder/OpenAshare&type=date&legend=top-left" />
   </picture>
 </a>
 
 ## License
 
-OpenAshare is licensed under the [MIT License](LICENSE).
+Financial Bot is licensed under the [MIT License](LICENSE).

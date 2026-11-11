@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import copy
 import hashlib
@@ -631,10 +631,108 @@ class StockAnalysisService:
             model=bundle.ai_model,
             error=None if bundle.ai_text or not bundle.ai_requested or not include_ai else "AI analysis returned empty content",
         )
+        market = infer_market(quote.stock_code)
+        # Provider provenance comes from the fetch that actually succeeded, not
+        # from the market. HK equities use Yahoo Finance; A-share may use the legacy adapter
+        # or the akshare fallback; US may use yfinance or Finnhub.
+        provider_info = {"provider": "unknown", "adjustment": "unknown"}
+        fetcher = getattr(getattr(bundle, "analyzer", None), "data_fetcher", None)
+        if fetcher is not None and hasattr(fetcher, "provider_info"):
+            try:
+                provider_info = fetcher.provider_info(quote.stock_code)
+            except Exception:
+                provider_info = {"provider": "unknown", "adjustment": "unknown"}
+        freshness_info = {"stale": False, "data_as_of": None}
+        if fetcher is not None and hasattr(fetcher, "freshness_info"):
+            try:
+                freshness_info = fetcher.freshness_info(quote.stock_code)
+            except Exception:
+                pass
+        currency = {"us": "USD", "hk": "HKD", "cn": "CNY", "sh": "CNY", "sz": "CNY", "bj": "CNY"}.get(market, "unknown")
+        # Work desk reuses the bot's IfindProvider for a live/delayed snapshot when
+        # history fell through to Fuyao/legacy (e.g. monthly history quota).
+        quote_provider = None
+        ifind_quote_meta = None
+        if market in {"cn", "sh", "sz", "bj", "hk"}:
+            try:
+                from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+                from api.datasources.ifind_work import try_quote
+
+                pool = ThreadPoolExecutor(max_workers=1)
+                try:
+                    ifind_quote = pool.submit(try_quote, quote.stock_code).result(timeout=5.0)
+                except FuturesTimeout:
+                    ifind_quote = None
+                finally:
+                    pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                ifind_quote = None
+            if ifind_quote and ifind_quote.get("price") is not None:
+                quote_provider = "ifind"
+                ifind_quote_meta = {
+                    "provider": "ifind",
+                    "thscode": ifind_quote.get("thscode"),
+                    "data_as_of": ifind_quote.get("data_as_of"),
+                    "price_status": ifind_quote.get("price_status") or "delayed_or_snapshot",
+                }
+                previous_close = ifind_quote.get("previous_close")
+                change = ifind_quote.get("change")
+                change_pct = ifind_quote.get("change_pct")
+                volume = ifind_quote.get("volume")
+                updates = {
+                    "current_price": float(ifind_quote["price"]),
+                }
+                if change is not None:
+                    updates["change"] = float(change)
+                if change_pct is not None:
+                    updates["change_pct"] = float(change_pct)
+                if volume is not None:
+                    updates["volume"] = float(volume)
+                if previous_close is not None and quote.open_price:
+                    # Keep OHLC from the history bar; only refresh last/change/volume.
+                    pass
+                quote = quote.model_copy(update=updates)
+        try:
+            from api.datasources.flags import yfinance_a_share_fallback, yfinance_primary_us_hk
+
+            if market == "us":
+                primary = "yfinance_adapter" if yfinance_primary_us_hk() else "yfinance_legacy"
+                fallbacks = ["Finnhub (if configured)"]
+            elif market == "hk":
+                primary = "ifind → yfinance"
+                fallbacks = []
+            else:
+                primary = "ifind → fuyao → sina → tencent(qfq) → akshare"
+                fallbacks = ["yfinance_adapter (only after all primary paths fail)"] if yfinance_a_share_fallback() else []
+            quota_note = None
+            try:
+                from api.datasources.ifind_work import history_quota_note
+
+                quota_note = history_quota_note(language="zh")
+            except Exception:
+                quota_note = None
+            policy = "same currency/period; no silent adjustment swap; quote may come from iFinD while history uses fallback"
+            if quota_note:
+                policy = f"{policy}; {quota_note}"
+            data_plan = {
+                "capability": "quote_history",
+                "market": market,
+                "used_provider": provider_info.get("provider", "unknown"),
+                "quote_provider": quote_provider or provider_info.get("provider", "unknown"),
+                "primary": primary,
+                "fallbacks": fallbacks,
+                "adjustment": provider_info.get("adjustment", "unknown"),
+                "stale": bool(freshness_info.get("stale")),
+                "policy": policy,
+                **({"notes": [quota_note]} if quota_note else {}),
+                **({"ifind_history_quota_exhausted": True} if quota_note else {}),
+            }
+        except Exception:
+            data_plan = None
         response = StockAnalysisResponse(
             stock_name=quote.stock_name,
             stock_code=quote.stock_code,
-            market=infer_market(quote.stock_code),
+            market=market,
             quote=quote,
             technical_indicators=indicators,
             signal_summary=SignalSummary(
@@ -647,11 +745,33 @@ class StockAnalysisService:
             chart_series=chart_series,
             metadata={
                 "data_points": len(bundle.dataframe),
-                "source": "yfinance/finnhub" if infer_market(quote.stock_code) == "us" else "akshare",
+                "source": provider_info.get("provider", "unknown"),
+                "provider": provider_info.get("provider", "unknown"),
+                "quote_provider": quote_provider or provider_info.get("provider", "unknown"),
+                "adjustment": provider_info.get("adjustment", "unknown"),
+                "coverage": "single_symbol_history",
                 "generated_at": quote.timestamp.isoformat(),
-                "currency": "USD" if infer_market(quote.stock_code) == "us" else "HKD" if infer_market(quote.stock_code) == "hk" else "CNY",
-                "data_as_of": chart_series[-1].get("date") if chart_series else None,
-                "price_status": "historical_or_delayed",
+                "retrieved_at": quote.timestamp.isoformat(),
+                "currency": currency,
+                "data_as_of": (ifind_quote_meta or {}).get("data_as_of")
+                or freshness_info.get("data_as_of")
+                or (chart_series[-1].get("date") if chart_series else None),
+                "price_status": (
+                    "stale_cache"
+                    if freshness_info.get("stale")
+                    else ((ifind_quote_meta or {}).get("price_status") or "historical_or_delayed")
+                ),
+                "stale": bool(freshness_info.get("stale")),
+                **({"ifind_quote": ifind_quote_meta} if ifind_quote_meta else {}),
+                **({"data_plan": data_plan} if data_plan else {}),
+                **(
+                    {
+                        "user_note": (data_plan or {}).get("notes", [None])[0],
+                        "data_notes": (data_plan or {}).get("notes") or [],
+                    }
+                    if (data_plan or {}).get("notes")
+                    else {}
+                ),
             },
         )
         self.progress_store.update(
@@ -664,6 +784,14 @@ class StockAnalysisService:
             include_ai=include_ai,
         )
         self._response_cache.set(cache_key, response, ttl)
+        # Phase 2 shadow only: compare with yfinance without changing the answer.
+        # Disabled by default; enable with YFINANCE_SHADOW=1 for local evaluation.
+        try:
+            from api.datasources.shadow import schedule_shadow
+
+            schedule_shadow(normalized, response)
+        except Exception:
+            pass
         if progress_callback:
             progress_callback("completed", 100, "分析结果已生成", {"stock_code": normalized})
         return response
@@ -698,8 +826,27 @@ class NewsService:
         if cached is not None:
             return cached
 
-        # 实时新闻为主（最新）：直接抓取，结果缓存 120s。
-        fetched = self.tracker.fetch_stock_news(normalized, resolved_name)
+        # 实时新闻为主（最新）：A/H 股先走 bot 同款 iFinD 公告，再补抓公开源。
+        fetched: list = []
+        market_hint = infer_market(normalized)
+        if market_hint in {"cn", "sh", "sz", "bj", "hk"}:
+            try:
+                from api.datasources.ifind_work import announcements_as_fetched_news
+
+                rows = self._call_with_timeout(
+                    lambda: announcements_as_fetched_news(normalized, limit=max(limit, 8)),
+                    5.0,
+                )
+                if rows:
+                    fetched.extend(rows)
+            except Exception:
+                pass
+        live = self._call_with_timeout(
+            lambda: self.tracker.fetch_stock_news(normalized, resolved_name),
+            6.0,
+        )
+        if live:
+            fetched.extend(live)
         live_items = [self._map_fetched_news(normalized, resolved_name, item) for item in fetched]
 
         # 监控存储为补充：去重后置于实时之后，避免旧告警挡住最新新闻。
@@ -710,18 +857,50 @@ class NewsService:
         ]
 
         merged = self._merge_stock_news(live_items, stored_items)
-        if infer_market(normalized) == "us":
-            aliases = {"US.MU": ["Micron"], "US.AAPL": ["Apple"], "US.NVDA": ["NVIDIA"], "US.MSFT": ["Microsoft"]}
-            ticker = normalized.removeprefix("US.")
-            company_alias = re.sub(r",?\s+(?:Inc\.?|Corp\.?|Corporation|Ltd\.?|Limited|Holdings?)\b.*$", "", resolved_name, flags=re.I)
-            names = [*aliases.get(normalized, []), resolved_name, company_alias]
-            for item in merged:
-                blob = html.unescape(f"{item.title} {item.summary}")
-                # 'mRNA' is also a biological term. An uppercase ticker or a
-                # company-name mention is needed before calling this direct news.
-                mentioned = bool(re.search(rf"\b{re.escape(ticker)}\b", blob)) or any(name != normalized and name and re.search(rf"\b{re.escape(name)}\b", blob, re.I) for name in names)
+        market = infer_market(normalized)
+        aliases = {"US.MU": ["Micron"], "US.AAPL": ["Apple"], "US.NVDA": ["NVIDIA"], "US.MSFT": ["Microsoft"]}
+        ticker = normalized.removeprefix("US.")
+        company_alias = re.sub(
+            r"[,，]?\s*(?:Inc\.?|Corp\.?|Corporation|Ltd\.?|Limited|Holdings?|控股|集团|股份有限公司)\s*$",
+            "",
+            resolved_name,
+            flags=re.I,
+        )
+        symbol = re.sub(r"^(?:US|HK|SH|SZ)\.?", "", normalized)
+        names = [*aliases.get(normalized, []), resolved_name, company_alias, symbol]
+
+        def _mentions(name: str) -> bool:
+            if not name or name == normalized:
+                return False
+            if re.search(r"[\u3400-\u9fff]", name):
+                # \b does not separate adjacent CJK characters.
+                return name in blob
+            return bool(re.search(rf"\b{re.escape(name)}\b", blob, re.I))
+
+        for item in merged:
+            blob = html.unescape(f"{item.title} {item.summary}")
+            # 'mRNA' is also a biological term. An uppercase ticker or a
+            # company-name mention is needed before calling this direct news.
+            mentioned = bool(re.search(rf"\b{re.escape(ticker)}\b", blob)) or any(
+                _mentions(name) for name in names
+            )
+            if market == "us":
                 item.relation_type = "direct" if mentioned else "market"
-                item.raw_payload["association_basis"] = "Company mention in source title or summary" if mentioned else "Retrieved through ticker query; company association unconfirmed"
+                item.raw_payload["association_basis"] = (
+                    "Company mention in source title or summary"
+                    if mentioned
+                    else "Retrieved through ticker query; company association unconfirmed"
+                )
+            else:
+                # HK/A-share feeds often include broad market news. Only a
+                # company-name or code mention may be presented as direct
+                # company news; everything else is a topic fallback.
+                item.relation_type = "direct" if mentioned else "topic"
+                item.raw_payload["association_basis"] = (
+                    "Company mention in source title or summary"
+                    if mentioned
+                    else "Topic-level fallback; company association unverified"
+                )
         result = self._prioritize_stock_news(merged, limit=limit)
         self._response_cache.set(cache_key, result, 120)
         return result
@@ -952,15 +1131,19 @@ class NewsService:
         )
 
     def _map_fetched_news(self, stock_code: str, stock_name: str, item: Dict[str, Any]) -> NewsItem:
+        from api.datasources.announcement_text import sanitize_announcement_title
+
         raw = dict(item)
-        summary = item.get("content") or item.get("summary") or item.get("title") or ""
+        title = sanitize_announcement_title(item.get("title") or "")
+        summary_raw = item.get("content") or item.get("summary") or title or ""
+        summary = sanitize_announcement_title(summary_raw) if summary_raw == item.get("title") else str(summary_raw)
         return NewsItem(
-            id=f"{stock_code}:{item.get('occurred_at', '')}:{item.get('title', '')}",
+            id=f"{stock_code}:{item.get('occurred_at', '')}:{title}",
             stock_code=stock_code,
             stock_name=stock_name,
             source=item.get("source", "live"),
             published_at=str(item.get("occurred_at", "")),
-            title=item.get("title", ""),
+            title=title,
             summary=summary[:280],
             relation_type=item.get("relation_type", "direct"),
             sentiment=_sentiment_from_summary(summary),
@@ -1182,8 +1365,12 @@ class WebSearchService:
 
         deduped: List[WebSearchResult] = []
         seen_urls: set[str] = set()
-        # Prefer original documents over news aggregator redirects.
-        records.sort(key=lambda row: (row.provider == "google_news_rss", not (urlparse(row.url).hostname or "").endswith((".gov", ".edu"))))
+        # Topic relevance comes before provider preference: an unrelated
+        # fallback result must not crowd out relevant aggregator results.
+        from api.relevance import web_result_is_relevant
+        records.sort(key=lambda row: (not web_result_is_relevant(row.model_dump(), query),
+                                      row.provider == "google_news_rss",
+                                      not (urlparse(row.url).hostname or "").endswith((".gov", ".edu"))))
         for item in records:
             normalized_url = item.url.strip()
             if not normalized_url or normalized_url in seen_urls or self._is_source_only_title(item.title):

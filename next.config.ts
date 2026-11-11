@@ -3,6 +3,7 @@ import type { NextConfig } from "next";
 const distDir = process.env.NODE_ENV === "development" ? ".next-dev" : ".next";
 
 const nextConfig: NextConfig = {
+  output: process.env.FB_STANDALONE === '1' ? 'standalone' : undefined,
   distDir,
   allowedDevOrigins: ["127.0.0.1"],
   reactStrictMode: true,
@@ -23,9 +24,9 @@ const nextConfig: NextConfig = {
               "style-src 'self' 'unsafe-inline'",
               "img-src 'self' data: blob: https:",
               "font-src 'self' data:",
-              "connect-src 'self' https://*.supabase.co https://api.openashare.com",
+              "connect-src 'self' https://*.supabase.co https://api.openashare.com https://*.trycloudflare.com https://fengbaoyao.github.io",
               "media-src 'self' blob:",
-              "frame-src 'none'",
+              "frame-src 'self'",
               "object-src 'none'",
               "base-uri 'self'",
               "form-action 'self'",

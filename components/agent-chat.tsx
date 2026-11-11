@@ -5,6 +5,7 @@ import { researchProgressLabel, updateToolActivity } from "@/lib/research-activi
 import { ResearchTrace, ResearchTools, ResponseTools, researchToolLabel, type ToolActivity } from "@/components/research-trace";
 import { useWorkspacePreferences } from "@/components/workspace-preferences";
 import { effectiveResearchMode } from "@/lib/research-availability";
+import { researchOutputNotice } from "@/lib/research-quality";
 import { decodeEntities } from "@/lib/i18n";
 import { ResearchMarkdown } from "@/components/research-markdown";
 
@@ -13,7 +14,7 @@ import Link from "next/link";
 
 import { StockPanelLink } from "@/components/stock-panel-link";
 import { ResearchChart } from "@/components/research-chart";
-import { streamAgent } from "@/lib/api";
+import { preflightAgent, streamAgent } from "@/lib/api";
 import {
   AGENT_LAB_RUN_EVENT,
   compactHeadline,
@@ -58,6 +59,41 @@ const DEFAULT_PROMPTS = ["分析 sh600036", "看看海光信息最近消息", "�
 
 const STORAGE_KEY = "ashare-agent-sessions-v1";
 
+const WELCOME_CONTENT = "你好，我是 financial-work。可以直接问全球新闻、热点、个股和持仓。";
+const LEGACY_WELCOME_CONTENTS = new Set([
+  "你好，我是 Ashare Agent。可以直接问全球新闻、热点、个股和持仓。",
+  "你好，我是 Financial Bot。可以直接问全球新闻、热点、个股和持仓。",
+]);
+
+function isWelcomeContent(content: string) {
+  return content === WELCOME_CONTENT || LEGACY_WELCOME_CONTENTS.has(content) || /^你好，我是 (?:Ashare Agent|Financial Bot|financial-work)。/.test(content);
+}
+
+function normalizeMessageContent(content: string) {
+  return isWelcomeContent(content) ? WELCOME_CONTENT : content;
+}
+
+/** Sessions with only the greeting count as the empty welcome desk. */
+function isEmptyWelcomeSession(session: ChatSession) {
+  return session.messages.every((message) => isWelcomeContent(message.content));
+}
+
+/** Keep a single leading welcome so history threads still greet on entry. */
+function ensureLeadingWelcome(session: ChatSession): ChatSession {
+  const rest = session.messages
+    .filter((message) => !isWelcomeContent(message.content))
+    .map((message) => ({
+      ...message,
+      id: message.id || createId("msg"),
+      content: normalizeMessageContent(message.content),
+    }));
+  return {
+    ...session,
+    pinned: Boolean(session.pinned),
+    messages: [createWelcomeMessage(), ...rest],
+  };
+}
+
 type AgentChatProps = {
   compact?: boolean;
   workspace?: boolean;
@@ -77,7 +113,7 @@ function createWelcomeMessage(): Message {
   return {
     id: createId("msg"),
     role: "agent",
-    content: "你好，我是 Ashare Agent。可以直接问全球新闻、热点、个股和持仓。",
+    content: WELCOME_CONTENT,
     actions: DEFAULT_PROMPTS,
   };
 }
@@ -123,6 +159,8 @@ export function AgentChat({
   const [historySearch, setHistorySearch] = useState("");
   const [renamingSessionId, setRenamingSessionId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
+  const [pendingModel, setPendingModel] = useState<{ question: string; context?: string; requestPrompt?: string; model: string | null; estimated: number; threshold: number } | null>(null);
+  const [preflightBusy, setPreflightBusy] = useState(false);
   const [clarificationRequest, setClarificationRequest] = useState<{
     clarification: AgentClarification;
     originalQuestion: string;
@@ -143,33 +181,51 @@ export function AgentChat({
     try {
       const raw = window.localStorage.getItem(STORAGE_KEY);
       if (!raw) {
+        // Workspace should still land on the empty welcome desk.
+        if (workspace) {
+          const fresh = createSession();
+          setSessions([fresh]);
+          setCurrentSessionId(fresh.id);
+        }
         return;
       }
       const parsed = JSON.parse(raw) as ChatSession[];
       if (!Array.isArray(parsed) || !parsed.length) {
+        if (workspace) {
+          const fresh = createSession();
+          setSessions([fresh]);
+          setCurrentSessionId(fresh.id);
+        }
         return;
       }
       const normalized = parsed
         .filter((session) => Array.isArray(session.messages) && session.messages.length)
-        .map((session) => ({
-          ...session,
-          pinned: Boolean(session.pinned),
-          messages: session.messages.map((message) => ({
-            ...message,
-            id: message.id || createId("msg"),
-          })),
-        }));
+        .map((session) => ensureLeadingWelcome(session));
       if (!normalized.length) {
+        if (workspace) {
+          const fresh = createSession();
+          setSessions([fresh]);
+          setCurrentSessionId(fresh.id);
+        }
         return;
       }
-      setSessions(normalized);
-      setCurrentSessionId(normalized[0].id);
+      if (workspace) {
+        // Default into the empty welcome homepage; history stays in the left rail.
+        const empties = normalized.filter(isEmptyWelcomeSession);
+        const history = normalized.filter((session) => !isEmptyWelcomeSession(session));
+        const welcomeSession = empties[0] ?? createSession();
+        setSessions([welcomeSession, ...history]);
+        setCurrentSessionId(welcomeSession.id);
+      } else {
+        setSessions(normalized);
+        setCurrentSessionId(normalized[0].id);
+      }
     } catch {
       // Ignore invalid local state and keep a fresh session.
     } finally {
       setSessionsLoaded(true);
     }
-  }, []);
+  }, [workspace]);
 
   useEffect(() => {
     if (currentSessionId) {
@@ -268,7 +324,7 @@ export function AgentChat({
   const visibleMessages = messages.slice(-40); // cap rendering to last 40 messages to avoid infinite scroll
   // A transition can remain pending while React renders the large response card.
   // Only the transport state should keep the visible "正在研究" indicator on screen.
-  const busy = streamState === "connecting" || streamState === "streaming";
+  const busy = streamState === "connecting" || streamState === "streaming" || preflightBusy || Boolean(pendingModel);
   const sortedSessions = useMemo(
     () =>
       [...sessions]
@@ -361,10 +417,10 @@ export function AgentChat({
     });
   }
 
-  function ask(question: string, context?: string, requestPrompt?: string) {
+  function runAsk(question: string, context?: string, requestPrompt?: string, force = false, modelApproved = false) {
     const trimmed = question.trim();
     const attachedContext = context?.trim();
-    if (!trimmed || busy || requestControllerRef.current) {
+    if (!trimmed || (!force && busy) || requestControllerRef.current) {
       return;
     }
 
@@ -401,6 +457,7 @@ export function AgentChat({
         const response = await streamAgent(promptWithContext, history, currentSession?.id ?? undefined, {
           language: locale === "en" ? "en-US" : "zh-CN",
           researchMode: effectiveResearchMode(researchMode, deepResearchAvailable),
+          modelApproved,
           signal: controller.signal,
           onEvent: (event) => {
             if (requestControllerRef.current !== controller) return;
@@ -416,7 +473,7 @@ export function AgentChat({
               if (event.tool) {
                 const tool = event.tool;
                 const status = event.type === "tool_progress" ? event.status ?? "running" : "running";
-                setToolActivity(previous => updateToolActivity(previous, { tool, status, reasonCode: event.type === "tool_progress" ? event.reasonCode : undefined }));
+                setToolActivity(previous => updateToolActivity(previous, { tool, status, endpoint: event.type === "tool_progress" ? event.endpoint : undefined, reasonCode: event.type === "tool_progress" ? event.reasonCode : undefined }));
               }
               onLabTrace?.({
                 id: createId("lab"),
@@ -477,7 +534,29 @@ export function AgentChat({
     })();
   }
 
-  askRef.current = ask;
+  function ask(question: string, context?: string, requestPrompt?: string) {
+    const trimmed = question.trim();
+    if (!trimmed || busy || requestControllerRef.current) return;
+    setPreflightBusy(true);
+    void (async () => {
+      try {
+        const preflight = await preflightAgent(trimmed);
+        if (preflight.requires_approval) {
+          setPendingModel({ question, context, requestPrompt, model: preflight.model, estimated: preflight.estimated_credits, threshold: preflight.threshold });
+          return;
+        }
+      } catch {
+        // Keep the existing submit path if preflight is unavailable.
+      } finally {
+        setPreflightBusy(false);
+      }
+      runAsk(question, context, requestPrompt, true);
+    })();
+  }
+
+  useEffect(() => {
+    askRef.current = ask;
+  });
 
   function submitCurrentInput() {
     const value = input.trim();
@@ -514,6 +593,24 @@ export function AgentChat({
     followBottomRef.current = true;
   }
 
+  function stopActiveRun() {
+    const controller = requestControllerRef.current;
+    if (!controller) return;
+    requestControllerRef.current = null;
+    controller.abort();
+    setStreamState("idle");
+    setActiveTool(null);
+    setCurrentStageLabel(locale === "en" ? "Stopped" : "已停止");
+    setStreamedAnswer("");
+    appendMessage({
+      id: createId("msg"),
+      role: "agent",
+      content: locale === "en"
+        ? "Research stopped. Already-sent external requests may still finish on the provider side."
+        : "研究已停止。已经发出的外部请求可能仍会在数据源侧完成。",
+    });
+  }
+
   function onNewChat() {
     clearActiveRun();
     setClarificationRequest(null);
@@ -544,6 +641,10 @@ export function AgentChat({
     clearActiveRun();
     setClarificationRequest(null);
     lastSubmittedQueryRef.current = "";
+    // Re-enter history with a fresh leading welcome each time.
+    setSessions((prev) =>
+      prev.map((session) => (session.id === sessionId ? ensureLeadingWelcome(session) : session)),
+    );
     setCurrentSessionId(sessionId);
     setHistoryOpen(false);
   }
@@ -594,7 +695,9 @@ export function AgentChat({
     );
   }
 
-  sessionActionsRef.current = { create: onNewChat, remove: onDeleteSession, select: onSelectSession };
+  useEffect(() => {
+    sessionActionsRef.current = { create: onNewChat, remove: onDeleteSession, select: onSelectSession };
+  });
 
   function continueClarifiedQuestion(answer: string) {
     const request = clarificationRequest;
@@ -632,7 +735,19 @@ export function AgentChat({
   }
 
   if (compact) {
-    const compactMessages = messages.length <= 1 ? [] : visibleMessages.filter(message => message.content !== "你好，我是 Ashare Agent。可以直接问全球新闻、热点、个股和持仓。");
+    const substantiveMessages = visibleMessages.filter((message) => !isWelcomeContent(message.content));
+    const isEmptyDesk = substantiveMessages.length === 0;
+    // Empty desk: big welcome card only. History: keep welcome bubble, then thread.
+    const compactMessages = isEmptyDesk
+      ? []
+      : visibleMessages.some((message) => isWelcomeContent(message.content))
+        ? visibleMessages
+        : [{
+            id: `welcome-${currentSession?.id ?? "desk"}`,
+            role: "agent" as const,
+            content: WELCOME_CONTENT,
+            actions: DEFAULT_PROMPTS,
+          }, ...substantiveMessages];
 
     return (
       <div className={`agent-chat-compact gpt-chat ${compactMessages.length ? "chat-has-messages" : "chat-is-empty"} ${workspace ? "workspace-agent" : ""}`}>
@@ -751,11 +866,11 @@ export function AgentChat({
         <div className="gpt-chat-log" ref={compactLogRef} onScroll={event => { const el = event.currentTarget; followBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 96; }}>
           <div className="agent-session-surface" key={currentSession?.id ?? "empty"}>
             {memoryMeta ? <MemoryPanel meta={memoryMeta} /> : null}
-            {messages.length <= 1 ? (
+            {isEmptyDesk ? (
               <section className="gpt-welcome-card">
-                <span className="research-welcome-eyebrow">{locale === "en" ? "YOUR RESEARCH DESK" : "你的研究空间"}</span>
-                <h3>{locale === "en" ? "What are you researching?" : "今天，想研究什么？"}</h3>
-                <p className="muted">{locale === "en" ? "Stocks, financials and the evidence behind them." : "股票、财务数据，以及观点背后的证据。"}</p>
+                <span className="research-welcome-eyebrow">financial-work</span>
+                <h3>{locale === "en" ? "Hi, I'm financial-work." : "你好，我是 financial-work。"}</h3>
+                <p className="muted">{locale === "en" ? "Ask about global news, themes, stocks and your portfolio." : "可以直接问全球新闻、热点、个股和持仓。"}</p>
               </section>
             ) : null}
             <div className="chat-log chat-log-full">
@@ -765,6 +880,7 @@ export function AgentChat({
                 <div className={`gpt-bubble ${message.role}`}>
                   {message.role === "agent" && locale === "en" && (message.content.match(/[\u3400-\u9fff]/g)?.length ?? 0) > 16 ? <p className="research-language-notice">Saved response in Chinese. New reports follow your current language setting; saved reports keep their original wording.</p> : null}
                   {message.response ? <ResponseTools response={message.response} /> : null}
+                  {message.response ? <ResponseQualityNotice response={message.response} locale={locale} /> : null}
                   <MarkdownText content={t(message.content)} />
                   {message.context ? <details className="agent-chart-context"><summary>{locale === "en" ? "Selected chart data" : "所选图表区间数据"}</summary><pre>{message.context}</pre></details> : null}
                   {message.response ? <ResearchTrace response={message.response} showTools={false} /> : null}
@@ -794,6 +910,12 @@ export function AgentChat({
           </div>
         </div>
 
+        <ModelApprovalPrompt
+          request={pendingModel}
+          locale={locale}
+          onCancel={() => setPendingModel(null)}
+          onConfirm={() => { const pending = pendingModel; setPendingModel(null); if (pending) runAsk(pending.question, pending.context, pending.requestPrompt, true, true); }}
+        />
         <div className="agent-clarification-shell">
           <ClarificationPrompt
             request={clarificationRequest}
@@ -825,17 +947,17 @@ export function AgentChat({
             <div className="gpt-input-meta">
               <div className="research-mode-switch" role="group" aria-label={locale === "en" ? "Research depth" : "研究深度"}>
                 <button type="button" aria-pressed={researchMode === "quick"} onClick={() => setResearchMode("quick")} disabled={busy}>{locale === "en" ? "Quick" : "快速"}</button>
-                <button type="button" aria-pressed={researchMode === "deep"} onClick={() => setResearchMode("deep")} disabled={busy || !deepResearchAvailable} title={!deepResearchAvailable ? (locale === "en" ? "Unavailable at the moment" : "暂时不可用") : undefined}>{locale === "en" ? "Deep" : "深入"}</button>
+                <button type="button" aria-pressed={researchMode === "deep"} onClick={() => setResearchMode("deep")} disabled={busy || !deepResearchAvailable} title={!deepResearchAvailable ? (locale === "en" ? "Unavailable — use Quick research" : "暂不可用，请改用快速研究") : undefined}>{locale === "en" ? "Deep" : "深入"}</button>
               </div>
               <button className="button ghost gpt-topbar-button research-clear" onClick={onClearChat} type="button" disabled={!currentSession}>{t("清空")}</button>
               {busy
-                ? <button className="button gpt-stop-button" type="button" onClick={() => requestControllerRef.current?.abort()}>{locale === "en" ? "Stop" : "停止"}</button>
+                ? <button className="button gpt-stop-button" type="button" onClick={stopActiveRun}>{locale === "en" ? "Stop" : "停止"}</button>
                 : <button className="button" type="submit" disabled={!input.trim()}>{t("发送")}</button>}
             </div>
           </div>
-          <p className="research-composer-hint" role={storageError ? "alert" : undefined}>{storageError ? (locale === "en" ? "Browser storage is full or unavailable. Download this report to keep it." : "浏览器存储已满或不可用，请下载报告以保存。") : !deepResearchAvailable ? (locale === "en" ? "Deep research is unavailable at the moment. Quick research is available." : "深入研究暂时不可用，可使用快速研究。") : (locale === "en" ? "Research only · Check dates and sources · Enter to send" : "仅供研究 · 核对数据日期与来源 · Enter 发送")}</p>
+          <p className="research-composer-hint" role={storageError ? "alert" : undefined}>{storageError ? (locale === "en" ? "Browser storage is full or unavailable. Download this report to keep it." : "浏览器存储已满或不可用，请下载报告以保存。") : !deepResearchAvailable ? (locale === "en" ? "Deep research is unavailable. Switch to Quick research." : "深度研究暂不可用，请改用快速研究。") : (locale === "en" ? "Research only · Check dates and sources · Enter to send" : "仅供研究 · 核对数据日期与来源 · Enter 发送")}</p>
         </form>
-        {!compactMessages.length ? <div className="research-starters" aria-label={locale === "en" ? "Research suggestions" : "研究建议"}>
+        {isEmptyDesk ? <div className="research-starters" aria-label={locale === "en" ? "Research suggestions" : "研究建议"}>
           {prompts.map((prompt,index) => <button key={prompt} type="button" title={prompt} onClick={() => {setInput(prompt); inputRef.current?.focus();}}>{promptLabels[index]} <span aria-hidden="true">↗</span></button>)}
         </div> : null}
       </div>
@@ -861,6 +983,7 @@ export function AgentChat({
               <div className={`bubble ${message.role}`} key={message.id}>
                 <strong>{message.role === "user" ? t("你") : "Agent"}</strong>
                 {message.response ? <ResponseTools response={message.response} /> : null}
+                {message.response ? <ResponseQualityNotice response={message.response} locale={locale} /> : null}
                 <MarkdownText content={t(message.content)} />
                 {message.context ? <details className="agent-chart-context"><summary>{locale === "en" ? "Selected chart data" : "所选图表区间数据"}</summary><pre>{message.context}</pre></details> : null}
                 {message.response ? <ResearchTrace response={message.response} showTools={false} /> : null}
@@ -910,6 +1033,12 @@ export function AgentChat({
         </div>
       </section>
 
+      <ModelApprovalPrompt
+        request={pendingModel}
+        locale={locale}
+        onCancel={() => setPendingModel(null)}
+        onConfirm={() => { const pending = pendingModel; setPendingModel(null); if (pending) runAsk(pending.question, pending.context, pending.requestPrompt, true, true); }}
+      />
       <div className="agent-clarification-shell">
         <ClarificationPrompt
           request={clarificationRequest}
@@ -917,6 +1046,31 @@ export function AgentChat({
           onClose={() => setClarificationRequest(null)}
           onResolve={continueClarifiedQuestion}
         />
+      </div>
+    </div>
+  );
+}
+
+function ModelApprovalPrompt({ request, locale, onCancel, onConfirm }: {
+  request: { question: string; model: string | null; estimated: number; threshold: number } | null;
+  locale: "en" | "zh";
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  if (!request) return null;
+  return (
+    <div className="model-approval-backdrop" role="dialog" aria-modal="true" aria-labelledby="work-model-approval-title">
+      <div className="model-approval-card">
+        <h3 id="work-model-approval-title">{locale === "en" ? "Confirm model call" : "确认调用模型"}</h3>
+        <p>{request.question}</p>
+        <dl>
+          <div><dt>{locale === "en" ? "Model" : "模型"}</dt><dd>{request.model || "—"}</dd></div>
+          <div><dt>{locale === "en" ? "Estimated credits" : "预计 credits"}</dt><dd>{request.estimated} / {request.threshold}</dd></div>
+        </dl>
+        <div className="model-approval-actions">
+          <button type="button" className="button ghost" onClick={onCancel}>{locale === "en" ? "Cancel" : "取消"}</button>
+          <button type="button" className="button" onClick={onConfirm}>{locale === "en" ? "Confirm" : "确认调用"}</button>
+        </div>
       </div>
     </div>
   );
@@ -982,6 +1136,11 @@ function compactActionLabel(action: string) {
   if (action.includes("完整单股分析")) return "完整分析";
   if (action.includes("全球局势")) return "全球影响";
   return truncate(action.replace(/^继续问[：:]/, "").trim(), 12);
+}
+
+function ResponseQualityNotice({ response, locale }: { response: AgentResponse; locale: "zh" | "en" }) {
+  const notice = researchOutputNotice(response, locale);
+  return notice ? <div className="research-data-gaps" role="status">{notice}</div> : null;
 }
 
 function PayloadCards({ response, workspace }: { response: AgentResponse; workspace: boolean }) {

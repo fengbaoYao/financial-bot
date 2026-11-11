@@ -67,10 +67,15 @@ logs/
 data/*.db
 data/agent_memory/
 data/strategy_analysis_cache.json
+data/last-good-cache.json
 data/user_settings.json
 data/sec_cache/
+data/financial_bot/
 output/
 info
+
+# Local UI verification captures
+reports/financial-bot/
 
 # Local captures and source media (use curated assets from public/marketing/)
 assets/screenshots/Screen Recording *

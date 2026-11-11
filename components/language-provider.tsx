@@ -13,7 +13,7 @@ export function LanguageProvider({ children, initialLanguage }: { children: Reac
   useEffect(() => {
     const explicit = params.get("lang");
     let stored: string | null = null;
-    try { stored = localStorage.getItem("openashare-language"); } catch { /* Storage can be disabled. */ }
+    try { stored = localStorage.getItem("financial-bot-language") /* financial-bot language preference */; } catch { /* Storage can be disabled. */ }
     const candidate = explicit ?? stored ?? initialLanguage;
     if (candidate === "en" || candidate === "zh") setLocale(candidate);
     setReady(true);
@@ -21,8 +21,12 @@ export function LanguageProvider({ children, initialLanguage }: { children: Reac
   useEffect(() => {
     if (!ready) return;
     document.documentElement.lang = locale === "en" ? "en" : "zh-CN";
-    document.cookie = `openashare-language=${locale};path=/;max-age=31536000;SameSite=Lax`;
-    try { localStorage.setItem("openashare-language", locale); } catch { /* Retain the in-memory preference. */ }
+    const cookieName = "financial-bot-language=";
+    const current = document.cookie.split(";").map((part) => part.trim()).find((part) => part.startsWith(cookieName))?.slice(cookieName.length);
+    if (current !== locale) {
+      document.cookie = `financial-bot-language=${locale};path=/;max-age=31536000;SameSite=Lax`;
+    }
+    try { localStorage.setItem("financial-bot-language", locale); } catch { /* Retain the in-memory preference. */ }
   }, [locale, ready]);
   const changeLanguage = useCallback((next: Language) => {
     setLocale(next);

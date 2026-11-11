@@ -292,7 +292,13 @@ export function searchStocksWithOptions(
 
 export function getStockAnalysis(
   code: string,
-  options?: { includeAi?: boolean; requestId?: string; requestInit?: RequestInit; language?: "en-US" | "zh-CN" },
+  options?: {
+    includeAi?: boolean;
+    requestId?: string;
+    requestInit?: RequestInit;
+    language?: "en-US" | "zh-CN";
+    timeoutMs?: number;
+  },
 ): Promise<StockAnalysisResponse> {
   const includeAi = options?.includeAi ?? true;
   const params = new URLSearchParams();
@@ -304,10 +310,15 @@ export function getStockAnalysis(
     params.set("request_id", options.requestId);
   }
   const suffix = params.toString() ? `?${params.toString()}` : "";
-  return request(`/api/stocks/${encodeURIComponent(code)}/analysis${suffix}`, {
+  const path = `/api/stocks/${encodeURIComponent(code)}/analysis${suffix}`;
+  const init: RequestInit = {
     ...(options?.requestInit ?? {}),
     cache: includeAi ? "no-store" : options?.requestInit?.cache ?? "default",
-  });
+  };
+  if (options?.timeoutMs && options.timeoutMs > 0) {
+    return requestWithTimeout(path, options.timeoutMs, init);
+  }
+  return request(path, init);
 }
 
 export type StockAnalysisStreamStage = {
@@ -400,8 +411,16 @@ export async function streamStockAnalysis(
   }
 }
 
-export function getStockNews(code: string): Promise<NewsItem[]> {
-  return request(`/api/stocks/${encodeURIComponent(code)}/news`);
+export function getStockNews(
+  code: string,
+  options?: { requestInit?: RequestInit; timeoutMs?: number },
+): Promise<NewsItem[]> {
+  const path = `/api/stocks/${encodeURIComponent(code)}/news`;
+  const init = options?.requestInit ?? {};
+  if (options?.timeoutMs && options.timeoutMs > 0) {
+    return requestWithTimeout(path, options.timeoutMs, init);
+  }
+  return request(path, init);
 }
 
 export function getStockAnalysisProgress(requestId: string): Promise<AnalysisProgressResponse> {
@@ -603,6 +622,7 @@ export async function queryAgent(
 
 export type AgentStreamHandlers = {
   onEvent?: (event: WorkspaceEvent) => void;
+  modelApproved?: boolean;
   signal?: AbortSignal;
   timeoutMs?: number;
   language?: "auto" | "en-US" | "zh-CN";
@@ -614,6 +634,24 @@ export type AgentStreamHandlers = {
  * events into workspace-friendly events. The backend remains backwards
  * compatible while the UI can render tool progress and context updates.
  */
+export type AgentPreflight = {
+  requires_approval: boolean;
+  estimated_credits: number;
+  threshold: number;
+  model: string | null;
+  model_configured: boolean;
+};
+
+export async function preflightAgent(query: string): Promise<AgentPreflight> {
+  const response = await fetch("/api/agent/preflight", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query }),
+  });
+  if (!response.ok) throw new Error("Model preflight unavailable");
+  return response.json() as Promise<AgentPreflight>;
+}
+
 export async function streamAgent(
   query: string,
   history: AgentHistoryTurn[] = [],
@@ -634,7 +672,7 @@ export async function streamAgent(
       method: "POST",
       cache: "no-store",
       headers: { "Content-Type": "application/json", Accept: "text/event-stream", ...(await getBrowserAuthHeaders()) },
-      body: JSON.stringify({ query, history, session_id: sessionId, request_id: requestId, language: handlers.language ?? "auto", research_mode: handlers.researchMode ?? "quick" }),
+      body: JSON.stringify({ query, history, session_id: sessionId, request_id: requestId, language: handlers.language ?? "auto", research_mode: handlers.researchMode ?? "quick", model_approved: Boolean(handlers.modelApproved) }),
       signal: controller.signal,
     });
     if (!response.ok || !response.body) {
@@ -683,7 +721,8 @@ export async function streamAgent(
         handlers.onEvent?.({ type: "message_delta", message: typeof meta.delta === "string" ? meta.delta : "", reset: meta.reset === true, provisional: false });
       } else if (eventName === "progress" || eventName === "start") {
         const status = payload.stage === "tool_completed" ? "completed" : payload.stage === "tool_error" ? "unavailable" : "running";
-        handlers.onEvent?.({ type: tool ? "tool_progress" : "tool_started", tool, message, stage, progressPct, status, reasonCode: typeof meta.reason_code === "string" ? meta.reason_code : undefined });
+        const endpoint = typeof meta.endpoint === "string" ? meta.endpoint : undefined;
+        handlers.onEvent?.({ type: tool ? "tool_progress" : "tool_started", tool, message, stage, progressPct, status, endpoint, reasonCode: typeof meta.reason_code === "string" ? meta.reason_code : undefined });
       } else if (eventName === "result" && payload.payload && typeof payload.payload === "object") {
         result = payload.payload as AgentResponse;
         handlers.onEvent?.({ type: "message_completed", response: result });

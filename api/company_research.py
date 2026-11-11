@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from urllib.parse import urlsplit
 
@@ -16,7 +17,7 @@ def verified_name(deps, code: str) -> str | None:
 
 def cached_identity(deps, query: str) -> dict | None:
     """Reuse only a matching, unambiguous identity, never the last global search."""
-    ticker_match = re.search(r"\((?:US\.)?([A-Z][A-Z0-9.-]{0,9})\)\s*$", query, re.I)
+    ticker_match = re.search(r"[（(]\s*((?:US\.|HK\.)?[A-Z0-9][A-Z0-9.-]{0,14})\s*[）)]\s*$", query, re.I)
     requested_code = normalize_stock_code(ticker_match.group(1) if ticker_match else query.strip()).upper()
     def name_key(value):
         words = re.sub(r"[^\w]+", " ", value.casefold()).split()
@@ -34,7 +35,7 @@ def cached_identity(deps, query: str) -> dict | None:
         if not code or (code.startswith("US.") and code not in deps.verified_us_codes):
             continue
         company_name = name_key(row.get("name", ""))
-        if code == requested_code or (len(name) >= 3 and company_name and (name == company_name or company_name.startswith(name + " "))):
+        if code == requested_code or (not ticker_match and len(name) >= 3 and company_name and (name == company_name or company_name.startswith(name + " "))):
             matches[code] = row
     return next(iter(matches.values())) if len(matches) == 1 else None
 
@@ -52,7 +53,8 @@ async def search_identity(deps, query: str, limit: int = 5) -> str:
         ticker_match = re.search(r"\((?:US\.)?([A-Z][A-Z0-9.-]{0,9})\)\s*$", query, re.I)
         lookup_query = ticker_match.group(1) if ticker_match else query.strip()
         us_codes = [row["code"] for row in out if row["code"].upper().startswith("US.")]
-        if us_codes or (not out and re.fullmatch(r"[A-Za-z][A-Za-z0-9 .-]{0,70}", lookup_query)):
+        sec_configured = "@" in os.environ.get("SEC_USER_AGENT", "")
+        if (us_codes or (not out and re.fullmatch(r"[A-Za-z][A-Za-z0-9 .-]{0,70}", lookup_query))) and sec_configured:
             try:
                 identity = await asyncio.to_thread(deps.sec_service.resolve, lookup_query, us_codes)
                 if identity["candidates"]:
@@ -65,6 +67,24 @@ async def search_identity(deps, query: str, limit: int = 5) -> str:
                             row["identity_verified"] = False
             except Exception:
                 lookup_failed = True
+                for row in out:
+                    if row["code"].upper().startswith("US."):
+                        row["identity_verified"] = False
+        elif us_codes:
+            # SEC contact is optional configuration. Without it, only accept an
+            # exact ticker/name from the local catalog; never call SEC.
+            if len(out) == 1 and len(us_codes) == 1:
+                row = out[0]
+                ticker = str(row.get("code") or "").upper().removeprefix("US.")
+                exact = lookup_query.strip().upper() in {ticker, f"US.{ticker}"} or (
+                    len(str(row.get("name") or "").strip()) >= 2
+                    and str(row.get("name") or "").strip().casefold() == lookup_query.strip().casefold()
+                )
+                row["identity_verified"] = bool(exact)
+                row["identity_source"] = "local_catalog" if exact else "unverified"
+                if exact:
+                    deps.verified_us_codes.add(str(row.get("code") or "").upper())
+            else:
                 for row in out:
                     if row["code"].upper().startswith("US."):
                         row["identity_verified"] = False
@@ -130,9 +150,13 @@ async def collect_company_evidence(deps, query: str, focus: str = "catalysts", *
                 return deps.record_tool({"tool": tool, "status": "unavailable", "data": {"data_gaps": ["Source data unavailable."]}})
         return await deps.retrieve(tool, args, execute)
 
-    tasks = [fetch("get_stock_news", {"stock_code": code, "limit": 6},
-                   lambda: [row.model_dump() for row in deps.news_service.get_stock_news(code, stock_name=name, limit=6)])]
-    if focus == "catalysts":
+    from api.financial_bot.prompt import tool_allowed
+    capabilities = deps.bot_capabilities
+    tasks = []
+    if tool_allowed("get_stock_news", capabilities):
+        tasks.append(fetch("get_stock_news", {"stock_code": code, "limit": 6},
+                           lambda: [row.model_dump() for row in deps.news_service.get_stock_news(code, stock_name=name, limit=6)]))
+    if focus == "catalysts" and tool_allowed("get_stock_analysis", capabilities):
         # Explain the observed move and retrieve contemporaneous company headlines.
         def quote_data():
             analysis = deps.stock_service.get_stock_analysis(code, False)
@@ -141,10 +165,39 @@ async def collect_company_evidence(deps, query: str, focus: str = "catalysts", *
             return localize_stock_analysis(analysis, deps.language).model_dump()
         tasks.append(fetch("get_stock_analysis", {"stock_code": code},
                            quote_data))
-    if code.startswith("US.") and focus in {"advantage", "policy", "overview"}:
+    if code.startswith("US.") and focus in {"advantage", "policy", "overview"} and tool_allowed("get_sec_company_data", capabilities):
         tasks.append(fetch("get_sec_company_data", {"stock_code": code}, lambda: deps.sec_service.company(code)))
+    # Price-move / catalyst research needs filings context (e.g. HK Q3 via yfinance)
+    # and a same-period sector/index benchmark when those tools are enabled.
+    if focus == "catalysts" and tool_allowed("get_company_fundamentals", capabilities):
+        market = "hk" if code.endswith(".HK") or code.startswith("HK.") else "us" if code.startswith("US.") else "cn"
+        if market in {"hk", "us"}:
+            def fundamentals_data(code=code):
+                from api.datasources.flags import yfinance_us_hk_fundamentals
+                from api.datasources.yfinance_provider import get_yfinance_provider
+                if not yfinance_us_hk_fundamentals():
+                    raise RuntimeError("yfinance US/HK fundamentals disabled")
+                return get_yfinance_provider().financials(code, "income", True, 4)
+            tasks.append(fetch(
+                "get_company_fundamentals",
+                {"stock_code": code, "statement": "income", "quarterly": True, "periods": 4},
+                fundamentals_data,
+            ))
+    if focus == "catalysts" and tool_allowed("get_benchmark_comparison", capabilities):
+        def benchmark_data(code=code):
+            from api.price_benchmark import fetch_benchmark_comparison
+            # Fetch independently: this runs in parallel with get_stock_analysis.
+            payload = fetch_benchmark_comparison(code, None)
+            if payload.get("status") == "unavailable":
+                raise RuntimeError("; ".join(payload.get("data_gaps") or ["benchmark unavailable"]))
+            return payload
+        tasks.append(fetch(
+            "get_benchmark_comparison",
+            {"stock_code": code},
+            benchmark_data,
+        ))
     await asyncio.gather(*tasks)
-    if focus == "catalysts" and deps.research_mode == "deep":
+    if focus == "catalysts" and deps.research_mode == "deep" and tool_allowed("web_search", capabilities):
         from api.web_research import search_public_sources, read_public_source
 
         # Deep catalyst analysis needs evidence beyond the same quote/news feed.
@@ -211,7 +264,7 @@ async def collect_company_evidence(deps, query: str, focus: str = "catalysts", *
                 if deps.synthesis_reason():
                     break
                 await read_public_source(deps, url, question or f"{name} recent price move catalysts and alternative explanations")
-    if focus in {"advantage", "policy"}:
+    if focus in {"advantage", "policy"} and tool_allowed("web_search", capabilities):
         from api.web_research import search_public_sources, read_public_source
         queries = list(dict.fromkeys(search_queries or ([question or f"{name} regulation company exposure", f"{name} annual report regulatory risk"] if focus == "policy" else
                                       [f"{name} products competitive advantage competitors", f"{name} annual report competition risks"])))

@@ -199,7 +199,7 @@ def test_search_endpoint(monkeypatch):
     assert response.json()[0]["code"] == "sh600036"
 
 
-def test_deepseek_profile_avoids_required_tool_choice(monkeypatch):
+def test_deepseek_profile_forces_output_only_without_thinking(monkeypatch):
     from openai import AsyncOpenAI
     from pydantic_ai.providers.openai import OpenAIProvider
 
@@ -208,7 +208,8 @@ def test_deepseek_profile_avoids_required_tool_choice(monkeypatch):
     )
     profile = _profile_for_model(provider, "deepseek-v4-flash", "https://api.deepseek.com")
 
-    assert profile["supports_forced_tool_choice"] is False
+    assert profile["supports_forced_tool_choice"] is True
+    assert profile["supports_forced_tool_choice_with_thinking"] is False
     assert profile["openai_supports_strict_tool_definition"] is False
     assert profile["openai_chat_thinking_field"] == "reasoning_content"
     assert profile["openai_chat_send_back_thinking_parts"] == "field"
@@ -361,7 +362,9 @@ def test_ai_analysis_response_is_private_no_store(monkeypatch):
     response = client.get("/api/stocks/sh600036/analysis", params={"include_ai": "true"})
     assert response.status_code == 200
     assert response.headers["cache-control"] == "private, no-store"
-    assert response.headers["vary"] == "Cookie"
+    # CORS appends Origin; the response must still vary by Cookie so one user's
+    # authenticated analysis is never served to another.
+    assert "Cookie" in [part.strip() for part in response.headers["vary"].split(",")]
 
 
 def test_public_analysis_response_keeps_public_cache(monkeypatch):
@@ -372,7 +375,8 @@ def test_public_analysis_response_keeps_public_cache(monkeypatch):
     response = client.get("/api/stocks/sh600036/analysis", params={"include_ai": "false"})
     assert response.status_code == 200
     assert response.headers["cache-control"].startswith("public, max-age=120")
-    assert "vary" not in response.headers
+    # Only CORS's Origin may vary; a public response must not vary by Cookie.
+    assert "Cookie" not in response.headers.get("vary", "")
 
 
 def test_stock_analysis_preserves_streamed_ai_insight_metadata(monkeypatch):
@@ -1545,3 +1549,35 @@ def test_attach_memory_profile_exposes_pinned_memory_and_goal():
     meta = enriched.payload["_meta"]["memory_profile"]
     assert meta["pinned_memory"] == ["偏好高股息"]
     assert meta["active_goal"] == "跟踪银行股分化"
+
+
+def test_pydantic_agent_is_not_reused_across_event_loops(monkeypatch):
+    import asyncio
+    import api.main as main
+    monkeypatch.setattr(main.settings_store, 'build_runtime_config', lambda config: SimpleNamespace(
+        llm_api_key='test-key', llm_base_url='https://example.invalid', llm_model='test-model'))
+    monkeypatch.setattr(main, 'create_agent', lambda **kwargs: object())
+    monkeypatch.setattr(main, '_pydantic_agent', None)
+    monkeypatch.setattr(main, '_pydantic_agent_signature', None)
+    async def get_agent():
+        first, _ = main._get_pydantic_agent()
+        second, _ = main._get_pydantic_agent()
+        assert first is second
+        return first
+    first = asyncio.run(get_agent())
+    second = asyncio.run(get_agent())
+    assert first is not second
+
+
+def test_deepseek_tool_forcing_respects_thinking_mode():
+    from openai import AsyncOpenAI
+    from pydantic_ai.models.openai import OpenAIChatModel
+    from pydantic_ai.models import ModelRequestParameters
+    from pydantic_ai.providers.openai import OpenAIProvider
+    provider = OpenAIProvider(openai_client=AsyncOpenAI(api_key='test-key', base_url='https://api.deepseek.com'))
+    model = OpenAIChatModel('deepseek-flash', provider=provider,
+                            profile=_profile_for_model(provider, 'deepseek-flash', 'https://api.deepseek.com'))
+    params = ModelRequestParameters()
+    assert model._supports_tool_forcing({'extra_body': {'thinking': {'type': 'disabled'}}}, params)
+    assert not model._supports_tool_forcing({'extra_body': {'thinking': {'type': 'enabled'}},
+                                             'openai_reasoning_effort': 'high'}, params)

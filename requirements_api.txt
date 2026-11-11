@@ -7,6 +7,7 @@ pydantic-ai-slim[openai]==2.55.0
 openai>=3.26.0,<4
 pandas>=2.2.0
 requests>=2.32.0
+tonghuashun-ifind-skill @ https://github.com/Etherstrings/tonghuashun-ifind-skill/archive/1866f48e0ea9621f729119e546c7ffb29720d0df.tar.gz
 beautifulsoup4>=4.13.0
 pypdf>=6.0.0,<7
 python-dotenv>=1.0.0
@@ -18,3 +19,6 @@ pytz>=2025.1
 # Data sources (Ashare.py imports yfinance; akshare is used as fallback)
 yfinance>=0.2.36
 akshare>=1.17.24
+
+# Pin upstream research role behavior to the reviewed TradingAgents release.
+tradingagents @ https://github.com/TauricResearch/TradingAgents/archive/c4544913a14ed3df5f1ed7b9e8483270ce20682a.tar.gz

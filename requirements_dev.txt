@@ -1,0 +1,8 @@
+# Local development and verification dependencies.
+# Install with: .venv/bin/python -m pip install -r requirements_dev.txt
+-r requirements_api.txt
+
+pytest>=8.0
+httpx>=0.27
+# Required only for the real PostgreSQL/RLS integration test.
+psycopg[binary]>=3.2

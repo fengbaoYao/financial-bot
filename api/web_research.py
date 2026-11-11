@@ -15,6 +15,8 @@ import urllib3
 import certifi
 from bs4 import BeautifulSoup
 
+from api.relevance import web_result_is_relevant
+
 
 class SourceUnavailable(ValueError):
     pass
@@ -33,7 +35,7 @@ def public_address(url: str) -> tuple[str, str]:
 
 class PublicDocumentReader:
     """Pin a validated public IP while retaining TLS certificate/hostname checks."""
-    def __init__(self, sec_user_agent: str = "OpenAshare research"):
+    def __init__(self, sec_user_agent: str = "Financial Bot research"):
         self.sec_user_agent = sec_user_agent
 
     def download(self, url: str) -> tuple[str, bytes, str]:
@@ -134,14 +136,15 @@ async def search_public_sources(
 ) -> str:
     query = re.sub(r"\s+", " ", query).strip()[:300]
     market = market or ("us" if deps.verified_us_codes or deps.language == "en-US" else "cn")
+    result_limit = min(3, max(1, limit))
     async def execute():
-        deps.report("tool_running", 50, "正在检索公开资料", {"tool": "web_search"})
+        deps.report("tool_running", 50, "正在检索公开资料", {"tool": "web_search", "endpoint": "Brave / Google News / Bing / DuckDuckGo"})
         try:
             if hasattr(deps.web_search_service, "search_report"):
-                report = await asyncio.to_thread(deps.web_search_service.search_report, query, limit=limit,
+                report = await asyncio.to_thread(deps.web_search_service.search_report, query, limit=8,
                     language=deps.language, market=market)
             else:
-                rows = await asyncio.to_thread(deps.web_search_service.search, query, limit=limit)
+                rows = await asyncio.to_thread(deps.web_search_service.search, query, limit=8)
                 report = {"results": [row.model_dump() for row in rows], "data_gaps": []}
             rows = [row.model_dump() if hasattr(row, "model_dump") else row for row in report.get("results", [])]
             gaps = list(report.get("data_gaps", []))
@@ -154,16 +157,29 @@ async def search_public_sources(
                     gaps.append(f"Excluded {rejected} search result(s) that did not identify the requested company.")
                 if not rows:
                     gaps.append("No search result explicitly identified the requested company; do not infer its business from similarly named entities.")
+            else:
+                # Generic web search has no company verifier. Omit hits that do
+                # not contain any meaningful query term instead of presenting
+                # provider noise as evidence.
+                matched = [row for row in rows if isinstance(row, dict) and web_result_is_relevant(row, query)]
+                rejected = len(rows) - len(matched)
+                rows = matched
+                if rejected:
+                    gaps.append(f"Excluded {rejected} search result(s) that did not match the question topic.")
             if source_priority is not None:
                 rows = sorted(rows, key=source_priority)
+            rows = rows[:result_limit]
             provider_failed = any(re.search(r"\b(?:unavailable|failed|timed out|error)\b", str(gap), re.I) for gap in gaps)
             reason_code = None
             if not rows:
-                reason_code = "provider_error" if provider_failed else "no_company_match" if rejected else "no_results"
+                reason_code = "no_company_match" if rejected else "provider_error" if provider_failed else "no_results"
             result = deps.record_tool({"tool": "web_search", "status": "completed" if rows else "unavailable",
-                                      "reason_code": reason_code, "data": rows, "data_gaps": gaps})
+                                      "reason_code": reason_code, "data": rows, "data_gaps": gaps,
+                                      "invalid_count": rejected})
             if rows:
-                deps.report("tool_completed", 65, "公开资料检索完成", {"tool": "web_search"})
+                providers = list(dict.fromkeys(str(row.get("provider")) for row in rows if isinstance(row, dict) and row.get("provider")))
+                endpoint = " / ".join(providers) if providers else "web search"
+                deps.report("tool_completed", 65, "公开资料检索完成", {"tool": "web_search", "endpoint": endpoint})
             return result
         except Exception as exc:
             return deps.record_tool({"tool": "web_search", "status": "unavailable", "data": [],
@@ -177,14 +193,15 @@ async def read_public_source(deps, url: str, question: str = "") -> str:
     if url not in known_urls | user_urls:
         return deps.record_tool({"tool": "read_public_source", "status": "unavailable", "data": {"data_gaps": ["Read only a URL supplied by the user or returned by a source tool; do not guess document links."]}})
     async def execute():
-        deps.report("tool_running", 65, "正在读取来源原文", {"tool": "read_public_source"})
+        domain = urlsplit(url).hostname or "source"
+        deps.report("tool_running", 65, f"正在读取来源原文 · {domain}", {"tool": "read_public_source", "endpoint": domain})
         try:
             data = await asyncio.to_thread(deps.document_reader.read, url, question[:300])
             result = deps.record_tool({"tool": "read_public_source", "data": data})
-            deps.report("tool_completed", 70, "来源原文读取完成", {"tool": "read_public_source"})
+            deps.report("tool_completed", 70, "来源原文读取完成", {"tool": "read_public_source", "endpoint": domain})
             return result
         except Exception as exc:
             gap = str(exc) if isinstance(exc, SourceUnavailable) else f"Document unavailable ({type(exc).__name__})."
-            return deps.record_tool({"tool": "read_public_source", "status": "unavailable", "data": {"data_gaps": [gap]}})
+            return deps.record_tool({"tool": "read_public_source", "status": "unavailable", "data": {"url": url, "data_gaps": [gap]}})
     # A second question does not cause another network read of the same document.
     return await deps.retrieve("read_public_source", {"url": url}, execute)

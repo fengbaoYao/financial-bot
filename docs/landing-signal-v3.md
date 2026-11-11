@@ -1,6 +1,6 @@
 # Signal landing page
 
-The landing page adapts the semantic HTML and CSS composition supplied in `OpenAshare_V3_Signal_Design_Package.zip` and the candlestick grammar from the V4 package. The approved ascending ribbon remains as a soft foundation for the illustrative candles, with teal/clay light and a full-width research desk demo. The workspace's warm white palette and sans-serif typography remain consistent.
+The landing page adapts the semantic HTML and CSS composition supplied in `Financial Bot_V3_Signal_Design_Package.zip` and the candlestick grammar from the V4 package. The approved ascending ribbon remains as a soft foundation for the illustrative candles, with teal/clay light and a full-width research desk demo. The workspace's warm white palette and sans-serif typography remain consistent.
 
 - `/` redirects to `/landing` on the same origin, carrying a valid `lang=en` or `lang=zh` query and falling back to the language cookie.
 - Workspace, waitlist and return-home links use relative paths. GitHub links intentionally open the public repository.

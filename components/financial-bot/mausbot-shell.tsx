@@ -3865,7 +3865,9 @@ if (kind === "turn") {
     try {
       const res = await fetch("/api/mausbot/browser/state", { cache: "no-store" });
       const data = await readJson(res);
-      if (!res.ok) throw new Error(String(data?.detail || data?.error || "browser unavailable"));
+      if (!res.ok) {
+        throw new Error(String(data?.detail || data?.error || "browser unavailable"));
+      }
       setBrowserState(data);
       if (!browserEditingRef.current) setBrowserUrl(String(data?.url || ""));
       setBrowserShot(`/api/mausbot/browser/screenshot?t=${Date.now()}`);
@@ -3882,7 +3884,9 @@ if (kind === "turn") {
     try {
       const res = await fetch("/api/mausbot/browser/open", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url: target }), cache: "no-store" });
       const data = await readJson(res);
-      if (!res.ok) throw new Error(String(data?.detail || data?.error || `open failed (${res.status})`));
+      if (!res.ok) {
+        throw new Error(String(data?.detail || data?.error || `open failed (${res.status})`));
+      }
       await refreshBrowser();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -3896,7 +3900,9 @@ if (kind === "turn") {
     try {
       const res = await fetch("/api/mausbot/browser/action", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, index, tabId }), cache: "no-store" });
       const data = await readJson(res);
-      if (!res.ok) throw new Error(String(data?.detail || data?.error || `action failed (${res.status})`));
+      if (!res.ok) {
+        throw new Error(String(data?.detail || data?.error || `action failed (${res.status})`));
+      }
       await refreshBrowser();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -3911,7 +3917,9 @@ if (kind === "turn") {
     try {
       const res = await fetch("/api/mausbot/browser-engine/install", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}", cache: "no-store" });
       const data = await readJson(res);
-      if (!res.ok) throw new Error(String(data?.detail || data?.error || `install failed (${res.status})`));
+      if (!res.ok) {
+        throw new Error(String(data?.detail || data?.error || `install failed (${res.status})`));
+      }
       if (botId) await loadRail(botId);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

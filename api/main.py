@@ -1801,14 +1801,49 @@ async def _maybe_recover_incomplete_synthesis(
 ):
     """When tools/synthesis stall, ask the selected LLM for a usable answer.
 
-    Prefers a tool-enabled recovery agent turn (prior tools kept; new tool calls
-    append to the same trace). Falls back to text-only model fill.
+    Synthesize existing source evidence first; only retry tool retrieval when
+    the initial run did not produce substantive source data.
     """
+    # Do not start a recovery model turn while the last provider request's
+    # charge is unknown. Recovery runs outside the normal request hook and
+    # could otherwise make another paid call after an unresolved failure.
+    if deps is not None and (
+        getattr(deps, "finish_reason", None) == "unresolved_provider_usage"
+        or getattr(deps, "provider_requests_started", 0)
+        > getattr(deps, "provider_requests_finished", 0)
+    ):
+        return response
     try:
-        from api.financial_bot.gap_synthesis import needs_research_recovery, recover_incomplete_synthesis
+        from api.financial_bot.gap_synthesis import (
+            has_substantive_source_data,
+            needs_research_recovery,
+            recover_incomplete_synthesis,
+        )
 
         if not needs_research_recovery(response):
             return response
+        results = tool_results if tool_results is not None else (
+            deps.tool_results if deps is not None else None
+        )
+        source_data_exists = has_substantive_source_data(results)
+        plan_context = ""
+        if deps is not None and getattr(deps, "research_plan", None) is not None:
+            try:
+                from api.financial_bot.plan import format_plan_context
+                plan_context = format_plan_context(deps.research_plan)
+            except Exception:
+                plan_context = ""
+        if source_data_exists:
+            recovered = await recover_incomplete_synthesis(
+                response,
+                query=query,
+                language=language,
+                model_provider=model_provider or "deepseek",
+                tool_results=results,
+                plan_context=plan_context,
+            )
+            if recovered is not response and not needs_research_recovery(recovered):
+                return recovered
         if agent is not None and deps is not None:
             try:
                 from api.agent_pydantic import run_recovery_async
@@ -1820,18 +1855,19 @@ async def _maybe_recover_incomplete_synthesis(
                     progress_callback=progress_callback,
                     model_provider=model_provider or "deepseek",
                 )
-                if recovered and (recovered.summary or "").strip():
+                if recovered and (recovered.summary or "").strip() and not needs_research_recovery(recovered):
                     return recovered
             except Exception:
                 logger.warning("tool-enabled research recovery failed; falling back to text fill", exc_info=False)
+        if source_data_exists:
+            return response
         return await recover_incomplete_synthesis(
             response,
             query=query,
             language=language,
             model_provider=model_provider or "deepseek",
-            tool_results=tool_results if tool_results is not None else (
-                deps.tool_results if deps is not None else None
-            ),
+            tool_results=results,
+            plan_context=plan_context,
         )
     except Exception:
         logger.warning("research synthesis recovery skipped", exc_info=False)
@@ -1922,6 +1958,7 @@ async def _run_agent_request(
         deps.bot_prompt = str(payload.bot_prompt or "")
         deps.bot_capabilities = dict(payload.bot_capabilities or {})
         deps.ui_context = dict(payload.ui_context or {})
+        deps.plan_before_research = not bool(deps.bot_prompt)
         if not deps.bot_prompt and payload.bot_instructions:
             deps.bot_prompt = (
                 f"你是独立研究 Bot【{payload.bot_name or 'Research Bot'}】。\n"
@@ -1980,13 +2017,16 @@ async def _run_agent_request(
                 deps=deps if isinstance(deps, AgentDeps) else None,
                 progress_callback=progress_callback,
             )
-            return await _maybe_apply_data_gap_fill(
+            response = await _maybe_apply_data_gap_fill(
                 response,
                 query=payload.query,
                 language=language,
                 model_provider=actual_provider,
                 tool_results=tool_results,
             )
+            if isinstance(deps, AgentDeps):
+                attach_work_plan_metadata(response, deps)
+            return response
         except asyncio.CancelledError:
             raise
         except (asyncio.TimeoutError, UsageLimitExceeded) as exc:
@@ -2009,6 +2049,8 @@ async def _run_agent_request(
                 )
                 from api.research_runs import save_run
                 response.payload["_meta"].update(save_run(deps, "incomplete", type(exc).__name__, response=response))
+                from api.agent_pydantic import attach_work_plan_metadata
+                attach_work_plan_metadata(response, deps)
             return response
         except BaseException as exc:
             if isinstance(exc, (SystemExit, KeyboardInterrupt)):
@@ -2055,8 +2097,13 @@ async def _run_agent_request(
                     model_provider=actual_provider,
                     tool_results=deps.tool_results if isinstance(deps, AgentDeps) else tool_results,
                 )
-                from api.research_runs import save_run
-                response.payload["_meta"].update(save_run(deps, "incomplete", type(exc).__name__, response=response))
+                from api.agent_pydantic import attach_work_plan_metadata
+                attach_work_plan_metadata(response, deps)
+                from api.research_runs import response_run_status, save_run
+                run_status = response_run_status(response)
+                response.payload["_meta"].update(save_run(
+                    deps, run_status, type(exc).__name__, response=response
+                ))
                 return response
             if progress_callback:
                 progress_callback("select_engine", 30, "智能引擎失败，切换到规则分析", {"engine": "deterministic"})

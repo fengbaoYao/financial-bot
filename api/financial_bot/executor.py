@@ -143,6 +143,8 @@ def classify_response(response: Any) -> tuple[str, str | None]:
         return "partial", "deep_evidence_quality_unverified"
     if meta.get("deep_research_incomplete") and summary:
         return "partial", "deep_research_incomplete"
+    if meta.get("source_data_incomplete") and summary:
+        return "partial", "source_data_incomplete"
     if meta.get("llm_research_recovery") and meta.get("unverified") and summary:
         return "partial", "unverified_recovery"
     if meta.get("llm_data_gap_fill_count") and summary:

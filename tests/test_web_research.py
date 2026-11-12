@@ -329,7 +329,10 @@ def test_unknown_specialist_usage_stops_new_paid_requests(monkeypatch, tmp_path)
     agent = create_agent(api_key="offline", model="offline-model")
     agent.model = FunctionModel(model)
     monkeypatch.setattr(main, "_get_pydantic_agent", lambda: (agent, deps))
-    response = asyncio.run(main._run_agent_request(AgentQuery(query="Research Moderna", language="en-US", research_mode="deep"), [], {}))
+    response = asyncio.run(main._run_agent_request(AgentQuery(
+        query="Research Moderna", language="en-US", research_mode="deep",
+        bot_prompt="Perform the requested read-only research and cite the retrieved sources.",
+    ), [], {}))
     assert len(calls) == 2 and response.evidence
     assert response.payload["_meta"]["usage_unresolved"]
     assert response.payload["_meta"]["limit_reason"] == "unresolved_provider_usage"

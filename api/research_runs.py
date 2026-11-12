@@ -28,7 +28,7 @@ def specialist_failure_category(exc: Exception) -> str:
 
 def _safe_tool_diagnostic(item: dict) -> dict:
     result = {key: value for key, value in item.items() if key in {
-        "tool", "status", "reason_code", "retrieved_at", "evidence", "data_gaps"}}
+        "tool", "status", "reason_code", "endpoint", "retrieved_at", "evidence", "data_gaps"}}
     if item.get("reason_code") == "specialist_error":
         if item.get("error_category") in {"other", "output_token_limit", "output_evidence_selection", "output_inline_evidence", "output_unknown_evidence", "output_retries_exhausted", "unexpected_model_behavior"}:
             result["error_category"] = item["error_category"]
@@ -55,6 +55,18 @@ def run_metadata(deps, status: str, failure: str | None = None) -> dict:
             "cost_basis": "DeepSeek Flash peak rates, all input uncached; known usage only; provisional, not billing reconciliation" if flash else "Model pricing unavailable",
             "provider_requests_started": deps.provider_requests_started, "provider_requests_finished": deps.provider_requests_finished,
             "retrieval_calls": deps.retrieval_count, "cache_hits": list(dict.fromkeys(deps.cache_hits))}
+
+
+def response_run_status(response, fallback: str = "incomplete") -> str:
+    """Treat a usable synthesis recovery as completed while preserving failure metadata."""
+    payload = getattr(response, "payload", None)
+    meta = payload.get("_meta") if isinstance(payload, dict) else None
+    if not isinstance(meta, dict):
+        return fallback
+    recovered = meta.get("llm_research_recovery") or meta.get("evidence_synthesis_recovery")
+    if recovered and not meta.get("synthesis_incomplete") and (getattr(response, "summary", "") or "").strip():
+        return "completed"
+    return fallback
 
 
 def save_run(deps, status: str, failure: str | None = None, response=None) -> dict:

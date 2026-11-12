@@ -23,7 +23,8 @@ export const fixtureSteps = [
 ];
 
 test('checking is an open, accessible progress control with icons and a logical rail', () => {
-  const html = renderToStaticMarkup(React.createElement(ResearchTools, { steps: fixtureSteps, phase: 'Checking facts and sources' }));
+  const activeSteps = fixtureSteps.map((step, index) => ({ ...step, status: index === fixtureSteps.length - 1 ? 'running' : step.status }));
+  const html = renderToStaticMarkup(React.createElement(ResearchTools, { steps: activeSteps, phase: 'Checking facts and sources' }));
   assert.match(html, /<details[^>]*class="research-tool-activity agent-run-timeline"[^>]*\bopen\b/);
   assert.match(html, /aria-live="polite"/);
   assert.match(html, /Checking facts and sources/);
@@ -45,6 +46,17 @@ test('completed tool history is grouped, collapsed and has no busy indicator', (
   assert.match(html, /3 tools · 3 groups/);
   assert.match(html, /agent-run-item/);
   assert.doesNotMatch(html, /<details[^>]*\bopen\b|research-stream-dot|Checking facts|aria-live/);
+});
+
+test('completed steps do not keep a stale fetching phase in the summary', () => {
+  const html = renderToStaticMarkup(React.createElement(ResearchTools, {
+    steps: Array.from({ length: 13 }, (_, index) => ({ tool: `research_${index}`, status: 'completed' })),
+    phase: '正在取数',
+  }));
+  assert.match(html, /13 tools · 13 groups/);
+  assert.match(html, /Tools used/);
+  assert.doesNotMatch(html, /正在取数/);
+  assert.doesNotMatch(html, /research-stream-dot/);
 });
 
 test('repeated tool calls merge into one group with a visible count', () => {

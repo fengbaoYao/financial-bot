@@ -15,8 +15,45 @@ from api.comparison_research import (
 from api.company_research import resolved_codes
 
 
+def _verified_simple_quote(query: str, result: dict) -> bool:
+    """Whether iFinD completed a single resolved quote that needs no more retrieval."""
+    if not re.search(r"股价|现价|最新价|报价|现在.*(?:多少|价格)|当前.*(?:多少|价格)|\b(?:stock|share)\s+price\b|\bquote\b", query, re.I):
+        return False
+    if re.search(r"历史|走势|分析|技术|为什么|原因|涨跌原因|比较|对比|财报|公告|新闻|估值|近[一二三四五六七八九十\d]+(?:个)?(?:天|日|周|月|年)|\b(?:history|historical|analysis|compare|comparison|news|earnings|valuation)\b", query, re.I):
+        return False
+    try:
+        from api.financial_bot.fallback_research import find_company
+        from api.datasources.ifind_provider import to_ths_code
+
+        match = find_company(query)
+        if not match:
+            return False
+        expected = to_ths_code(match[0]).upper()
+        payload = result.get("data") or {}
+        if result.get("endpoint") != "real_time_quotation":
+            return False
+        tables = (payload.get("data") or {}).get("tables") or []
+        returned = {
+            str(row.get("thscode") or "").strip().upper()
+            for row in tables if isinstance(row, dict) and str(row.get("thscode") or "").strip()
+        }
+        has_price = any(
+            isinstance(row, dict)
+            and isinstance(row.get("table"), dict)
+            and bool(row["table"].get("latest"))
+            and row["table"]["latest"][0] is not None
+            for row in tables
+        )
+        return returned == {expected} and has_price
+    except Exception:
+        return False
+
+
 class ResearchCapability(Capability):
     async def before_model_request(self, ctx, request_context):
+        if getattr(ctx.deps, "finish_reason", None) == "unresolved_provider_usage":
+            from pydantic_ai.exceptions import UsageLimitExceeded
+            raise UsageLimitExceeded("Unknown provider usage blocks additional paid model requests.")
         if ctx.deps.provider_requests_started > ctx.deps.provider_requests_finished:
             from pydantic_ai.exceptions import UsageLimitExceeded
             raise UsageLimitExceeded("Unknown provider usage blocks additional paid model requests.")
@@ -46,6 +83,13 @@ class ResearchCapability(Capability):
         if reason:
             ctx.deps.finish_reason = reason
             return []  # Output tools remain available, including validation repair.
+        if getattr(ctx.deps, "plan_before_research", False) and getattr(ctx.deps, "research_plan", None) is not None:
+            # Work's structured plan is the routing authority for this run.
+            # Do not replace it with the older iFinD-first broad-query gate;
+            # the outer PrepareTools hook exposes only the current plan step.
+            return [tool for tool in tool_defs
+                    if tool.name != "get_sec_company_data"
+                    or (getattr(ctx.deps, "verified_us_codes", set()) and "@" in os.environ.get("SEC_USER_AGENT", ""))]
         gated = self._apply_ifind_primary_gate(ctx, tool_defs)
         if gated is not None:
             return gated
@@ -168,12 +212,44 @@ class ResearchCapability(Capability):
         """
         try:
             from api.datasources.flags import ifind_enabled, ifind_primary
-            from api.agent_pydantic import should_prefetch_ifind
+            from api.agent_pydantic import is_simple_stock_quote_query, should_prefetch_ifind
         except Exception:
             return None
         query = str(getattr(ctx.deps, "user_query", "") or "")
         if not (ifind_enabled() and ifind_primary() and should_prefetch_ifind(query)):
             return None
+        try:
+            from api.agent_pydantic import _is_stock_price_move_question
+            if _is_stock_price_move_question(query, verified_identity=bool(resolved_codes(ctx.deps))):
+                # Causal questions use structured quote, news and benchmark
+                # retrieval. Do not also expose the broad NL router, whose
+                # independent failure was being mistaken for total iFinD failure.
+                return [tool for tool in tool_defs if tool.name != "ifind_smart_query"]
+        except Exception:
+            pass
+        if is_simple_stock_quote_query(query):
+            results = list(getattr(ctx.deps, "tool_results", None) or [])
+            searches = [item for item in results if item.get("tool") == "search_stocks"]
+            if not searches:
+                return [tool for tool in tool_defs if tool.name == "search_stocks"]
+            search = searches[-1]
+            rows = search.get("data") if isinstance(search.get("data"), list) else []
+            if search.get("status") == "unavailable" or len(rows) != 1:
+                return []
+            try:
+                from api.financial_bot.fallback_research import find_company
+
+                expected = normalize_stock_code(find_company(query)[0]).upper()
+            except Exception:
+                return []
+            if resolved_codes(ctx.deps) != {expected}:
+                return []
+            analysis = next((item for item in reversed(results) if item.get("tool") == "get_stock_analysis"), None)
+            if analysis is None:
+                return [tool for tool in tool_defs if tool.name == "get_stock_analysis"]
+            # A successful quote is sufficient for this narrow request; an
+            # unavailable one should produce a clear gap without web detours.
+            return []
         # Technical-signal asks still prefetch iFinD for context, but need local
         # analysis tools; do not hard-block them.
         if re.search(r"技术面|技术分析|\bMACD\b|\bRSI\b|均线|信号评分|买卖点", query, re.I):
@@ -189,6 +265,10 @@ class ResearchCapability(Capability):
             return only or None
         if any(item.get("status") == "unavailable" for item in ifind_rows):
             return None  # failure → normal tool set
+        if _verified_simple_quote(query, ifind_rows[-1]):
+            # A verified live quote is already the complete evidence for a short
+            # price request; additional identity and web reads only add latency.
+            return []
         # Success: keep competing market providers closed; leave identity/web/etc.
         verified = getattr(ctx.deps, "verified_us_codes", set()) or set()
         sec_ready = "@" in os.environ.get("SEC_USER_AGENT", "")

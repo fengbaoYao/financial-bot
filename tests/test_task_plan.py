@@ -138,6 +138,48 @@ def test_llm_normalized_plan_rejects_unknown_tools():
     assert all(tool not in {"shell_exec"} for step in plan.steps for tool in step.tools)
 
 
+def test_work_planner_runs_for_a_short_question_and_sets_answer_goal():
+    from pydantic_ai import ModelResponse, ToolCallPart
+    from pydantic_ai.models.function import FunctionModel
+    from api.financial_bot.planner import LLMPlanner
+
+    calls = []
+
+    def planning_model(messages, _info):
+        calls.append(messages)
+        return ModelResponse(parts=[ToolCallPart("final_result", {
+            "answer_intent": "判断贵州茅台近期走势及投资价值",
+            "answer_objective": "先核对走势是否稳定，再结合估值、经营和风险证据回答是否值得投资",
+            "steps": [
+                {"step_id": "s1", "title": "核验贵州茅台身份并取得近期行情和相对表现", "kind": "market",
+                 "tools": ["search_stocks", "get_stock_analysis", "get_benchmark_comparison"],
+                 "depends_on": [], "validation": {"kind": "evidence", "min_evidence": 1}, "retry_max": 1},
+                {"step_id": "s2", "title": "检查近期经营、估值和公司事件证据", "kind": "filings",
+                 "tools": ["get_company_fundamentals", "get_valuations", "get_cninfo_announcements"],
+                 "depends_on": ["s1"], "validation": {"kind": "evidence", "min_evidence": 1}, "retry_max": 1},
+                {"step_id": "s3", "title": "综合数据并回答是否值得投资及主要风险", "kind": "synthesis",
+                 "tools": [], "depends_on": ["s2"], "validation": {"kind": "summary"}, "retry_max": 0},
+            ],
+            "termination_condition": "完成证据采集后回答；缺少关键数据时说明缺口。",
+        })])
+
+    planner = LLMPlanner(api_key=None, base_url=None, model=None)
+    plan = asyncio.run(planner.plan(
+        "近期茅台比较稳定，帮我看下是否值得投资",
+        plan_id="work-test",
+        model_instance=FunctionModel(planning_model),
+        force=True,
+    ))
+
+    assert len(calls) == 1
+    assert plan is not None and plan.source == "llm"
+    assert "判断贵州茅台" in plan.answer_intent
+    assert "估值、经营和风险" in plan.answer_objective
+    formatted = format_plan_context(plan)
+    assert "最终回答目标" in formatted
+    assert "是否值得投资" in formatted
+
+
 def test_executor_gate_downgrades_completed_answer_with_incomplete_plan(tmp_path, monkeypatch):
     db = Database(sqlite_path=tmp_path / "gate.sqlite3")
     db.initialize()

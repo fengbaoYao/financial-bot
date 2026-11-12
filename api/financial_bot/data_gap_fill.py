@@ -43,6 +43,45 @@ _PROVIDER_SOURCES = frozenset({
     "sina", "tencent", "akshare", "ths", "brave",
 })
 
+_RESTRICTED_KNOWLEDGE_QUERY = re.compile(
+    r"涨跌原因|涨跌|上涨|下跌|走强|走弱|暴涨|暴跌|飙升|回落|反弹|震荡|波动|"
+    r"股价|股票价格|行情|现价|报价|市价|最新价|"
+    r"公告|新闻|消息|财报|年报|季报|营收|收入|净利润|现金流|估值|目标价|"
+    r"近期|最近|最新|今日|今天|昨天|本周|上周|本月|上月|截至目前|"
+    r"\b(?:stock price|share price|quote|market price|stock performance|"
+    r"why (?:did|has|is)|cause(?:s|d)?|catalyst(?:s)?|announcement(?:s)?|"
+    r"news|filing(?:s)?|earnings|revenue|net income|valuation|target price)\b|"
+    r"\b(?:recent|latest|today|yesterday|this week|last week|as of)\b|"
+    r"(?:19|20)\d{2}(?:[-/.年]\d{1,2}(?:[-/.月]\d{1,2}日?)?)?|"
+    r"\d{1,2}月\d{1,2}日?",
+    re.I,
+)
+_STABLE_BACKGROUND_GAP = re.compile(
+    r"主营业务|公司简介|公司概况|业务模式|商业模式|行业背景|业务概览|主营产品|产品线|"
+    r"\b(?:company (?:profile|overview|business)|business model|industry background|"
+    r"business overview|product portfolio)\b",
+    re.I,
+)
+
+
+def is_restricted_knowledge_query(query: str) -> bool:
+    """Whether this query needs fresh evidence and must not use model memory."""
+    return bool(_RESTRICTED_KNOWLEDGE_QUERY.search(query or ""))
+
+
+def has_stable_background_gap(gaps: list[Any]) -> bool:
+    """True only when an explicit missing company/industry background field exists."""
+    for item in gaps:
+        description = item.get("description", "") if isinstance(item, dict) else str(item)
+        if _STABLE_BACKGROUND_GAP.search(description):
+            return True
+    return False
+
+
+def _stable_background_gaps(gaps: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Allow model fill only for explicit, stable company/industry background gaps."""
+    return [item for item in gaps if _STABLE_BACKGROUND_GAP.search(item.get("description", ""))]
+
 
 def data_gap_fill_enabled() -> bool:
     """Prefer LLM_DATA_GAP_FILL; fall back to LLM_GAP_FILL; default on."""
@@ -228,11 +267,18 @@ async def complete_with_selected_provider(
         max_retries=0,
         timeout=30,
     )
+    request_options = {}
+    if "deepseek" in str(runtime.llm_model or "").lower() or "api.deepseek.com" in str(runtime.llm_base_url or "").lower():
+        # The main research agent explicitly disables DeepSeek thinking for
+        # concise final output. Match that protocol here; otherwise some runs
+        # return reasoning without any user-facing content to this text caller.
+        request_options["extra_body"] = {"thinking": {"type": "disabled"}}
     response = await client.chat.completions.create(
         model=runtime.llm_model,
         messages=messages,
         temperature=0.2,
         max_tokens=1200,
+        **request_options,
     )
     return (response.choices[0].message.content or "").strip()
 
@@ -323,11 +369,9 @@ def _model_evidence(fills: list[dict[str, Any]], language: str) -> ResearchEvide
 def _merge_fills(
     response: AgentResponse,
     fills: list[dict[str, Any]],
-    remaining: list[str],
     *,
     language: str,
     model_provider: str,
-    requested_gaps: list[dict[str, str]],
 ) -> AgentResponse:
     en = language == "en-US"
     payload = dict(response.payload or {})
@@ -385,23 +429,10 @@ def _merge_fills(
     gaps = list(response.data_gaps or [])
     if kept and fill_note not in gaps:
         gaps.append(fill_note)
-    for note in remaining[:8]:
-        text = str(note).strip()
-        if text and text not in gaps:
-            gaps.append(text)
-    # Keep original material gaps that were not filled.
-    filled_keys = {row["field_key"] for row in kept}
-    for item in requested_gaps:
-        if item["field_key"] in filled_keys:
-            continue
-        desc = item.get("description") or item["field_key"]
-        remnant = (
-            f"Still unconfirmed after model fill: {desc}"
-            if en
-            else f"模型补齐后仍无法确认：{desc}"
-        )
-        if remnant not in gaps:
-            gaps.append(remnant)
+    # Keep provider-reported gaps, but do not repeat unfilled fields as model-
+    # generated disclaimers. The source/tool state already communicates those
+    # gaps; "still_unconfirmed" is only used internally to reject unsupported
+    # model fills.
     response.data_gaps = gaps[:24]
 
     meta["llm_data_gap_fill"] = True
@@ -465,11 +496,26 @@ async def apply_data_gap_fill(
     meta = (response.payload or {}).get("_meta") if isinstance(response.payload, dict) else None
     if isinstance(meta, dict) and (meta.get("llm_data_gap_fill") or meta.get("limit_reached")):
         return response
+    if isinstance(meta, dict) and (meta.get("source_data_incomplete") or meta.get("engine") == "direct_stock_quote"):
+        # A missing provider value must stay visibly missing. Delay/status notes
+        # on a direct quote are not fields for the language model to fill.
+        return response
+    if isinstance(meta, dict) and meta.get("factual_only_fallback"):
+        # Do not append model-generated values to a factual-only fallback.
+        return response
     if isinstance(meta, dict) and meta.get("engine") == "llm_gap_fill":
         # Explanation-only path already ran; skip a second paid fill.
         return response
 
+    # Model memory cannot replace fresh evidence for price moves, current
+    # market data, announcements, news, financials, valuations, or dated facts.
+    if is_restricted_knowledge_query(query):
+        return response
+
     material = collect_material_gaps(response, tool_results)
+    if not material:
+        return response
+    material = _stable_background_gaps(material)
     if not material:
         return response
 
@@ -480,9 +526,13 @@ async def apply_data_gap_fill(
             "Return ONLY JSON: "
             '{"fills":[{"field_key":"...","value":"...","unit":null,"period":null,'
             '"confidence":"low|medium","note":"..."}],"still_unconfirmed":["..."]}. '
-            "Rules: never invent URLs or citation IDs; never claim the value came from "
+            "Rules: only fill stable company or industry background fields included in Missing fields; "
+            "never invent URLs or citation IDs; never claim the value came from "
             "iFinD, Fuyao, yfinance, SEC, Finnhub or other providers; prefer short "
-            "qualitative background; never guess current quotes, financial figures, "
+            "qualitative background that directly answers the missing field; never "
+            "return caveats, disclaimers, limitations, or restatements of the existing "
+            "summary as fills. If no useful field value can be supplied, leave it out "
+            "of fills and put it in still_unconfirmed. Never guess current quotes, financial figures, "
             "announcements or dates; if unsure, "
             "put the field in still_unconfirmed instead of guessing. Do not overwrite "
             "fields that providers already returned."
@@ -500,7 +550,10 @@ async def apply_data_gap_fill(
             '{"fills":[{"field_key":"...","value":"...","unit":null,"period":null,'
             '"confidence":"low|medium","note":"..."}],"still_unconfirmed":["..."]}。'
             "规则：严禁编造 URL 或引用 ID；不得声称来自 iFinD/Fuyao/yfinance/SEC 等数据源；"
-            "不得猜测最新行情、财务数字、公告内容或日期；仅提供定性背景。"
+            "只能补充缺失字段中明确列出的公司/行业稳定背景；不得猜测行情数字、财务数字、公告内容或日期。"
+            "只能补充能直接回答该字段的稳定定性背景。"
+            "不要把免责声明、限制说明或已有摘要换句话重复后作为补齐内容。"
+            "确实无法提供有用字段值时，不要生成 fills，只将字段放入 still_unconfirmed。"
             "不确定就放入 still_unconfirmed；置信度偏低时用 low；不要覆盖数据源已返回的字段。"
         )
         user = (
@@ -530,23 +583,17 @@ async def apply_data_gap_fill(
         return _mark_fill_failed(response, language)
 
     fills = []
+    allowed_field_keys = {item["field_key"] for item in material}
     for row in parsed.get("fills") or []:
         if isinstance(row, dict):
             clean = _sanitize_fill(row)
-            if clean:
+            if clean and clean["field_key"] in allowed_field_keys:
                 fills.append(clean)
-    remaining = [
-        str(item).strip()
-        for item in (parsed.get("still_unconfirmed") or [])
-        if str(item).strip()
-    ]
-    if not fills and not remaining:
+    if not fills:
         return response
     return _merge_fills(
         response,
         fills[:8],
-        remaining,
         language=language,
         model_provider=model_provider,
-        requested_gaps=material,
     )

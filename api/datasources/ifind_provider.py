@@ -711,6 +711,7 @@ class IfindProvider:
         if len(set(candidates)) > 1:
             raise IfindUnavailable("skill_multi_symbol_unsupported")
         us_ticker = candidates[0] if len(candidates) == 1 and not re.search(r"\d{4,6}\.(?:HK|SH|SZ)\b", query, re.I) else None
+        expected_quote_code = None
         if us_ticker:
             plan = build_generic_smart_query_plan(query)
             searchstring = plan.payload.get("searchstring", query)
@@ -718,7 +719,61 @@ class IfindProvider:
                 searchstring = f"{us_ticker} 最新价"
             plan = __import__("dataclasses").replace(plan, payload={**plan.payload, "searchstring": searchstring, "searchtype": "US_stock"})
         else:
-            plan = build_route_plan(query, entity_lookup=lookup)
+            plan = None
+            simple_quote = (
+                bool(re.search(r"股价|现价|最新价|报价|现在.*(?:多少|价格)|当前.*(?:多少|价格)|\b(?:stock|share)\s+price\b|\bquote\b", query, re.I))
+                and not re.search(r"历史|走势|分析|技术|为什么|原因|涨跌原因|比较|对比|财报|公告|新闻|估值|近[一二三四五六七八九十\d]+(?:个)?(?:天|日|周|月|年)|\b(?:history|historical|analysis|compare|comparison|news|earnings|valuation)\b", query, re.I)
+            )
+            if simple_quote:
+                try:
+                    from api.financial_bot.fallback_research import find_company
+
+                    match = find_company(query)
+                    if match:
+                        raw_code, company_name = match
+                        symbol = to_ths_code(raw_code)
+                        requested_hk = bool(re.search(r"港股|香港|\.HK\b", query, re.I))
+                        requested_us = bool(re.search(r"美股|美國股|美国股|\bUS\b", query, re.I))
+                        if not (requested_hk and not symbol.endswith(".HK")) and not (requested_us and not symbol.endswith((".O", ".N"))):
+                            entity = ResolvedEntity(raw=str(raw_code), symbol=symbol, name=str(company_name), entity_type="stock")
+                            plan = build_realtime_plan(entity)
+                            expected_quote_code = symbol.upper()
+                except IfindUnavailable:
+                    # Unsupported local mappings stay on the installed skill's normal route.
+                    pass
+                except Exception:
+                    # Do not let a local alias lookup prevent the normal research route.
+                    pass
+            if plan is None:
+                plan = build_route_plan(query, entity_lookup=lookup)
+        if not us_ticker and plan.intent == "quote_realtime":
+            try:
+                from api.financial_bot.fallback_research import _COMPANY_ALIASES, find_company
+                from ashare.stock_pool import normalize_stock_code
+
+                known_codes = {
+                    normalize_stock_code(code).upper()
+                    for alias, code in _COMPANY_ALIASES.items() if alias in query
+                }
+                explicit_codes = {
+                    normalize_stock_code(code).upper()
+                    for code in re.findall(r"(?<!\d)\d{1,6}\.HK\b|\b(?:SH|SZ)\d{6}\b|\bUS\.[A-Z][A-Z0-9.]{0,10}\b", query, re.I)
+                }
+                if len(known_codes | explicit_codes) <= 1:
+                    match = find_company(query)
+                    if match:
+                        raw_code, company_name = match
+                        symbol = to_ths_code(raw_code)
+                        requested_hk = bool(re.search(r"港股|香港|\.HK\b", query, re.I))
+                        requested_us = bool(re.search(r"美股|美國股|美国股|\bUS\b", query, re.I))
+                        if not (requested_hk and not symbol.endswith(".HK")) and not (requested_us and not symbol.endswith((".O", ".N"))):
+                            plan = build_realtime_plan(ResolvedEntity(
+                                raw=str(raw_code), symbol=symbol, name=str(company_name), entity_type="stock"
+                            ))
+                            expected_quote_code = symbol.upper()
+            except Exception:
+                # A failed local alias lookup leaves the installed skill route intact.
+                pass
         if (plan.intent == "quote_realtime" and plan.entity
                 and re.search(r"近(?:一|1)(?:个)?月", query)):
             import calendar
@@ -750,7 +805,16 @@ class IfindProvider:
             raise IfindUnavailable("history_quota_exhausted:-4318", quota_exhausted=True, endpoint=endpoint)
         result = self._post(endpoint, plan.payload)
         if not result.get("tables"):
-            raise IfindUnavailable("skill_empty_result")
+            raise IfindUnavailable("skill_empty_result", endpoint=endpoint)
+        if endpoint == "real_time_quotation" and plan.intent == "quote_realtime" and plan.entity:
+            expected = expected_quote_code or to_ths_code(str(getattr(plan.entity, "symbol", ""))).upper()
+            returned = {
+                str(entry.get("thscode") or "").strip().upper()
+                for entry in result.get("tables") or []
+                if isinstance(entry, dict) and str(entry.get("thscode") or "").strip()
+            }
+            if not returned or returned != {expected}:
+                raise IfindUnavailable("skill_identity_mismatch", endpoint=endpoint)
         if us_ticker:
             codes = []
             substantive = False
@@ -764,16 +828,16 @@ class IfindProvider:
                     elif not any(term in key.lower() for term in ("简称", "名称", "name")) and isinstance(values, list):
                         substantive = substantive or any(value is not None and str(value).strip() not in {"", "--", "null"} for value in values)
             if not any(code.split(".")[0] == us_ticker for code in codes):
-                raise IfindUnavailable("skill_identity_mismatch")
+                raise IfindUnavailable("skill_identity_mismatch", endpoint=endpoint)
             if not substantive:
-                raise IfindUnavailable("skill_no_substantive_data")
+                raise IfindUnavailable("skill_no_substantive_data", endpoint=endpoint)
         if endpoint == "real_time_quotation":
             tables = result.get("tables") or []
             if not any(
                 _at((entry.get("table") or {}).get("latest"), 0) is not None
                 for entry in tables if isinstance(entry, dict)
             ):
-                raise IfindUnavailable("skill_empty_result")
+                raise IfindUnavailable("skill_empty_result", endpoint=endpoint)
         return {"provider": "ifind", "endpoint": endpoint, "intent": plan.intent, "data": result}
 
     def screen(self, query: str, *, market: str = "stock", limit: int = 30) -> dict[str, Any]:

@@ -52,16 +52,14 @@ def test_recover_replaces_stall_with_labeled_model_answer(monkeypatch):
         seen["n"] += 1
         seen["messages"] = messages
         return (
-            "## 今日相对昨日\n"
-            "行情工具显示港股腾讯有可比窗口（见证据）。\n"
-            "新闻与公开网页检索失败；以下为模型知识补齐 / 未核验："
-            "需关注游戏版号与广告投放节奏，具体以一手公告为准。"
+            "## 腾讯的主营业务\n"
+            "腾讯提供社交、内容、游戏和数字服务。模型知识补齐 / 未核验。"
         )
 
     out = asyncio.run(
         gap.recover_incomplete_synthesis(
-            _incomplete_response(),
-            query="今天腾讯和昨天腾讯相比有什么需要关注的吗",
+            _incomplete_response(data_gaps=["缺少腾讯的主营业务背景"]),
+            query="腾讯的主营业务和稳定行业背景是什么",
             language="zh-CN",
             model_provider="chatgpt",
             tool_results=[
@@ -88,6 +86,113 @@ def test_recover_replaces_stall_with_labeled_model_answer(monkeypatch):
     blob = "\n".join(m["content"] for m in seen["messages"])
     assert "get_stock_news" in blob
     assert "web_search" in blob
+
+
+def test_recover_synthesizes_investment_answer_from_retrieved_evidence(monkeypatch):
+    monkeypatch.setenv("LLM_DATA_GAP_FILL", "1")
+    seen = {}
+
+    async def fake_complete(messages):
+        seen["messages"] = messages
+        return "结论：近20日上涨，但估值偏高；适合长期分批观察，不宜追高。"
+
+    source_results = [{
+        "tool": "get_stock_analysis",
+        "status": "completed",
+        "data": {"quote": {"close": 1405.39}, "windows": [{"days": 20, "change_pct": 7.04}]},
+        "evidence": [{
+            "id": "ev_price",
+            "source": "iFinD",
+            "title": "贵州茅台行情",
+            "data_as_of": "2026-11-12",
+            "excerpts": [{"location": "price_window", "text": "收盘价1405.39元；近20日涨幅7.04%。"}],
+        }],
+    }]
+    response = _incomplete_response(
+        evidence=[ResearchEvidence(
+            id="ev_price", source="iFinD", retrieved_at="2026-11-12T00:00:00+00:00",
+            freshness="current", title="贵州茅台行情", data_as_of="2026-11-12",
+            excerpts=[{"location": "price_window", "text": "收盘价1405.39元；近20日涨幅7.04%。"}],
+        )],
+    )
+
+    out = asyncio.run(gap.recover_incomplete_synthesis(
+        response,
+        query="帮我看下茅台最近的走势以及适不适合投资",
+        language="zh-CN",
+        tool_results=source_results,
+        plan_context="结合近期走势和估值判断是否适合投资",
+        complete_fn=fake_complete,
+    ))
+
+    assert out is not response
+    assert "结论：近20日上涨" in out.summary
+    assert "研究综合未完成" not in out.summary
+    assert "模型知识补齐" not in out.summary
+    assert out.payload["_meta"]["synthesis_incomplete"] is False
+    assert out.payload["_meta"]["answer_basis"] == "source_data"
+    assert out.payload["_meta"]["evidence_synthesis_recovery"] is True
+    assert any(ev.id == "ev_price" for ev in out.evidence)
+    prompt = "\n".join(message["content"] for message in seen["messages"])
+    assert "1405.39" in prompt
+    assert "7.04%" in prompt
+    assert "结合近期走势和估值判断是否适合投资" in prompt
+    assert "不可信" in prompt
+
+
+def test_source_evidence_recovery_precedes_another_tool_agent_turn(monkeypatch):
+    from types import SimpleNamespace
+    from api import main
+
+    recovered = AgentResponse(
+        intent="pydantic_ai_agent",
+        summary="结论：现有数据支持谨慎分批观察。",
+        actions=[], citations=[], evidence=[], data_gaps=[],
+        payload={"_meta": {
+            "llm_research_recovery": True,
+            "evidence_synthesis_recovery": True,
+            "synthesis_incomplete": False,
+        }},
+    )
+    seen = {}
+
+    async def fake_synthesis(response, **kwargs):
+        seen.update(kwargs)
+        return recovered
+
+    async def no_agent_recovery(*args, **kwargs):
+        raise AssertionError("must synthesize existing evidence before retrying tools")
+
+    monkeypatch.setattr(gap, "recover_incomplete_synthesis", fake_synthesis)
+    monkeypatch.setattr("api.agent_pydantic.run_recovery_async", no_agent_recovery, raising=False)
+    result = asyncio.run(main._maybe_recover_incomplete_synthesis(
+        _incomplete_response(),
+        query="茅台走势适合投资吗",
+        language="zh-CN",
+        model_provider="deepseek",
+        tool_results=[{"tool": "get_stock_analysis", "status": "completed", "data": {"close": 1405}}],
+        agent=object(),
+        deps=SimpleNamespace(tool_results=[], research_plan=None),
+    ))
+    assert result is recovered
+    assert seen["tool_results"][0]["tool"] == "get_stock_analysis"
+
+
+def test_recovery_snapshot_keeps_valid_json_and_provider_excerpt():
+    snapshot = gap._tool_snapshot([{
+        "tool": "ifind_smart_query",
+        "status": "completed",
+        "data": {"unrecognized_provider_fields": {"close": 1405.39}},
+        "evidence": [{
+            "id": "ev_quote", "source": "iFinD", "title": "行情",
+            "excerpts": [{"text": "近20日涨幅7.04%"}],
+        }],
+    }])
+    import json
+
+    parsed = json.loads(snapshot)
+    assert parsed[0]["evidence"][0]["excerpts"][0]["text"] == "近20日涨幅7.04%"
+    assert parsed[0]["data"]["keys"] == ["unrecognized_provider_fields"]
 
 
 def test_recover_disabled_leaves_stall(monkeypatch):
@@ -119,8 +224,8 @@ def test_recover_does_not_invent_citations(monkeypatch):
 
     out = asyncio.run(
         gap.recover_incomplete_synthesis(
-            _incomplete_response(citations=[]),
-            query="腾讯",
+            _incomplete_response(citations=[], data_gaps=["缺少公司主营业务背景"]),
+            query="腾讯的主营业务是什么",
             language="zh-CN",
             model_provider="deepseek",
             complete_fn=fake_complete,
@@ -134,14 +239,14 @@ def test_synthesize_gap_uses_selected_provider_label(monkeypatch):
     monkeypatch.setenv("LLM_GAP_FILL", "1")
 
     async def fake_complete(messages):
-        return "缺少一手报价，下面是通用分析框架。"
+        return "茅台主要经营白酒产品。"
 
     out = asyncio.run(
         gap.synthesize_gap(
-            "茅台股价",
+            "茅台的主营业务是什么",
             "zh-CN",
             evidence=[],
-            gaps=["行情不可用"],
+            gaps=["缺少公司主营业务背景"],
             model_provider="chatgpt",
             complete_fn=fake_complete,
         )
@@ -150,3 +255,30 @@ def test_synthesize_gap_uses_selected_provider_label(monkeypatch):
     assert out.payload["_meta"]["model_provider"] == "chatgpt"
     assert out.payload["_meta"]["llm_research_recovery"] is True
     assert "模型知识补齐" in out.summary
+
+
+def test_time_sensitive_gap_fallbacks_skip_model_knowledge(monkeypatch):
+    monkeypatch.setenv("LLM_GAP_FILL", "1")
+    calls = []
+
+    async def completion(_messages):
+        calls.append(True)
+        return "模型记忆中的公告摘要"
+
+    original = _incomplete_response(data_gaps=["缺少当天公告内容"])
+    recovered = asyncio.run(gap.recover_incomplete_synthesis(
+        original,
+        query="腾讯今天发布了什么公告",
+        language="zh-CN",
+        complete_fn=completion,
+    ))
+    synthesized = asyncio.run(gap.synthesize_gap(
+        "腾讯今天发布了什么公告",
+        "zh-CN",
+        gaps=["缺少当天公告内容"],
+        complete_fn=completion,
+    ))
+
+    assert calls == []
+    assert recovered is original
+    assert synthesized is None

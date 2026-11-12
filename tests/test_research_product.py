@@ -112,6 +112,60 @@ def test_real_pydantic_tool_roundtrip_and_thinking_protocol(monkeypatch, tmp_pat
     asyncio.run(scenario())
 
 
+def test_work_intent_plan_model_call_precedes_research_and_guides_synthesis():
+    from pydantic_ai.models.function import FunctionModel
+    from pydantic_ai.messages import ModelResponse, ToolCallPart
+
+    async def scenario():
+        requests = []
+        deps = AgentDeps(
+            stock_service=SimpleNamespace(search_stocks=lambda *_args, **_kwargs: [
+                StockSearchResult(name="腾讯控股", code="HK.00700", market="hk")
+            ]), news_service=SimpleNamespace(),
+            hotspot_service=SimpleNamespace(), portfolio_service=SimpleNamespace(),
+            web_search_service=SimpleNamespace(), language="zh-CN",
+            user_query="腾讯近期走势怎么样",
+            plan_before_research=True,
+        )
+
+        def model(messages, info):
+            requests.append(messages)
+            if len(requests) == 1:
+                assert any("你是金融任务规划器" in str(message) for message in messages)
+                return ModelResponse(parts=[ToolCallPart("final_result", {
+                    "answer_intent": "评估茅台近期走势和投资价值",
+                    "answer_objective": "用近期走势、经营、估值和风险证据回答投资价值",
+                    "steps": [
+                        {"step_id": "s1", "title": "核验茅台近期走势与市场相对表现", "kind": "market",
+                     "tools": ["search_stocks"], "depends_on": [],
+                         "validation": {"kind": "evidence", "min_evidence": 1}, "retry_max": 1},
+                        {"step_id": "s2", "title": "按已取证据回答投资价值和风险", "kind": "synthesis", "tools": [],
+                         "depends_on": ["s1"], "validation": {"kind": "summary"}, "retry_max": 0},
+                    ],
+                    "termination_condition": "根据证据回答，缺口明确说明。",
+                })])
+            prompt = "\n".join(str(message) for message in messages)
+            if len(requests) == 2:
+                assert "最终回答目标" in prompt
+                assert "用近期走势、经营、估值和风险证据回答投资价值" in prompt
+                assert {tool.name for tool in info.function_tools} == {"search_stocks"}
+                return ModelResponse(parts=[ToolCallPart("search_stocks", {"query": "腾讯控股"})])
+            evidence_id = deps.tool_results[-1]["evidence"][0]["id"]
+            return ModelResponse(parts=[ToolCallPart("final_result", {
+                "summary": f"已确认腾讯控股（HK.00700）[{evidence_id}]，但这次没有取到近期价格序列，暂不能判断走势。",
+                "actions": [], "evidence_ids": [evidence_id], "financial_fact_ids": [], "data_gaps": [],
+            })])
+
+        agent = create_agent(api_key="offline", model="offline-model")
+        agent.model = FunctionModel(model)
+        response = await run_agent_async(agent, deps, deps.user_query)
+        assert len(requests) == 3
+        assert deps.research_plan is not None and deps.research_plan.source == "llm"
+        assert "已确认腾讯控股" in response.summary
+
+    asyncio.run(scenario())
+
+
 def test_sec_units_periods_and_cash_flow_are_preserved():
     facts = {"facts": {"ifrs-full": {concept: {"units": {unit: [{"val": value, "start": "2025-01-01", "end": "2025-12-31", "filed": "2026-04-01", "form": "20-F", "accn": "0000000001-26-000001"}]}}
              for concept, unit, value in [("Revenue", "TWD", 123), ("CashFlowsFromUsedInOperatingActivities", "TWD", 42)]}}}

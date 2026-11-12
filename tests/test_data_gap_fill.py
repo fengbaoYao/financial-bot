@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 
 import pytest
 
@@ -46,22 +48,74 @@ def test_disabled_skips_model(monkeypatch):
     assert not (out.payload.get("_meta") or {}).get("llm_data_gap_fill")
 
 
+def test_selected_deepseek_text_completion_disables_thinking(monkeypatch):
+    import httpx
+    import openai
+    from types import SimpleNamespace
+
+    from api import main
+
+    request_bodies = []
+
+    def provider(request):
+        request_bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={
+            "id": "text-fallback",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "deepseek-flash",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                "role": "assistant", "content": "根据已检索证据给出结论。"
+            }}],
+        })
+
+    real_client = openai.AsyncOpenAI(
+        api_key="offline-test",
+        base_url="https://offline.invalid/v1",
+        max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(provider)),
+    )
+    monkeypatch.setattr(openai, "AsyncOpenAI", lambda **_kwargs: real_client)
+    monkeypatch.setattr(
+        main.settings_store,
+        "build_runtime_config",
+        lambda _config: SimpleNamespace(
+            llm_api_key="offline-test",
+            llm_base_url="https://offline.invalid/v1",
+            llm_model="deepseek-flash",
+        ),
+    )
+
+    async def scenario():
+        try:
+            result = await fill.complete_with_selected_provider(
+                [{"role": "user", "content": "test"}], model_provider="deepseek"
+            )
+            assert result == "根据已检索证据给出结论。"
+        finally:
+            await real_client.close()
+
+    asyncio.run(scenario())
+    assert request_bodies[0]["thinking"] == {"type": "disabled"}
+
+
 def test_fill_marked_unverified_and_uses_selected_provider(monkeypatch):
     monkeypatch.setenv("LLM_DATA_GAP_FILL", "1")
-    seen = {"provider": None}
+    field_key = 'response.gap:' + hashlib.sha1('缺少公司主营业务背景'.encode()).hexdigest()[:8]
 
     async def fake_complete(messages):
-        return (
-            '{"fills":[{"field_key":"get_company_fundamentals.periods",'
-            '"value":"约 1700 亿","unit":"CNY","period":"2025",'
-            '"confidence":"low","note":"公开常识粗估"}],'
-            '"still_unconfirmed":["精确审计营收"]}'
-        )
+        assert '缺少公司主营业务背景' in '\n'.join(item['content'] for item in messages)
+        return json.dumps({"fills": [{
+            "field_key": field_key,
+            "value": "茅台主要经营白酒产品。",
+            "confidence": "low",
+        }], "still_unconfirmed": []}, ensure_ascii=False)
 
     # Ensure complete_with_selected_provider is not used; inject complete_fn.
     out = asyncio.run(
         fill.apply_data_gap_fill(
             _response(
+                    data_gaps=["缺少公司主营业务背景"],
                 evidence=[
                     ResearchEvidence(
                         id="ev_provider",
@@ -82,7 +136,7 @@ def test_fill_marked_unverified_and_uses_selected_provider(monkeypatch):
                     }],
                 },
             ),
-            query="茅台营收",
+                query="茅台的主营业务是什么",
             language="zh",
             model_provider="chatgpt",
             tool_results=[{
@@ -162,20 +216,19 @@ def test_does_not_overwrite_good_provider_data(monkeypatch):
 
 def test_rejects_fake_urls_and_provider_claims(monkeypatch):
     monkeypatch.setenv("LLM_DATA_GAP_FILL", "1")
+    field_key = 'response.gap:' + hashlib.sha1('缺少公司主营业务背景'.encode()).hexdigest()[:8]
 
     async def fake_complete(messages):
-        return (
-            '{"fills":['
-            '{"field_key":"a","value":"1","url":"https://fake.example/x"},'
-            '{"field_key":"b","value":"2","source":"yfinance"},'
-            '{"field_key":"c","value":"可用值","confidence":"low"}'
-            '],"still_unconfirmed":[]}'
-        )
+        return json.dumps({"fills": [
+            {"field_key": field_key, "value": "虚假链接值", "url": "https://fake.example/x"},
+            {"field_key": field_key, "value": "冒充来源值", "source": "yfinance"},
+            {"field_key": field_key, "value": "稳定背景值", "confidence": "low"},
+        ], "still_unconfirmed": []}, ensure_ascii=False)
 
     out = asyncio.run(
         fill.apply_data_gap_fill(
-            _response(),
-            query="测试",
+            _response(data_gaps=["缺少公司主营业务背景"]),
+            query="腾讯的主营业务是什么",
             language="zh",
             model_provider="deepseek",
             tool_results=[{
@@ -188,9 +241,8 @@ def test_rejects_fake_urls_and_provider_claims(monkeypatch):
     )
     fills = out.payload.get("llm_gap_fills") or []
     keys = {row["field_key"] for row in fills}
-    assert "a" not in keys
-    assert "b" not in keys
-    assert "c" in keys
+    assert keys == {field_key}
+    assert [row["value"] for row in fills] == ["稳定背景值"]
 
 
 def test_collect_material_gaps_from_unavailable_tools():
@@ -211,16 +263,16 @@ def test_collect_material_gaps_from_unavailable_tools():
 
 
 def test_missing_provider_model_fill_is_visible_and_does_not_claim_completion(monkeypatch):
-    from api.financial_bot.executor import classify_response
     monkeypatch.setenv('LLM_DATA_GAP_FILL', '1')
+    calls = []
     async def completion(_messages):
+        calls.append(True)
         return '{"fills":[{"field_key":"get_stock_news.payload","value":"历史背景仅供参考","confidence":"low"}],"still_unconfirmed":["最新公告尚无法核验"]}'
     original = _response(intent='error', summary='新闻数据暂不可用', data_gaps=['新闻源不可用'])
     out = asyncio.run(fill.apply_data_gap_fill(original, query='分析新闻', language='zh-CN', tool_results=[{'tool':'get_stock_news','status':'unavailable','data':None}], complete_fn=completion))
-    assert '模型知识补齐（未核验）' in out.summary
-    assert '历史背景仅供参考' in out.summary
+    assert calls == []
+    assert out.summary == '新闻数据暂不可用'
     assert '新闻源不可用' in out.data_gaps
-    assert classify_response(out)[0] == 'partial'
 
 
 def test_model_fill_failure_preserves_original_answer_and_gaps(monkeypatch):
@@ -247,11 +299,88 @@ def test_model_fill_cannot_override_usage_limit(monkeypatch):
 
 
 def test_model_fill_failure_is_visible_and_partial(monkeypatch):
-    from api.financial_bot.executor import classify_response
     monkeypatch.setenv('LLM_DATA_GAP_FILL', '1')
+    calls = []
     async def completion(_messages):
+        calls.append(True)
         raise RuntimeError('unavailable')
     original = _response(summary='已有的行情', data_gaps=['公告源不可用'])
     out = asyncio.run(fill.apply_data_gap_fill(original, query='公告', language='zh-CN', tool_results=[{'tool':'get_stock_news','status':'unavailable','data':None}], complete_fn=completion))
-    assert any('模型补齐未成功' in gap for gap in out.data_gaps)
-    assert classify_response(out)[0] == 'partial'
+    assert calls == []
+    assert out.data_gaps == ['公告源不可用']
+
+
+@pytest.mark.parametrize('query', [
+    '腾讯近期震荡回弹的原因是什么',
+    '腾讯现在股价多少',
+    '腾讯今天发布了什么公告',
+    '腾讯在11月10日为什么上涨',
+])
+def test_time_sensitive_and_causal_questions_never_use_model_fill(monkeypatch, query):
+    monkeypatch.setenv('LLM_DATA_GAP_FILL', '1')
+    calls = []
+
+    async def completion(_messages):
+        calls.append(True)
+        return '{"fills":[],"still_unconfirmed":[]}'
+
+    original = _response(summary='已核实的行情片段', data_gaps=['缺少近期催化证据'])
+    out = asyncio.run(fill.apply_data_gap_fill(
+        original,
+        query=query,
+        language='zh-CN',
+        tool_results=[{'tool': 'get_stock_news', 'status': 'unavailable', 'data': None}],
+        complete_fn=completion,
+    ))
+
+    assert calls == []
+    assert out.summary == '已核实的行情片段'
+    assert out.data_gaps == ['缺少近期催化证据']
+    assert not out.payload['_meta'].get('llm_data_gap_fill')
+
+
+def test_only_stable_background_gaps_are_sent_to_model(monkeypatch):
+    monkeypatch.setenv('LLM_DATA_GAP_FILL', '1')
+    seen = {}
+
+    field_key = 'response.gap:' + hashlib.sha1('缺少公司主营业务背景'.encode()).hexdigest()[:8]
+
+    async def completion(messages):
+        seen['prompt'] = '\n'.join(item['content'] for item in messages)
+        return json.dumps({
+            'fills': [{'field_key': field_key, 'value': '腾讯主要从事互联网平台与数字服务。', 'confidence': 'low'}],
+            'still_unconfirmed': [],
+        }, ensure_ascii=False)
+
+    original = _response(data_gaps=['缺少公司主营业务背景'])
+    out = asyncio.run(fill.apply_data_gap_fill(
+        original,
+        query='腾讯的主营业务是什么',
+        language='zh-CN',
+        tool_results=None,
+        complete_fn=completion,
+    ))
+
+    assert '缺少公司主营业务背景' in seen['prompt']
+    assert '免责声明' in seen['prompt']
+    assert '腾讯主要从事互联网平台与数字服务。' in out.summary
+    assert out.payload['_meta'].get('llm_data_gap_fill') is True
+
+
+def test_model_fill_must_match_a_requested_stable_field(monkeypatch):
+    monkeypatch.setenv('LLM_DATA_GAP_FILL', '1')
+
+    async def completion(_messages):
+        return '{"fills":[{"field_key":"unrequested.current_price","value":"999","confidence":"low"}],"still_unconfirmed":[]}'
+
+    original = _response(data_gaps=['缺少公司主营业务背景'])
+    out = asyncio.run(fill.apply_data_gap_fill(
+        original,
+        query='腾讯的主营业务是什么',
+        language='zh-CN',
+        tool_results=None,
+        complete_fn=completion,
+    ))
+
+    assert out.summary == original.summary
+    assert not out.payload['_meta'].get('llm_data_gap_fill')

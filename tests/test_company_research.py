@@ -660,7 +660,11 @@ def test_deep_price_move_requires_catalyst_research_and_reads_two_source_angles(
         assert set(reads) == {"https://moderna.com/press-release", "https://example.org/biotech-sector"}
         assert {"research_company", "web_search", "read_public_source"} <= {step.tool for step in response.research_steps}
         assert response.payload["_meta"]["retrieval_calls"] >= 7
-        assert "No benchmark-relative return" in " ".join(response.data_gaps)
+        # Retrieved web excerpts are dated but the fixture has no direct,
+        # direction-matched company news, so Work must not repeat the model's
+        # speculative catalyst summary.
+        assert "plausible catalysts" not in response.summary
+        assert "cause remains unconfirmed" in response.summary
         assert deps.evidence_review_only is False
     asyncio.run(run())
 

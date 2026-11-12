@@ -329,7 +329,9 @@ export function ResearchTools({ steps, phase, workSeconds }: { steps: ToolActivi
 
   if (!steps.length && !phase) return worked ? <p className="research-tool-activity">{worked}</p> : null;
 
-  const summaryLabel = phase || worked || (en ? "Tools used" : "调用的工具");
+  const pending = groups.some((group) => group.status === "running");
+  const activePhase = pending || steps.length === 0 ? phase : undefined;
+  const summaryLabel = activePhase || worked || (en ? "Tools used" : "调用的工具");
   const countLabel = steps.length
     ? `${steps.length} ${en ? "tools" : "个工具"}${groups.length ? ` · ${groups.length} ${en ? "groups" : "组"}` : ""}`
     : "";
@@ -340,12 +342,12 @@ export function ResearchTools({ steps, phase, workSeconds }: { steps: ToolActivi
       open={open}
       onToggle={(event) => setOpen(event.currentTarget.open)}
     >
-      <summary aria-live={phase ? "polite" : undefined}>
+      <summary aria-live={activePhase ? "polite" : undefined}>
         <span className="agent-run-summary-icon" aria-hidden="true">
           <ToolGlyph tool={groups.find((group) => group.status === "running")?.tool ?? "generic"} />
         </span>
         <span className="agent-run-summary-label">
-          {phase ? <i className="research-stream-dot" aria-hidden="true" /> : null}
+          {activePhase ? <i className="research-stream-dot" aria-hidden="true" /> : null}
           {summaryLabel}
         </span>
         {countLabel ? <span className="agent-run-summary-count">{countLabel}</span> : null}

@@ -27,6 +27,7 @@ ALLOWED_TOOLS = {
     "get_cninfo_announcements",
     "get_financial_statements",
     "get_company_fundamentals",
+    "get_valuations",
     "get_analyst_estimates",
     "get_consensus_estimates",
     "compare_companies",
@@ -60,6 +61,8 @@ class PlannedStep(BaseModel):
 
 
 class PlanOutput(BaseModel):
+    answer_intent: str = Field(default="", max_length=300)
+    answer_objective: str = Field(default="", max_length=800)
     steps: list[PlannedStep] = Field(min_length=1, max_length=6)
     termination_condition: str = Field(
         default="全部步骤 completed 才算任务完成；关键步骤连续重试失败则终止。",
@@ -80,6 +83,8 @@ class TaskPlan(BaseModel):
     bot_id: str | None = None
     session_id: str | None = None
     original_query: str
+    answer_intent: str = ""
+    answer_objective: str = ""
     status: Literal["planning", "running", "completed", "partial", "failed", "cancelled"] = "planning"
     source: Literal["template", "llm", "fallback"] = "template"
     steps: list[PlanStep] = Field(default_factory=list)
@@ -161,6 +166,8 @@ def deterministic_plan(query: str, *, plan_id: str = "") -> TaskPlan:
     return TaskPlan(
         task_id=plan_id,
         original_query=text,
+        answer_intent="按用户原始问题完成研究",
+        answer_objective=text[:800],
         status="planning",
         source="template",
         steps=[
@@ -175,8 +182,15 @@ def deterministic_plan(query: str, *, plan_id: str = "") -> TaskPlan:
     )
 
 
-def normalize_llm_plan(output: PlanOutput, *, query: str, plan_id: str) -> TaskPlan:
+def normalize_llm_plan(
+    output: PlanOutput,
+    *,
+    query: str,
+    plan_id: str,
+    allowed_tools: set[str] | None = None,
+) -> TaskPlan:
     """Validate an LLM plan against the available tool vocabulary."""
+    tool_vocabulary = ALLOWED_TOOLS if allowed_tools is None else ALLOWED_TOOLS & allowed_tools
     steps: list[PlanStep] = []
     seen: set[str] = set()
     for index, raw in enumerate(output.steps[:6]):
@@ -184,7 +198,7 @@ def normalize_llm_plan(output: PlanOutput, *, query: str, plan_id: str) -> TaskP
         if step_id in seen:
             step_id = f"s{index + 1}"
         seen.add(step_id)
-        tools = [tool for tool in raw.tools if tool in ALLOWED_TOOLS]
+        tools = [tool for tool in raw.tools if tool in tool_vocabulary]
         kind = raw.kind if raw.kind in STEP_KINDS else "web"
         if raw.kind != "synthesis" and not tools:
             return deterministic_plan(query, plan_id=plan_id)
@@ -198,16 +212,34 @@ def normalize_llm_plan(output: PlanOutput, *, query: str, plan_id: str) -> TaskP
                 kind=kind,
                 tools=tools,
                 depends_on=[dep for dep in raw.depends_on if dep in seen and dep != step_id][:6],
-                validation=validation,
+                validation=validation.model_copy(update={
+                    "tools": [tool for tool in validation.tools if tool in tool_vocabulary]
+                }),
                 retry_max=raw.retry_max,
                 status="pending",
             )
         )
     if not steps:
         return deterministic_plan(query, plan_id=plan_id)
+    if steps[-1].kind != "synthesis":
+        if len(steps) >= 6:
+            steps = steps[:5]
+        prior_id = steps[-1].step_id
+        steps.append(PlanStep(
+            step_id=f"s{len(steps) + 1}",
+            title="根据任务和已取得证据回答用户问题",
+            kind="synthesis",
+            tools=[],
+            depends_on=[prior_id],
+            validation=ValidationRule(kind="summary", description="最终回答须回应用户目标，并区分证据与缺口。"),
+            retry_max=0,
+            status="pending",
+        ))
     return TaskPlan(
         task_id=plan_id,
         original_query=query,
+        answer_intent=(output.answer_intent or "按用户原始问题完成研究")[:300],
+        answer_objective=(output.answer_objective or query)[:800],
         status="planning",
         source="llm",
         steps=steps,
@@ -223,6 +255,9 @@ def format_plan_context(plan: TaskPlan) -> str:
         f"用户原始请求：{plan.original_query[:1200]}",
         "你只能执行工具并回答；不能修改、跳过或宣称完成下面的步骤。只有服务端校验全部步骤通过，任务才算完成。",
         "如果某个步骤缺少数据，请明确说明，不要用空结果当作成功。",
+        f"用户意图：{plan.answer_intent or '按原始问题完成研究'}",
+        f"最终回答目标：{plan.answer_objective or plan.original_query}",
+        "取证时围绕各步骤的目标调用对应工具；综合时逐项回应最终回答目标，优先给结论，再用取得的数据支持。不得以工具列表或免责声明代替回答。",
     ]
     for step in plan.steps:
         deps = f"；依赖 {', '.join(step.depends_on)}" if step.depends_on else ""

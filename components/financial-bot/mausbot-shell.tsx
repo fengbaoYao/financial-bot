@@ -2,6 +2,7 @@
 "use client";
 
 import { FormEvent, SyntheticEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { isTranscriptNearBottom, scrollTranscriptToBottom } from "../../lib/bot-transcript-scroll";
 import styles from "./mausbot-shell.module.css";
 
 type OmbTask = {
@@ -987,7 +988,7 @@ function modelProvenanceLabel(info: ModelProvenance | undefined, zh: boolean): s
   if (!info?.actualProvider && !info?.actualModel) {
     return info?.fallbackReason
       ? (zh ? `已报告降级，实际模型未知（${info.fallbackReason.replace(/_/g, " ")}）` : `Fallback reported; actual model unknown (${info.fallbackReason.replace(/_/g, " ")})`)
-      : (zh ? "实际模型未知" : "Actual model unknown");
+      : "";
   }
   const provider = (value?: string) => {
     const normalized = (value || "").trim().toLowerCase();
@@ -1675,7 +1676,7 @@ function activityLabel(msg: ChatMsg, zh = true) {
   return localizeActivityPhrase(raw, zh);
 }
 
-function ActivityCapsule({ msgs, zh, live }: { msgs: ChatMsg[]; zh: boolean; live?: string | null }) {
+function ActivityCapsule({ msgs, zh }: { msgs: ChatMsg[]; zh: boolean }) {
   const [open, setOpen] = useState(false);
   const [openId, setOpenId] = useState<string | null>(null);
   const failed = msgs.some((m) => m.tool?.ok === false);
@@ -1684,8 +1685,8 @@ function ActivityCapsule({ msgs, zh, live }: { msgs: ChatMsg[]; zh: boolean; liv
   const latest = activityLabel(msgs[msgs.length - 1], zh);
   const countLabel = zh ? `${msgs.length} 步` : `${msgs.length} steps`;
   const title = names.length === 1 ? `${names[0]} · ${countLabel}` : `${latest} · ${countLabel}`;
-  const tone = failed ? "bad" : pending || live ? "run" : "ok";
-  const headline = localizeActivityPhrase(live || title, zh);
+  const tone = failed ? "bad" : pending ? "run" : "ok";
+  const headline = title;
   return (
     <section className={styles.capsule} data-open={open ? "true" : "false"} data-tone={tone}>
       <button
@@ -2817,6 +2818,7 @@ export function MausbotShell() {
   const imeJustEndedRef = useRef(0);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
+  const shouldFollowTranscriptRef = useRef(true);
   const bootOnce = useRef(false);
   const streamingRef = useRef(false);
   const queueRef = useRef<QueuedPrompt[]>([]);
@@ -3255,6 +3257,7 @@ export function MausbotShell() {
 
   useEffect(() => {
     if (!threadId) return;
+    shouldFollowTranscriptRef.current = true;
     if (previewRef.current) {
       if (!streamingRef.current) void loadMessages(threadId);
       return;
@@ -3269,8 +3272,7 @@ export function MausbotShell() {
 
   useEffect(() => {
     const el = transcriptRef.current;
-    if (!el) return;
-    el.scrollTop = el.scrollHeight;
+    scrollTranscriptToBottom(el, shouldFollowTranscriptRef.current);
   }, [visibleMessages, streaming, queued.length, liveStatus, turnEndNotice]);
 
   const drainQueue = useCallback(() => {
@@ -4810,7 +4812,14 @@ if (kind === "turn") {
             </div>
           </header>
 
-          <div ref={transcriptRef} className={styles.transcript} aria-live="polite">
+          <div
+            ref={transcriptRef}
+            className={styles.transcript}
+            aria-live="polite"
+            onScroll={(event) => {
+              shouldFollowTranscriptRef.current = isTranscriptNearBottom(event.currentTarget);
+            }}
+          >
             <div className={styles.stream}>
               {bootstrapping || loadingMsgs ? (
                 <div className={styles.skeleton} aria-busy="true">
@@ -4862,26 +4871,18 @@ if (kind === "turn") {
                     blocks.push({ kind: "msg", msg: m });
                   }
                 }
-                const lastBlock = blocks[blocks.length - 1];
-                const lastActivityId = lastBlock?.kind === "activity" ? lastBlock.id : null;
                 const answerVisible = hasVisibleAnswer(visibleMessages);
                 const liveText = (() => {
                   if (!liveStatus) return null;
                   if (answerVisible && isGenericThinking(liveStatus, zh)) return null;
                   return liveStatus;
                 })();
-                const liveInCapsule = Boolean(liveText && lastActivityId);
                 return (
                   <>
                     {blocks.map((block) => {
                       if (block.kind === "activity") {
                         return (
-                          <ActivityCapsule
-                            key={block.id}
-                            msgs={block.msgs}
-                            zh={zh}
-                            live={liveInCapsule && block.id === lastActivityId ? liveText : null}
-                          />
+                          <ActivityCapsule key={block.id} msgs={block.msgs} zh={zh} />
                         );
                       }
                       const m = block.msg;
@@ -4936,14 +4937,15 @@ if (kind === "turn") {
                         );
                       }
                       const mine = m.role === "user";
+                      const provenanceLabel = modelProvenanceLabel(m.modelProvenance, zh);
                       return (
                         <div key={m.id} className={styles.row} data-role={m.role}>
                           {!mine ? <div className={styles.avatar} aria-hidden="true">{(displayBotName(activeBot?.name).slice(0, 1) || "f").slice(0, 1)}</div> : <div className={styles.avatarSpacer} />}
                           <div className={`${styles.bubble} ${mine ? styles.bubbleUser : styles.bubbleBot} ${m.pending ? styles.bubblePending : ""}`}>
                             {(m.steered || m.queued) ? <div className={styles.tag}>{m.steered ? (zh ? "插话" : "Steered") : (zh ? "排队" : "Queued")}</div> : null}
-                            {!mine && !m.pending ? (
+                            {!mine && !m.pending && provenanceLabel ? (
                               <div className={styles.tag} title={zh ? "仅显示运行时明确回传的模型信息" : "Only model metadata explicitly returned by the runtime is shown"}>
-                                {modelProvenanceLabel(m.modelProvenance, zh)}
+                                {provenanceLabel}
                               </div>
                             ) : null}
                             <MessageBody msg={m} botName={displayBotName(activeBot?.name)}  zh={zh} />
@@ -4951,9 +4953,7 @@ if (kind === "turn") {
                         </div>
                       );
                     })}
-                    {liveText && !liveInCapsule ? (
-                      <LiveLine text={liveText} zh={zh} />
-                    ) : null}
+                    {liveText ? <LiveLine text={liveText} zh={zh} /> : null}
                   </>
                 );
               })()}

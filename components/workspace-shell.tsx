@@ -1008,6 +1008,7 @@ function ResearchContextPanel({
   const marketScope = preferences.market;
   const hasGeneralMarketFeed = globalNews.some(item => item.raw_payload?.general_feed_available === true);
   const [reload, setReload] = useState(0);
+  const [chartRange, setChartRange] = useState("1Y");
   useEffect(() => {
     const close = (event: KeyboardEvent) => {
       const inToolMenu = event.target instanceof Element && event.target.closest('.workspace-tool-shortcuts, [role="menu"]');
@@ -1199,7 +1200,7 @@ function ResearchContextPanel({
         <div className="research-empty-state"><h3>{locale === "en" ? "Choose a stock to research" : "选择一只股票开始研究"}</h3><p>{locale === "en" ? "Select a saved stock or search for a ticker in the left panel." : "请从左侧自选股中选择，或搜索代码后添加。"}</p></div>
       ) : null}
       {!loading && !error && context?.type === "stock" && context.entityId ? (
-        <StockContext analysis={stock} news={news} fallback={payloadToStock(context.payload)} displayName={contextStockName ?? undefined} onSelectStock={onSelectStock} watched={watchlist.some(item => item.code.toUpperCase() === contextStockCode?.toUpperCase())} watchlistBusy={watchlistBusy} watchlistError={watchlistError} onToggleWatch={onToggleWatch} />
+        <StockContext analysis={stock} news={news} fallback={payloadToStock(context.payload)} displayName={contextStockName ?? undefined} onSelectStock={onSelectStock} range={chartRange} onRangeChange={setChartRange} watched={watchlist.some(item => item.code.toUpperCase() === contextStockCode?.toUpperCase())} watchlistBusy={watchlistBusy} watchlistError={watchlistError} onToggleWatch={onToggleWatch} />
       ) : null}
       {!loading && !error && context?.type === "topic" ? <TopicContext detail={hotspot} /> : null}
       {!loading && !error && context?.type === "market" ? <MarketContext market={market} /> : null}
@@ -1229,6 +1230,8 @@ function StockContext({
   fallback,
   displayName,
   onSelectStock,
+  range,
+  onRangeChange,
   watched, watchlistBusy, watchlistError, onToggleWatch,
 }: {
   analysis: StockAnalysisResponse | null;
@@ -1236,6 +1239,8 @@ function StockContext({
   fallback: StockAnalysisResponse | null;
   displayName?: string;
   onSelectStock: (code: string, name?: string) => void;
+  range: string;
+  onRangeChange: (range: string) => void;
   watched: boolean;
   watchlistBusy: boolean;
   watchlistError: string;
@@ -1243,7 +1248,6 @@ function StockContext({
 }) {
   const { t, locale } = useLanguage();
   const [chartExpanded, setChartExpanded] = useState(false);
-  const [range, setRange] = useState("1Y");
   const [selectedSegment, setSelectedSegment] = useState<ChartSegment | null>(null);
   const [annotationPrompt, setAnnotationPrompt] = useState("");
   const [annotationOpen, setAnnotationOpen] = useState(false);
@@ -1376,7 +1380,7 @@ function StockContext({
       </div>
       {series.length ? <section className="stock-chart-surface" aria-label={locale === "en" ? "Price chart" : "价格图表"}>
         <div className="stock-chart-toolbar">
-          <div className="stock-chart-ranges" role="group" aria-label={locale === "en" ? "Chart date range" : "图表时间范围"}>{["1M", "3M", "6M", "1Y", "ALL"].map(value => <button type="button" key={value} aria-pressed={range === value} onClick={() => setRange(value)}>{locale === "en" ? (value === "ALL" ? "All" : value) : ({ "1M": "1月", "3M": "3月", "6M": "6月", "1Y": "1年", "ALL": "全部" }[value])}</button>)}</div>
+          <div className="stock-chart-ranges" role="group" aria-label={locale === "en" ? "Chart date range" : "图表时间范围"}>{["1M", "3M", "6M", "1Y", "ALL"].map(value => <button type="button" key={value} aria-pressed={range === value} onClick={() => onRangeChange(value)}>{locale === "en" ? (value === "ALL" ? "All" : value) : ({ "1M": "1月", "3M": "3月", "6M": "6月", "1Y": "1年", "ALL": "全部" }[value])}</button>)}</div>
           <div className="stock-chart-view"><select aria-label={locale === "en" ? "Chart type" : "图表类型"} value={chartType} onChange={event => setChartType(event.target.value as typeof chartType)}><option value="candles">{locale === "en" ? "Candles" : "K线"}</option><option value="line">{locale === "en" ? "Line" : "折线"}</option></select><button ref={expandButtonRef} type="button" aria-label={t("展开 K 线")} title={t("展开 K 线")} onClick={showExpandedChart}>↗</button></div>
         </div>
         <CandlestickChart data={series} height={260} surface chartType={chartType} onReady={handlePreviewChartReady} />

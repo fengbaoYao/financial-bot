@@ -54,11 +54,20 @@ type ChatMsgTool = {
   clipped?: boolean;
 };
 
+type ModelProvenance = {
+  actualProvider?: string;
+  actualModel?: string;
+  requestedProvider?: string;
+  requestedModel?: string;
+  fallbackReason?: string;
+};
+
 type ChatMsg = {
   id: string;
   role: "user" | "assistant" | "system";
   kind?: string;
   text: string;
+  modelProvenance?: ModelProvenance;
   at?: number;
   helperIntro?: boolean;
   attachments?: MsgAttachment[];
@@ -934,6 +943,73 @@ function dropSupersededReplies(raw: any[]): any[] {
   return out;
 }
 
+function modelProvenanceFrom(value: any): ModelProvenance | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const candidates = [
+    value,
+    value.modelProvenance,
+    value.model_provenance,
+    value._meta,
+    value.meta,
+    value.metadata?._meta,
+    value.metadata,
+    value.modelInfo,
+    value.model_info,
+  ].filter((item) => item && typeof item === "object" && !Array.isArray(item));
+  const result: ModelProvenance = {};
+  const text = (source: any, keys: string[]) => {
+    for (const key of keys) {
+      const candidate = source?.[key];
+      if (typeof candidate === "string" && candidate.trim()) return candidate.trim().slice(0, 160);
+    }
+    return undefined;
+  };
+  for (const meta of candidates) {
+    const requestedProvider = text(meta, ["requested_model_provider", "requestedModelProvider", "requestedProvider"]);
+    const fallbackReason = text(meta, ["model_fallback", "modelFallback", "fallback_reason", "fallbackReason"]);
+    const explicitProvider = text(meta, ["actual_model_provider", "actualModelProvider", "actualProvider"]);
+    const actualProvider = explicitProvider || ((requestedProvider || fallbackReason)
+      ? text(meta, ["model_provider", "modelProvider"])
+      : undefined);
+    const actualModel = text(meta, ["actual_model", "actualModel"])
+      || (actualProvider && (requestedProvider || fallbackReason) ? text(meta, ["model"]) : undefined);
+    const requestedModel = text(meta, ["requested_model", "requestedModel"]);
+    if (actualProvider) result.actualProvider = actualProvider;
+    if (actualModel) result.actualModel = actualModel;
+    if (requestedProvider) result.requestedProvider = requestedProvider;
+    if (requestedModel) result.requestedModel = requestedModel;
+    if (fallbackReason) result.fallbackReason = fallbackReason;
+  }
+  return Object.values(result).some(Boolean) ? result : undefined;
+}
+
+function modelProvenanceLabel(info: ModelProvenance | undefined, zh: boolean): string {
+  if (!info?.actualProvider && !info?.actualModel) {
+    return info?.fallbackReason
+      ? (zh ? `已报告降级，实际模型未知（${info.fallbackReason.replace(/_/g, " ")}）` : `Fallback reported; actual model unknown (${info.fallbackReason.replace(/_/g, " ")})`)
+      : (zh ? "实际模型未知" : "Actual model unknown");
+  }
+  const provider = (value?: string) => {
+    const normalized = (value || "").trim().toLowerCase();
+    if (normalized === "deepseek") return "DeepSeek";
+    if (normalized === "chatgpt" || normalized === "gpt") return "ChatGPT";
+    if (normalized === "openaicompat") return "OpenAI-compatible";
+    return value?.trim() || "";
+  };
+  const actual = [provider(info.actualProvider), info.actualModel].filter(Boolean).join(" · ");
+  const requested = [provider(info.requestedProvider), info.requestedModel].filter(Boolean).join(" · ");
+  if (info.fallbackReason) {
+    const reason = info.fallbackReason.replace(/_/g, " ");
+    return zh
+      ? `已降级：${requested || "请求模型"} → ${actual || "实际模型未知"} · ${reason}`
+      : `Fallback: ${requested || "requested model"} → ${actual || "actual model unknown"} · ${reason}`;
+  }
+  const requestedNote = requested && requested.toLowerCase() !== actual.toLowerCase()
+    ? ` · ${zh ? "请求" : "requested"}: ${requested}`
+    : "";
+  return `${zh ? "实际模型" : "Actual model"}: ${actual}${requestedNote}`;
+}
+
 function wireToChatMsg(m: any): ChatMsg | null {
   if (!m || !(m.role === "user" || m.role === "bot" || m.role === "assistant")) return null;
   const text = String(m.text || "");
@@ -982,6 +1058,7 @@ function wireToChatMsg(m: any): ChatMsg | null {
     role: m.role === "user" ? "user" : "assistant",
     kind: resolvedKind,
     text,
+    modelProvenance: modelProvenanceFrom(m),
     at: m.at,
     helperIntro: Boolean(m.helperIntro),
     attachments,
@@ -2687,6 +2764,7 @@ export function MausbotShell() {
   const [turnEndNotice, setTurnEndNotice] = useState<string | null>(null);
   const [queued, setQueued] = useState<QueuedPrompt[]>([]);
   const [loadingBots, setLoadingBots] = useState(true);
+  const [botsLoadError, setBotsLoadError] = useState("");
   const [loadingMsgs, setLoadingMsgs] = useState(false);
   const [bootstrapping, setBootstrapping] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -2923,19 +3001,22 @@ export function MausbotShell() {
   const loadBots = useCallback(async () => {
     if (previewRef.current) {
       setLoadingBots(false);
+      setBotsLoadError("");
       setBots(PREVIEW_BOTS);
       return PREVIEW_BOTS;
     }
     setLoadingBots(true);
+    setBotsLoadError("");
     try {
       const res = await fetch("/api/mausbot/bots", { cache: "no-store" });
       const data = await readJson(res);
       if (!res.ok) throw new Error(String(data?.detail || data?.error || "load bots failed"));
-      const next = (data?.bots || []) as OmbBot[];
+      if (!Array.isArray(data?.bots)) throw new Error("invalid bots response");
+      const next = data.bots as OmbBot[];
       setBots(next);
       return next;
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setBotsLoadError(e instanceof Error ? e.message : String(e));
       return [] as OmbBot[];
     } finally {
       setLoadingBots(false);
@@ -3343,6 +3424,7 @@ export function MausbotShell() {
       // 插话后模型可能把整段答案重写一遍（同一回合内出现第二条消息）。
       // 记录被替代的旧消息，只在界面保留最新那份，避免“回复两次”。
       const supersededIds = new Set<string>();
+      let turnModelProvenance: ModelProvenance | undefined;
 
       setMessages((prev) => [
         ...prev,
@@ -3370,6 +3452,16 @@ export function MausbotShell() {
           return [...prev, { id, role: "assistant", kind: "text", text: "", at: Date.now(), ...patch, pending: false }];
         });
       };
+      const attachModelProvenance = (value: any) => {
+        const next = modelProvenanceFrom(value);
+        if (!next) return;
+        turnModelProvenance = { ...turnModelProvenance, ...next };
+        setMessages((prev) => prev.map((message) => (
+          message.id === provisionalId || message.id === streamMsgId
+            ? { ...message, modelProvenance: turnModelProvenance }
+            : message
+        )));
+      };
 
       try {
         const res = await fetch("/api/mausbot/ask/stream", {
@@ -3391,6 +3483,9 @@ export function MausbotShell() {
         let buf = "";
 
         const handleEvent = (ev: any) => {
+          attachModelProvenance(ev);
+          attachModelProvenance(ev?.event);
+          attachModelProvenance(ev?.message);
           const kind = ev?.kind;
           if (kind === "hello" && ev.threadId && ev.threadId !== threadIdRef.current) {
             setThreadId(String(ev.threadId));
@@ -3401,7 +3496,7 @@ export function MausbotShell() {
             if (sawRuntimeTextDelta || ev.synthetic === true) return;
             streamText += ev.delta;
             const id = streamMsgId || provisionalId;
-            ensureBubble(id, { text: streamText, role: "assistant" });
+            ensureBubble(id, { text: streamText, role: "assistant", modelProvenance: turnModelProvenance });
             if (streamText.trim()) {
               setLiveStatus((prev) => (isGenericThinking(prev, zh) ? null : prev));
             }
@@ -3460,6 +3555,9 @@ export function MausbotShell() {
             if (role !== "bot" && role !== "assistant") return;
             const mapped = wireToChatMsg({ ...msg, role: "assistant" });
             if (!mapped) return;
+            if (mapped.modelProvenance) {
+              turnModelProvenance = { ...turnModelProvenance, ...mapped.modelProvenance };
+            }
             const msgid = String(msg.id || streamMsgId || provisionalId);
             if (supersededIds.has(msgid)) return;
             if (mapped.kind === "activity") {
@@ -3525,6 +3623,7 @@ export function MausbotShell() {
               helperIntro: Boolean(msg.helperIntro),
               attachments: mapAttachments(msg.attachments),
               tool: mapped.tool,
+              modelProvenance: mapped.modelProvenance ?? turnModelProvenance,
             });
             if (String(streamText || nextText).trim()) {
               setLiveStatus((prev) => (isGenericThinking(prev, zh) ? null : prev));
@@ -4563,7 +4662,22 @@ if (kind === "turn") {
                   <span className={styles.presenceDot} data-presence={bot.busy ? "working" : "idle"} />
                 </button>
               ))}
-              {!bots.length && !loadingBots ? <p className={styles.emptyHint}>{zh ? "还没有机器人" : "No bots yet"}</p> : null}
+              {!bots.length ? (
+                loadingBots ? (
+                  <p className={styles.emptyHint} role="status" aria-live="polite" aria-busy="true">
+                    {zh ? "正在同步机器人…" : "Loading bots…"}
+                  </p>
+                ) : botsLoadError ? (
+                  <div className={styles.emptyHint} role="alert">
+                    <span>{zh ? "机器人列表加载失败" : "Could not load bots"}</span>
+                    <button type="button" className={styles.textButton} onClick={() => void loadBots()}>
+                      {zh ? "重试" : "Retry"}
+                    </button>
+                  </div>
+                ) : (
+                  <p className={styles.emptyHint}>{zh ? "还没有机器人" : "No bots yet"}</p>
+                )
+              ) : null}
             </div>
           </div>
 
@@ -4606,11 +4720,26 @@ if (kind === "turn") {
                 </div>
               ))}
               {!shownThreads.length ? (
-                <p className={styles.emptyHint}>
-                  {threadQuery.trim()
-                    ? (zh ? "没有匹配的话题" : "No matching threads")
-                    : (zh ? "暂无话题" : "No threads")}
-                </p>
+                loadingBots ? (
+                  <p className={styles.emptyHint} role="status" aria-live="polite" aria-busy="true">
+                    {zh ? "正在同步话题…" : "Loading threads…"}
+                  </p>
+                ) : botsLoadError ? (
+                  <div className={styles.emptyHint} role="alert">
+                    <span>{zh ? "话题加载失败" : "Could not load threads"}</span>
+                    <button type="button" className={styles.textButton} onClick={() => void loadBots()}>
+                      {zh ? "重试" : "Retry"}
+                    </button>
+                  </div>
+                ) : (
+                  <p className={styles.emptyHint} role="status" aria-live="polite">
+                    {threadQuery.trim()
+                      ? (zh ? "没有匹配的话题" : "No matching threads")
+                      : (zh ? "暂无话题" : "No threads")}
+                  </p>
+                )
+              ) : botsLoadError ? (
+                <p className={styles.emptyHint} role="alert">{zh ? "话题刷新失败，显示的是上次加载结果。" : "Thread refresh failed; showing the last loaded list."}</p>
               ) : null}
             </div>
           </div>
@@ -4812,6 +4941,11 @@ if (kind === "turn") {
                           {!mine ? <div className={styles.avatar} aria-hidden="true">{(displayBotName(activeBot?.name).slice(0, 1) || "f").slice(0, 1)}</div> : <div className={styles.avatarSpacer} />}
                           <div className={`${styles.bubble} ${mine ? styles.bubbleUser : styles.bubbleBot} ${m.pending ? styles.bubblePending : ""}`}>
                             {(m.steered || m.queued) ? <div className={styles.tag}>{m.steered ? (zh ? "插话" : "Steered") : (zh ? "排队" : "Queued")}</div> : null}
+                            {!mine && !m.pending ? (
+                              <div className={styles.tag} title={zh ? "仅显示运行时明确回传的模型信息" : "Only model metadata explicitly returned by the runtime is shown"}>
+                                {modelProvenanceLabel(m.modelProvenance, zh)}
+                              </div>
+                            ) : null}
                             <MessageBody msg={m} botName={displayBotName(activeBot?.name)}  zh={zh} />
                           </div>
                         </div>

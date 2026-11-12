@@ -412,6 +412,16 @@ export function ResearchTools({ steps, phase, workSeconds }: { steps: ToolActivi
   );
 }
 
+function isExternalResearchLink(value: unknown): value is string {
+  if (typeof value !== "string" || !value.trim()) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" || url.protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+
 function ResearchDataCards({ cards, en }: { cards: Array<Record<string, unknown>>; en: boolean }) {
   const visible = cards.filter((card) => String(card.kind || "") !== "model_fill");
   if (!visible.length) return null;
@@ -430,7 +440,16 @@ function ResearchDataCards({ cards, en }: { cards: Array<Record<string, unknown>
         {kind === "estimates" && targets ? <ul className="research-data-list">{Object.entries(targets).map(([key, value]) => <li key={key}><strong>{key}</strong>: {String(value)}</li>)}</ul> : null}
         {kind === "estimates" && years.length ? <div className="research-data-table"><table><thead><tr><th>{en ? "Period" : "年度"}</th><th>Mean</th><th>Min</th><th>Max</th><th>{en ? "Analysts" : "机构数"}</th></tr></thead><tbody>{years.map((row, rowIndex) => <tr key={rowIndex}><td>{String(row.period || "")}</td><td>{String(row.mean ?? "—")}</td><td>{String(row.min ?? "—")}</td><td>{String(row.max ?? "—")}</td><td>{String(row.count ?? "—")}</td></tr>)}</tbody></table></div> : null}
         {kind === "index" && rows.length ? <div className="research-data-table"><table><thead><tr><th>{en ? "Code" : "代码"}</th><th>{en ? "Name" : "名称"}</th><th>{en ? "Weight" : "权重"} %</th></tr></thead><tbody>{rows.map((row, rowIndex) => <tr key={rowIndex}><td>{String(row.code || "")}</td><td>{String(row.name || "")}</td><td>{String(row.weight_percent ?? "—")}</td></tr>)}</tbody></table></div> : null}
-        {kind === "announcements" && rows.length ? <ul className="research-data-list">{rows.map((row, rowIndex) => <li key={rowIndex}><a href={String(row.url || "#")} target="_blank" rel="noreferrer">{String(row.title || "")}</a> <small>{String(row.date || "")}</small></li>)}</ul> : null}
+        {kind === "announcements" && rows.length ? <ul className="research-data-list">{rows.map((row, rowIndex) => {
+          const sourceUrl = isExternalResearchLink(row.url) ? row.url : null;
+          const hasSourceUrl = sourceUrl !== null;
+          return <li key={rowIndex}>
+            {hasSourceUrl
+              ? <a href={sourceUrl} target="_blank" rel="noreferrer">{String(row.title || "")}</a>
+              : <span title={en ? "Original link unavailable" : "原文链接暂不可用"}>{String(row.title || "")}</span>}
+            {" "}<small>{String(row.date || "")}{hasSourceUrl ? "" : ` · ${en ? "Original link unavailable" : "原文链接暂不可用"}`}</small>
+          </li>;
+        })}</ul> : null}
       </details>;
     })}
   </div>;

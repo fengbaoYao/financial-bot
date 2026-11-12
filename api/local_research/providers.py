@@ -130,7 +130,10 @@ def cninfo_announcements(stock_code: str, limit: int = 8) -> dict[str, Any]:
                 "title": str(item.get("announcementTitle") or "").strip(),
                 "type": str(item.get("announcementTypeName") or "").strip(),
                 "date": date,
-                "url": f"https://www.cninfo.com.cn/new/disclosure/detail?annoId={announcement_id}" if announcement_id else None,
+                "url": (
+                    f"https://www.cninfo.com.cn/new/disclosure/detail?stockCode={digits}&announcementId={announcement_id}"
+                    if announcement_id else None
+                ),
                 "record_key": str(announcement_id or ""),
             }
         )

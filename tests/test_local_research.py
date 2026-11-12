@@ -47,7 +47,9 @@ def test_cninfo_announcements_parse_and_evidence_fields(monkeypatch):
     result = providers.cninfo_announcements("sh600519", limit=5)
     assert result["provider"] == "cninfo"
     assert result["announcements"][0]["title"].startswith("贵州茅台")
-    assert result["announcements"][0]["url"].endswith("annoId=1225475868")
+    assert result["announcements"][0]["url"] == (
+        "https://www.cninfo.com.cn/new/disclosure/detail?stockCode=600519&announcementId=1225475868"
+    )
     assert result["raw_sha256"]
     assert result["raw_retained"] is False
 

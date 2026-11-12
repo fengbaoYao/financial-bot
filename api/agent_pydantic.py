@@ -2183,6 +2183,15 @@ def create_agent(
                         }
                         for row in ifind_data.get("announcements", [])
                     ]
+                    if any(not row.get("url") for row in rows):
+                        try:
+                            from api.datasources.announcement_links import merge_official_announcement_urls
+                            from api.local_research import cninfo_announcements
+
+                            official_data = await asyncio.to_thread(cninfo_announcements, stock_code, limit)
+                            rows = merge_official_announcement_urls(rows, official_data.get("announcements", []))
+                        except Exception as link_exc:
+                            logger.info("CNINFO URL enrichment unavailable for %s: %s", stock_code, type(link_exc).__name__)
                     payload = {
                         "symbol": stock_code,
                         "market": "CN",

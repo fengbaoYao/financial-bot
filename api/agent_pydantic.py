@@ -1148,9 +1148,18 @@ def work_plan_tools_for_request(deps: AgentDeps, available_tools: set[str]) -> s
         return set(available_tools)
     attempted = {str(item.get("tool") or "") for item in deps.tool_results}
 
+    # Batching exposes whole plan steps at once, which also widened access to
+    # the plan's optional web tools. Batching must not become a way to spend the
+    # slow public-web path on a question that did not ask for it.
+    from api.comparison_research import brief_needs_web_search
+
+    skip_web = not brief_needs_web_search(deps.user_query)
+
     def planned_for(step) -> list[str]:
         return [tool for tool in (step.tools or step.validation.tools)
-                if tool in available_tools and tool != "ifind_smart_query"]
+                if tool in available_tools
+                and tool != "ifind_smart_query"
+                and not (skip_web and tool in {"web_search", "read_public_source"})]
 
     # A pending resolve step is a hard barrier: the code it returns is an input
     # to everything else.

@@ -15,6 +15,7 @@ def _deps(steps, attempted=()):
         bot_prompt=None,
         research_plan=SimpleNamespace(steps=steps),
         tool_results=[{"tool": name} for name in attempted],
+        user_query="分析一下贵州茅台的财报",
     )
 
 
@@ -66,3 +67,28 @@ def test_bot_conversations_are_not_gated():
     deps = _deps([_step("resolve", ["search_stocks"])])
     deps.bot_prompt = "system"
     assert work_plan_tools_for_request(deps, AVAILABLE) == AVAILABLE
+
+
+def test_batching_does_not_smuggle_in_web_search():
+    """Exposing whole steps must not make the slow web path available by default."""
+    tools = {"search_stocks", "get_financial_statements", "web_search",
+             "read_public_source", "list_hotspots"}
+    deps = _deps([
+        _step("resolve", ["search_stocks"]),
+        _step("market", ["get_financial_statements", "web_search", "read_public_source", "list_hotspots"]),
+    ], attempted={"search_stocks"})
+    deps.user_query = "分析一下贵州茅台的财报"
+    exposed = work_plan_tools_for_request(deps, tools)
+    assert "web_search" not in exposed
+    assert "read_public_source" not in exposed
+    assert "get_financial_statements" in exposed
+
+
+def test_batching_keeps_web_search_when_user_asked_for_it():
+    tools = {"search_stocks", "get_financial_statements", "web_search"}
+    deps = _deps([
+        _step("resolve", ["search_stocks"]),
+        _step("market", ["get_financial_statements", "web_search"]),
+    ], attempted={"search_stocks"})
+    deps.user_query = "联网搜一下这家公司的最新报道"
+    assert "web_search" in work_plan_tools_for_request(deps, tools)

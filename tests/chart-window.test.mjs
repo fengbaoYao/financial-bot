@@ -44,3 +44,21 @@ test("large research selections bound model context and retain endpoints and ext
   assert.ok(result.includes(large[571])); assert.ok(result.includes(large[817]));
   assert.equal(sampleChartBars(data), data);
 });
+
+test("a preset window covers the whole requested month span, not the current month", () => {
+  // ISO dates are 1-based months while Date.UTC is 0-based. Off by one there made
+  // "1 month" resolve to the 1st of the *current* month, so a mid-November series
+  // showed ten days of November instead of a month of data.
+  const daily = [];
+  for (let day = 1; day <= 28; day++) daily.push(bar(`2026-10-${String(day).padStart(2, "0")}`));
+  for (let day = 1; day <= 12; day++) daily.push(bar(`2026-11-${String(day).padStart(2, "0")}`));
+
+  const window = presetChartWindow(daily, 1);
+  const first = daily[window.from].date;
+  assert.equal(first, "2026-10-01", "1 month from 2026-11-12 must start in October");
+  assert.equal(daily[window.to].date, "2026-11-12");
+
+  // The cutoff must cross the year boundary too.
+  const spring = [bar("2025-12-15"), bar("2026-01-05"), bar("2026-01-20")];
+  assert.equal(spring[presetChartWindow(spring, 1).from].date, "2025-12-15");
+});

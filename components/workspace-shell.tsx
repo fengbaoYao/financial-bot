@@ -1576,7 +1576,9 @@ function filterChartRange(series: ChartPoint[], range: string) {
   const monthCount = CHART_RANGE_MONTHS[range] ?? 12;
   const [year, month] = (series.at(-1)?.date.slice(0, 7) ?? "").split("-").map(Number);
   if (!year || !month) return series;
-  const cutoff = new Date(Date.UTC(year, month - monthCount, 1)).toISOString().slice(0, 10);
+  // ISO month is 1-based, Date.UTC is 0-based; the extra -1 keeps "1 month"
+  // an actual month instead of silently becoming the current month only.
+  const cutoff = new Date(Date.UTC(year, month - 1 - monthCount, 1)).toISOString().slice(0, 10);
   return series.filter(point => point.date.slice(0, 10) >= cutoff);
 }
 

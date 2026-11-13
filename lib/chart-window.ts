@@ -38,7 +38,9 @@ export function moveChartWindow(range: ChartWindow, delta: number, count: number
 export function presetChartWindow(data: ChartBar[], months: number | null): ChartWindow {
   if (months === null || !data.length) return clampChartWindow({ from: 0, to: data.length - 1 }, data.length);
   const [year, month] = data.at(-1)!.date.split("-").map(Number);
-  const cutoff = new Date(Date.UTC(year, month - months, 1)).toISOString().slice(0, 10);
+  // `month` is 1-based from the ISO date, `Date.UTC` expects 0-based, so the
+  // offset needs the extra -1. Without it every preset is one month short.
+  const cutoff = new Date(Date.UTC(year, month - 1 - months, 1)).toISOString().slice(0, 10);
   const from = Math.max(0, data.findIndex(point => point.date >= cutoff));
   return clampChartWindow({ from, to: data.length - 1 }, data.length);
 }

@@ -316,7 +316,7 @@ FRONTEND_AGENT_PROMPT = """你是 Financial-Bot，交互风格对标 GrokBot。
 5. 金融红线：绝不代为下单、确认风险、签署协议，不提供投资建议。
    - 但免责声明只能放在回答的最后一句，简短一句即可；不要用免责声明开头，不要每段都加，更不能用“不构成投资建议”代替回答。
    - 正确顺序：先直接回答用户的问题 → 给依据与数据 → 最后一句说明不构成投资建议。
-6. 多轮分步交互，等用户确认指令再往下走，不要一次性跑完全部流程。
+6. 只有涉及账号、资金、风控、人机验证或不可逆操作时，才分步等待用户确认。只读研究类问题不要这样：该查的证据一次性并行取完，直接给结论，不要让用户等好几轮。
 7. 记忆当前任务节点与已完成事项；用户刷新或追问时先恢复进度，再继续下一步。
 8. 接口超时或账户异常时，先给结论，再给两个重试/检查方案，不假装成功。
 """
@@ -348,6 +348,9 @@ SYSTEM_PROMPT = FRONTEND_AGENT_PROMPT + """你是 Financial Bot 股票研究助�
 - 多标的对比、纯宏观/热点、个人持仓或记忆写入、以及明确技术信号类问题，按原有分流；不要把个人持仓或账户信息发给同花顺。
 
 ## 工具使用策略（智能、少而准）
+- 【同一轮批量调用】目标股票已核验后，把这一轮需要的所有独立工具（财报、估值、一致预期、公告、新闻等）在**同一次回复里一起发出**，不要一个一个试。并行调用比串行快数倍，用户体验差别很大。
+- 只有后一个工具的参数依赖前一个工具的结果时（例如必须先 search_stocks 才知道代码），才分轮调用；其余情况一律并成一批。
+- 不要“先拿一个结果看看再决定”，这类试探会让用户多等好几轮。
 - 只有在需要数据时才调用工具；避免为了“看起来更全”而把所有工具都跑一遍。
 - 先判断用户真正要的动作，再选择最少的工具；不要因为提到了股票就默认调用 get_stock_analysis。
 - 涉及具体股票名称或代码时，先调用 search_stocks 核验目标；模型记忆不能覆盖工具返回的数据。
@@ -1391,7 +1394,11 @@ def create_agent(
         model_settings={"max_tokens": 2500},
         tool_timeout=45,
         capabilities=[ResearchCapability(), PrepareTools(_prepare_bot_tools)],
-        end_strategy="early",
+        # `early` runs function tools only after every output tool fails, and never
+        # alongside a successful output, which serialises evidence collection into
+        # one round trip per tool. `graceful` runs function tools in parallel within
+        # each segment, so a brief's independent sources land together.
+        end_strategy="graceful",
     )
 
     async def run_evidence_review(ctx, prompt, settings):

@@ -1424,7 +1424,11 @@ def create_agent(
         deps_type=AgentDeps,
         output_type=AgentOutput,
         system_prompt=SYSTEM_PROMPT,
-        retries={"tools": 1, "output": 2},
+        # DeepSeek frequently answers in prose instead of emitting the final_result
+        # tool call. One corrective retry is worth keeping; a second just repeats a
+        # request the model has already failed twice, and the text fallback below
+        # already preserves a usable answer.
+        retries={"tools": 1, "output": 1},
         model_settings={"max_tokens": 2500},
         tool_timeout=45,
         capabilities=[ResearchCapability(), PrepareTools(_prepare_bot_tools)],
@@ -3732,8 +3736,13 @@ def _text_output_fallback(deps: AgentDeps, text: str) -> AgentResponse | None:
     response = build_agent_response(output, deps.tool_results, deps.language, deps.user_query)
     mark_deep_review_incomplete(response, deps)
     meta = response.payload.setdefault("_meta", {})
+    # Only the *structure* failed, not the research. When the streamed text is a
+    # real answer built on tool evidence, marking it "synthesis incomplete" made
+    # the caller run the whole agent a second time just to re-derive the same
+    # prose. Recovery is reserved for text that carries no finding yet.
+    substantive = bool(cleaned) and not is_plan_only_answer(cleaned, deps.tool_results)
     meta.update({
-        "synthesis_incomplete": True,
+        "synthesis_incomplete": not substantive,
         "failure_type": "UnexpectedModelBehavior",
         "output_fallback": "text",
         "structured_output_validated": False,
@@ -4289,7 +4298,12 @@ async def run_agent_async(
             # The iFinD prefetch and the investor-brief preload are independent
             # network reads; awaiting them one after the other made every brief
             # pay both latencies in series.
-            want_ifind = not deps.evidence_review_only and not deps.plan_before_research
+            # Plan mode excludes `ifind_smart_query` from its tool allow-list
+            # (it can route to unrelated endpoints), so without the prefetch a
+            # planned Work request had no iFinD access at all and fell back to
+            # slower sources. The prefetch is a single bounded read, so it runs
+            # in both modes.
+            want_ifind = not deps.evidence_review_only
             want_brief = is_first_pass_investor_brief(deps.user_query) and not deps.evidence_review_only
             ifind_context, brief_records = await asyncio.gather(
                 prefetch_ifind_skill(deps) if want_ifind else _no_value(),

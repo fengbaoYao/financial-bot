@@ -47,8 +47,26 @@ def brief_needs_quote(query: str) -> bool:
     return bool(re.search(r"stock price|share price|quote|price performance|stock performance|returns?|股价|行情|涨跌|收益率", query, re.I))
 
 
+# The public web is the slow path: a single search plus a source read can take
+# tens of seconds. Structured providers (iFinD, Fuyao, SEC, the news feeds) cover
+# quotes, filings, fundamentals and announcements, so web search is only required
+# when the user asked for it or the question depends on outside material.
+_WEB_SEARCH_REQUEST = re.compile(
+    r"联网|上网|搜一下|搜索一下|查一下|查资料|外部资料|公开资料|官网|政策原文|监管|研报|第三方|\.com|\.cn|\.gov\b|"
+    r"\b(?:web|online|internet|search|google|browse|website|official site|press release|policy text|regulator)\b",
+    re.IGNORECASE,
+)
+
+
+def brief_needs_web_search(query: str) -> bool:
+    """True only when the request explicitly depends on the open web."""
+    return bool(_WEB_SEARCH_REQUEST.search(query or ""))
+
+
 def investor_brief_tools(query: str, *, us_company: bool) -> list[str]:
-    tools = (["get_sec_company_data"] if us_company else []) + ["get_stock_news", "web_search"]
+    tools = (["get_sec_company_data"] if us_company else []) + ["get_stock_news"]
+    if brief_needs_web_search(query):
+        tools.append("web_search")
     if brief_needs_quote(query):
         tools.append("get_stock_analysis")
     return tools

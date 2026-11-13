@@ -625,16 +625,32 @@ button, input, textarea { font: inherit; }
   margin: 0 0 6px;
   font-size: 1rem;
 }
+/* The v2 welcome card centres its text; a bulleted list centred around a left
+   marker reads as ragged, so keep this block left-aligned and only inset. */
 .gpt-welcome-hints {
   margin: 12px 0 0;
-  padding-left: 18px;
+  padding: 0;
+  list-style: none;
   display: grid;
   gap: 6px;
+  max-width: 30rem;
+  margin-inline: auto;
+  text-align: left;
   color: var(--muted);
   font-size: 0.82rem;
   line-height: 1.55;
 }
-.gpt-welcome-hints li::marker { color: var(--accent); }
+.gpt-welcome-hints li { position: relative; padding-left: 16px; }
+.gpt-welcome-hints li::before {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 0.58em;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--accent);
+}
 .memory-panel {
   margin: 0 0 14px;
   padding: 13px 14px;

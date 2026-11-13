@@ -1762,13 +1762,8 @@ function ActivityCapsule({ msgs, zh }: { msgs: ChatMsg[]; zh: boolean }) {
   );
 }
 
-function LiveLine({ text, zh, startedAt }: { text: string; zh: boolean; startedAt?: number | null }) {
-  const [open, setOpen] = useState(false);
+function ComposerElapsed({ startedAt, zh }: { startedAt: number | null; zh: boolean }) {
   const [elapsed, setElapsed] = useState(0);
-  const display = localizeActivityPhrase(text, zh);
-  const long = display.length > 96;
-  // A first turn takes tens of seconds. Showing elapsed time (and a rough
-  // expectation) stops the wait from reading as a hang.
   useEffect(() => {
     if (!startedAt) return;
     const tick = () => setElapsed(Math.max(0, Math.round((Date.now() - startedAt) / 1000)));
@@ -1776,11 +1771,20 @@ function LiveLine({ text, zh, startedAt }: { text: string; zh: boolean; startedA
     const timer = window.setInterval(tick, 1000);
     return () => window.clearInterval(timer);
   }, [startedAt]);
-  const elapsedLabel = startedAt
-    ? elapsed < 20
-      ? (zh ? `${elapsed}s · 通常需要 20–40 秒` : `${elapsed}s · usually 20–40s`)
-      : (zh ? `${elapsed}s · 仍在处理，可继续等待或停止` : `${elapsed}s · still working — wait or stop`)
-    : null;
+  if (!startedAt || elapsed <= 0) return null;
+  return (
+    <span className={styles.composerElapsed} role="status" aria-live="off">
+      {elapsed < 20
+        ? (zh ? `${elapsed}s · 通常 20–40 秒` : `${elapsed}s · usually 20–40s`)
+        : (zh ? `${elapsed}s · 仍在处理` : `${elapsed}s · still working`)}
+    </span>
+  );
+}
+
+function LiveLine({ text, zh }: { text: string; zh: boolean }) {
+  const [open, setOpen] = useState(false);
+  const display = localizeActivityPhrase(text, zh);
+  const long = display.length > 96;
   return (
     <div className={styles.liveStatus} data-open={open ? "true" : "false"} data-tone="think" role="status" aria-live="polite">
       <span className={styles.livePlane} aria-hidden="true">
@@ -1790,7 +1794,6 @@ function LiveLine({ text, zh, startedAt }: { text: string; zh: boolean; startedA
         </svg>
       </span>
       <span className={styles.liveText}>{display}</span>
-      {elapsedLabel ? <span className={styles.liveElapsed}>{elapsedLabel}</span> : null}
       {long ? (
         <button type="button" className={styles.textButton} aria-expanded={open} onClick={() => setOpen((v) => !v)}>
           {open ? (zh ? "收起" : "Hide") : (zh ? "展开" : "Show")}
@@ -5006,7 +5009,7 @@ if (kind === "turn") {
                         </div>
                       );
                     })}
-                    {liveText ? <LiveLine text={liveText} zh={zh} startedAt={turnStartedAt} /> : null}
+                    {liveText ? <LiveLine text={liveText} zh={zh} /> : null}
                   </>
                 );
               })()}
@@ -5112,6 +5115,10 @@ if (kind === "turn") {
                 }
               />
               <div className={styles.composerPillActions}>
+                {/* The status line above is cleared whenever it is only generic
+                    "thinking", so elapsed time lives here: the composer always
+                    renders this while a turn runs. */}
+                {streaming ? <ComposerElapsed startedAt={turnStartedAt} zh={zh} /> : null}
                 {streaming ? (
                   <button type="button" className={styles.stopBtn} onClick={onStop}>
                     {zh ? "停止" : "Stop"}

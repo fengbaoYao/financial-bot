@@ -1151,9 +1151,16 @@ def work_plan_tools_for_request(deps: AgentDeps, available_tools: set[str]) -> s
     # Batching exposes whole plan steps at once, which also widened access to
     # the plan's optional web tools. Batching must not become a way to spend the
     # slow public-web path on a question that did not ask for it.
-    from api.comparison_research import brief_needs_web_search
+    from api.comparison_research import brief_needs_web_search, is_company_news_query
 
     skip_web = not brief_needs_web_search(deps.user_query)
+
+    # The planner emits a full research plan even for a plain "what's the latest
+    # news on X" lookup, and batching then spends every one of those tools at
+    # once. A news-only request needs the identity check and the news step; the
+    # rest of the plan is answering a question nobody asked.
+    news_only = is_company_news_query(deps.user_query, verified_identity=True)
+    news_only_kinds = {"news"}
 
     def planned_for(step) -> list[str]:
         return [tool for tool in (step.tools or step.validation.tools)
@@ -1174,6 +1181,8 @@ def work_plan_tools_for_request(deps: AgentDeps, available_tools: set[str]) -> s
     batch: set[str] = set()
     for step in deps.research_plan.steps:
         if step.kind == "synthesis":
+            continue
+        if news_only and step.kind != "resolve" and step.kind not in news_only_kinds:
             continue
         if step.kind not in _PARALLEL_SAFE_STEP_KINDS:
             # An unknown step kind keeps the old one-step-at-a-time behaviour so

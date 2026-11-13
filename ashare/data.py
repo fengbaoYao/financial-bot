@@ -4,6 +4,8 @@
 提供统一的股票数据获取接口，支持多种数据源
 """
 
+import threading
+
 import pandas as pd
 from typing import Any, Dict, List, Optional
 from ashare.logging import get_logger
@@ -80,13 +82,34 @@ class DataFetcher:
         self.adjustment_by_code: Dict[str, str] = {}
         self.stale_by_code: Dict[str, bool] = {}
         self.data_as_of_by_code: Dict[str, str] = {}
+        # Provenance of the fetch currently in flight. `_mark_source` writes it
+        # without knowing the code, so it is only ever consumed immediately by
+        # the same synchronous fetch (see `_take_pending_source`). It is never
+        # read for another symbol: concurrent or sequential fetches of different
+        # tickers must not inherit each other's provider label.
         self._last_fetch_source: Optional[str] = None
         self._last_fetch_adjustment: Optional[str] = None
+        # Serialises "run the provider chain, then attribute its provenance".
+        # Re-entrant so a nested fetch on the same instance cannot deadlock.
+        self._fetch_provenance_lock = threading.RLock()
         logger.info(f"数据获取器已初始化，默认获取{default_count}条数据")
 
     def _mark_source(self, source: str, adjustment: str = "unknown") -> None:
         self._last_fetch_source = source
         self._last_fetch_adjustment = adjustment
+
+    def _take_pending_source(self, fallback: str = "unknown") -> tuple[str, str]:
+        """Consume the provenance of the fetch that just finished.
+
+        The pending label is cleared on read so a later symbol can never inherit
+        it, and an unlabelled fetch is reported as ``unknown`` instead of being
+        attributed to whatever provider ran last.
+        """
+        source = self._last_fetch_source or fallback
+        adjustment = self._last_fetch_adjustment or "unknown"
+        self._last_fetch_source = None
+        self._last_fetch_adjustment = None
+        return source, adjustment
 
     def provider_info(self, code: str) -> Dict[str, str]:
         normalized = normalize_stock_code(code)
@@ -337,7 +360,15 @@ class DataFetcher:
             health.record_failure("ashare", "a_share_history", "empty")
         return None
 
-    def _remember_last_good(self, code: str, frequency: str, frame: pd.DataFrame) -> None:
+    def _remember_last_good(
+        self,
+        code: str,
+        frequency: str,
+        frame: pd.DataFrame,
+        *,
+        source: Optional[str] = None,
+        adjustment: Optional[str] = None,
+    ) -> None:
         try:
             from api.datasources.last_good import put
 
@@ -355,8 +386,8 @@ class DataFetcher:
                 "price_history",
                 f"{code}:{frequency}",
                 {"bars": bars},
-                provider=self._last_fetch_source or "unknown",
-                adjustment=self._last_fetch_adjustment or "unknown",
+                provider=source or "unknown",
+                adjustment=adjustment or "unknown",
                 data_as_of=bars[-1]["date"] if bars else None,
             )
         except Exception:
@@ -402,6 +433,58 @@ class DataFetcher:
             logger.debug("last-good cache read skipped for %s", code, exc_info=True)
             return None
 
+    def _fetch_via_provider_chain(self, code: str, count: int, frequency: str) -> Optional[pd.DataFrame]:
+        """Run the per-market provider chain and return its raw frame.
+
+        Callers must hold ``_fetch_provenance_lock`` so the provider label this
+        chain writes is attributed to this symbol only.
+        """
+        if is_hk_index(code):
+            df = self._fetch_stock_data_hk_index(code, count, frequency)
+        elif is_hk_stock(code):
+            df = self._fetch_stock_data_ifind(code, count, frequency)
+            if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+                df = self._fetch_stock_data_hk(code, count, frequency)
+        elif is_us_stock(code):
+            # 美股走独立链路：yfinance 主源，Finnhub 备选
+            df = self._fetch_stock_data_us(code, count, frequency)
+        else:
+            df = self._fetch_stock_data_ifind(code, count, frequency)
+            if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+                df = self._fetch_a_share_fuyao(code, count, frequency)
+            # When iFinD 历史数据 is exhausted, Sina/Tencent often stall; prefer
+            # akshare/yfinance before the legacy Ashare HTTP paths.
+            prefer_alt = False
+            try:
+                from api.datasources.flags import ifind_history_enabled
+                from api.datasources.ifind_provider import history_quota_exhausted
+                prefer_alt = (not ifind_history_enabled()) or history_quota_exhausted()
+            except Exception:
+                prefer_alt = False
+            if prefer_alt:
+                if (df is None or (isinstance(df, pd.DataFrame) and df.empty)) and frequency == "1d":
+                    df = self._fetch_stock_data_akshare(code, count)
+                if (df is None or (isinstance(df, pd.DataFrame) and df.empty)) and frequency == "1d":
+                    try:
+                        from api.datasources.flags import yfinance_a_share_fallback
+                        if yfinance_a_share_fallback():
+                            df = self._fetch_stock_data_yfinance_adapter(code, count, frequency, auto_adjust=False)
+                    except Exception:
+                        logger.debug("A-share yfinance fallback failed for %s", code, exc_info=True)
+            if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+                df = self._fetch_a_share(code, count, frequency)
+            if (df is None or (isinstance(df, pd.DataFrame) and df.empty)) and frequency == "1d" and not prefer_alt:
+                df = self._fetch_stock_data_akshare(code, count)
+            if (df is None or (isinstance(df, pd.DataFrame) and df.empty)) and frequency == "1d" and not prefer_alt:
+                try:
+                    from api.datasources.flags import yfinance_a_share_fallback
+
+                    if yfinance_a_share_fallback():
+                        df = self._fetch_stock_data_yfinance_adapter(code, count, frequency, auto_adjust=False)
+                except Exception:
+                    logger.debug("A-share yfinance fallback failed for %s", code, exc_info=True)
+        return df
+
     def fetch_stock_data(self, code: str, count: Optional[int] = None, 
                         frequency: str = '1d') -> Optional[pd.DataFrame]:
         """
@@ -427,53 +510,11 @@ class DataFetcher:
         try:
             logger.info(f"正在获取股票 {code} 的数据...")
             df = None
-            self._last_fetch_source = None
-            self._last_fetch_adjustment = None
-            if is_hk_index(code):
-                df = self._fetch_stock_data_hk_index(code, count, frequency)
-            elif is_hk_stock(code):
-                df = self._fetch_stock_data_ifind(code, count, frequency)
-                if df is None or (isinstance(df, pd.DataFrame) and df.empty):
-                    df = self._fetch_stock_data_hk(code, count, frequency)
-            elif is_us_stock(code):
-                # 美股走独立链路：yfinance 主源，Finnhub 备选
-                df = self._fetch_stock_data_us(code, count, frequency)
-            else:
-                df = self._fetch_stock_data_ifind(code, count, frequency)
-                if df is None or (isinstance(df, pd.DataFrame) and df.empty):
-                    df = self._fetch_a_share_fuyao(code, count, frequency)
-                # When iFinD 历史数据 is exhausted, Sina/Tencent often stall; prefer
-                # akshare/yfinance before the legacy Ashare HTTP paths.
-                prefer_alt = False
-                try:
-                    from api.datasources.flags import ifind_history_enabled
-                    from api.datasources.ifind_provider import history_quota_exhausted
-                    prefer_alt = (not ifind_history_enabled()) or history_quota_exhausted()
-                except Exception:
-                    prefer_alt = False
-                if prefer_alt:
-                    if (df is None or (isinstance(df, pd.DataFrame) and df.empty)) and frequency == "1d":
-                        df = self._fetch_stock_data_akshare(code, count)
-                    if (df is None or (isinstance(df, pd.DataFrame) and df.empty)) and frequency == "1d":
-                        try:
-                            from api.datasources.flags import yfinance_a_share_fallback
-                            if yfinance_a_share_fallback():
-                                df = self._fetch_stock_data_yfinance_adapter(code, count, frequency, auto_adjust=False)
-                        except Exception:
-                            logger.debug("A-share yfinance fallback failed for %s", code, exc_info=True)
-                if df is None or (isinstance(df, pd.DataFrame) and df.empty):
-                    df = self._fetch_a_share(code, count, frequency)
-                if (df is None or (isinstance(df, pd.DataFrame) and df.empty)) and frequency == "1d" and not prefer_alt:
-                    df = self._fetch_stock_data_akshare(code, count)
-                if (df is None or (isinstance(df, pd.DataFrame) and df.empty)) and frequency == "1d" and not prefer_alt:
-                    try:
-                        from api.datasources.flags import yfinance_a_share_fallback
-
-                        if yfinance_a_share_fallback():
-                            df = self._fetch_stock_data_yfinance_adapter(code, count, frequency, auto_adjust=False)
-                    except Exception:
-                        logger.debug("A-share yfinance fallback failed for %s", code, exc_info=True)
-            
+            with self._fetch_provenance_lock:
+                self._last_fetch_source = None
+                self._last_fetch_adjustment = None
+                df = self._fetch_via_provider_chain(code, count, frequency)
+                source, adjustment = self._take_pending_source()
             # 检查数据是否有效
             if df is None or df.empty:
                 logger.warning(f"股票 {code} 返回空数据")
@@ -483,11 +524,11 @@ class DataFetcher:
                     return stale
                 self._log_stock_code_help(code)
                 return None
-            self.source_by_code[code] = self._last_fetch_source or "unknown"
-            self.adjustment_by_code[code] = self._last_fetch_adjustment or "unknown"
+            self.source_by_code[code] = source
+            self.adjustment_by_code[code] = adjustment
             self.stale_by_code[code] = False
             self.data_as_of_by_code[code] = str(df.index[-1])[:10] if len(df.index) else ""
-            self._remember_last_good(code, frequency, df)
+            self._remember_last_good(code, frequency, df, source=source, adjustment=adjustment)
             logger.info(f"成功获取 {code} 数据，共 {len(df)} 条记录")
             logger.info(f"数据时间范围: {df.index[0]} 到 {df.index[-1]}")
             

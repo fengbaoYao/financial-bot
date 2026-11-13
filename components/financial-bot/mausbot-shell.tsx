@@ -4613,6 +4613,14 @@ if (kind === "turn") {
                 {healthLabel}
               </span>
             </span>
+            <button
+              type="button"
+              className={styles.sidebarClose}
+              aria-label={zh ? "关闭话题侧栏" : "Close thread sidebar"}
+              onClick={() => { setNavOpen(false); setPanelOpen(false); }}
+            >
+              <span aria-hidden="true">✕</span>
+            </button>
           </div>
 
           <div className={styles.topActions}>

@@ -6272,6 +6272,23 @@ textarea.input {
   font-size: 0.66rem;
   font-weight: 750;
 }
+.workspace-project-composer { flex-wrap: wrap; }
+.workspace-project-error {
+  flex-basis: 100%;
+  margin: 2px 0 0;
+  color: #b4453a;
+  font-size: 0.66rem;
+  line-height: 1.4;
+}
+.stock-refresh-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.stock-refresh[disabled] { opacity: .6; cursor: progress; }
+.stock-refresh-status { color: var(--muted); font-size: .66rem; }
+.stock-chart-coverage {
+  margin: -12px 0 22px;
+  color: #a2601f;
+  font-size: .66rem;
+  line-height: 1.5;
+}
 .workspace-project-list {
   display: grid;
   gap: 2px;

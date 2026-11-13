@@ -121,6 +121,7 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
   const [activeProjectId, setActiveProjectId] = useState<string>("all");
   const [projectComposerOpen, setProjectComposerOpen] = useState(false);
   const [projectDraft, setProjectDraft] = useState("");
+  const [projectError, setProjectError] = useState("");
   const [sessionMenu, setSessionMenu] = useState<SessionContextMenu | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
   const [projectMenu, setProjectMenu] = useState<ProjectContextMenu | null>(null);
@@ -481,7 +482,11 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
   function createProject(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const name = projectDraft.trim();
-    if (!name) return;
+    if (!name) {
+      setProjectError(locale === "en" ? "Enter a project name to continue." : "请先填写项目名称。");
+      return;
+    }
+    setProjectError("");
     const project: WorkspaceProject = {
       id: `project-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
       name: name.slice(0, 48),
@@ -726,12 +731,14 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
                 <form className="workspace-project-composer" onSubmit={createProject}>
                   <input
                     value={projectDraft}
-                    onChange={(event) => setProjectDraft(event.target.value)}
+                    onChange={(event) => { setProjectDraft(event.target.value); if (projectError) setProjectError(""); }}
                     placeholder={t("例如：新能源产业链")}
                     aria-label={t("项目名称")}
+                    aria-invalid={projectError ? true : undefined}
                     autoFocus
                   />
                   <button type="submit">{t("建立")}</button>
+                  {projectError ? <p className="workspace-project-error" role="alert">{projectError}</p> : null}
                 </form>
               ) : null}
               {projects.length > 0 ? <div className="workspace-project-list" aria-label={t("项目筛选")}>
@@ -794,15 +801,15 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
                 {accountMenuOpen ? (
                   <div className="workspace-account-popover" role="dialog" aria-label={t("账户菜单")}>
                     <div className="workspace-account-popover-head">
-                      <span className="workspace-avatar workspace-avatar--large">P</span>
+                      <span className="workspace-avatar workspace-avatar--large">D</span>
                       <div className="workspace-account-copy">
-                        <strong>Peter</strong>
-                        <span>{t("个人研究空间")}</span>
+                        <strong>{locale === "en" ? "Shared demo" : "共享演示空间"}</strong>
+                        <span>{locale === "en" ? "No account isolation" : "未登录 · 无账号隔离"}</span>
                       </div>
                     </div>
                     <button type="button" className="workspace-account-settings" onClick={() => { setAccountMenuOpen(false); setSettingsOpen(true); }}>{locale === "en" ? "Settings" : "设置"}<span aria-hidden="true">↗</span></button>
                     <SupabaseAuthPanel placement="profile" onAuthChange={handleSupabaseAuth} />
-                    <p className="workspace-account-status">{cloudStatus === "connected" ? t("云端已连接") : cloudStatus === "syncing" ? t("同步中") : cloudStatus === "error" ? t("云端同步未完成") : t("本地模式")}</p>
+                    <p className="workspace-account-status">{cloudStatus === "connected" ? t("云端已连接") : cloudStatus === "syncing" ? t("同步中") : cloudStatus === "error" ? t("云端同步未完成") : (locale === "en" ? "Public demo · conversations are shared" : "公开演示 · 会话为共享数据")}</p>
                     {cloudError ? <p className="workspace-account-status">{t("使用本地记录")}</p> : null}
                     <p className="workspace-account-status">{creditBalance?.unlimited ? t("本地模式 · Credits 不限") : `${creditBalance?.balance ?? "—"} Credits`}</p>
                   </div>
@@ -815,10 +822,10 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
                   onClick={() => setAccountMenuOpen((open) => !open)}
                 >
                   <span className="workspace-account-card">
-                    <span className="workspace-avatar">P</span>
+                    <span className="workspace-avatar">D</span>
                     <span className="workspace-account-copy">
-                      <strong>Peter</strong>
-                      <span>{t("个人研究空间")}</span>
+                      <strong>{locale === "en" ? "Shared demo" : "共享演示空间"}</strong>
+                      <span>{locale === "en" ? "No account isolation" : "未登录 · 无账号隔离"}</span>
                     </span>
                   </span>
                   <span className="workspace-account-menu-icon" aria-hidden="true">
@@ -1004,6 +1011,7 @@ function ResearchContextPanel({
   const [globalNews, setGlobalNews] = useState<GlobalNewsItem[]>([]);
   const [portfolio, setPortfolio] = useState<PortfolioAnalysisResponse | null>(null);
   const [error, setError] = useState("");
+  const [stockLoadedAt, setStockLoadedAt] = useState<string | null>(null);
   const { preferences, updatePreferences } = useWorkspacePreferences();
   const marketScope = preferences.market;
   const hasGeneralMarketFeed = globalNews.some(item => item.raw_payload?.general_feed_available === true);
@@ -1083,6 +1091,7 @@ function ResearchContextPanel({
             setStock(analysis);
             setResolvedStockName(isUnknownStockName(analysis.stock_name) ? null : analysis.stock_name);
             setNews(relatedNews);
+            setStockLoadedAt(new Date().toLocaleTimeString(locale === "en" ? "en-US" : "zh-CN", { hour12: false }));
           }
         } else if (context.type === "topic" && context.entityId) {
           const detail = await getHotspotDetail(context.entityId);
@@ -1200,7 +1209,7 @@ function ResearchContextPanel({
         <div className="research-empty-state"><h3>{locale === "en" ? "Choose a stock to research" : "选择一只股票开始研究"}</h3><p>{locale === "en" ? "Select a saved stock or search for a ticker in the left panel." : "请从左侧自选股中选择，或搜索代码后添加。"}</p></div>
       ) : null}
       {!loading && !error && context?.type === "stock" && context.entityId ? (
-        <StockContext analysis={stock} news={news} fallback={payloadToStock(context.payload)} displayName={contextStockName ?? undefined} onSelectStock={onSelectStock} range={chartRange} onRangeChange={setChartRange} watched={watchlist.some(item => item.code.toUpperCase() === contextStockCode?.toUpperCase())} watchlistBusy={watchlistBusy} watchlistError={watchlistError} onToggleWatch={onToggleWatch} />
+        <StockContext analysis={stock} news={news} fallback={payloadToStock(context.payload)} displayName={contextStockName ?? undefined} onSelectStock={onSelectStock} range={chartRange} onRangeChange={setChartRange} watched={watchlist.some(item => item.code.toUpperCase() === contextStockCode?.toUpperCase())} watchlistBusy={watchlistBusy} onToggleWatch={onToggleWatch} loading={loading} loadedAt={stockLoadedAt} />
       ) : null}
       {!loading && !error && context?.type === "topic" ? <TopicContext detail={hotspot} /> : null}
       {!loading && !error && context?.type === "market" ? <MarketContext market={market} /> : null}
@@ -1232,7 +1241,7 @@ function StockContext({
   onSelectStock,
   range,
   onRangeChange,
-  watched, watchlistBusy, watchlistError, onToggleWatch,
+  watched, watchlistBusy, onToggleWatch, loading, loadedAt,
 }: {
   analysis: StockAnalysisResponse | null;
   news: NewsItem[];
@@ -1243,8 +1252,9 @@ function StockContext({
   onRangeChange: (range: string) => void;
   watched: boolean;
   watchlistBusy: boolean;
-  watchlistError: string;
   onToggleWatch: (code: string) => Promise<void>;
+  loading: boolean;
+  loadedAt: string | null;
 }) {
   const { t, locale } = useLanguage();
   const [chartExpanded, setChartExpanded] = useState(false);
@@ -1315,6 +1325,7 @@ function StockContext({
   const asOf = String(data.metadata?.data_as_of ?? series.at(-1)?.date ?? (locale === "en" ? "Date unknown" : "日期未知"));
   const quoteProvider = typeof data.metadata?.quote_provider === "string" ? data.metadata.quote_provider : null;
   const chartData = filterChartRange(series, range);
+  const rangeCoverage = chartRangeCoverage(chartData, range);
   const chartName = displayName ?? data.stock_name;
 
   function showExpandedChart() {
@@ -1376,7 +1387,6 @@ function StockContext({
           <div className={`research-change ${direction}`}>{data.quote.change_pct >= 0 ? "+" : ""}{data.quote.change_pct.toFixed(2)}%</div>
         </div>
         <div className="stock-quote-caption"><button type="button" className="stock-watch-button" disabled={watchlistBusy} aria-pressed={watched} aria-label={watched ? (locale === "en" ? "Remove from watchlist" : "移出自选股") : (locale === "en" ? "Add to watchlist" : "加入自选股")} onClick={() => { void onToggleWatch(data.stock_code); }}><span aria-hidden="true">{watched ? "★" : "☆"}</span>{watched ? (locale === "en" ? "Watching" : "已关注") : (locale === "en" ? "Watch" : "关注")}</button><span>{quoteProvider ? (locale === "en" ? `Delayed snapshot · ${quoteProvider}` : `延迟快照 · ${quoteProvider}`) : (locale === "en" ? "Delayed daily data" : "延迟日线")} · {asOf}</span></div>
-        {watchlistError ? <p className="stock-watch-error" role="alert">{watchlistError}</p> : null}
       </div>
       {series.length ? <section className="stock-chart-surface" aria-label={locale === "en" ? "Price chart" : "价格图表"}>
         <div className="stock-chart-toolbar">
@@ -1385,6 +1395,7 @@ function StockContext({
         </div>
         <CandlestickChart data={series} height={260} surface chartType={chartType} onReady={handlePreviewChartReady} />
         <div className="stock-chart-caption"><span>{previewDates?.from ?? chartData[0]?.date.slice(0, 10)} — {previewDates?.to ?? chartData.at(-1)?.date.slice(0, 10)}</span><span>{currency} · {locale === "en" ? "Daily" : "日线"}{typeof data.metadata?.source === "string" ? ` · ${data.metadata.source}` : ""}</span></div>
+        {rangeCoverage ? <p className="stock-chart-coverage" role="status">{locale === "en" ? `Source data covers only ${rangeCoverage.coveredDays} days of this range, not a full ${rangeCoverage.requestedDays} days.` : `数据源在该区间只覆盖 ${rangeCoverage.coveredDays} 天，不足完整的 ${rangeCoverage.requestedDays} 天。`}</p> : null}
       </section> : <p className="research-muted">{locale === "en" ? "Price history unavailable." : "历史价格暂不可用。"}</p>}
       {chartExpanded && series.length ? createPortal(<div className="research-chart-overlay" role="dialog" aria-modal="true" aria-label={`${chartName} · ${t("K 线")}`} onClick={event => { if (event.target === event.currentTarget) setChartExpanded(false); }}>
         <div ref={chartDialogRef} className="research-chart-dialog">
@@ -1417,7 +1428,10 @@ function StockContext({
       {!!data.technical_commentary?.length && <section className="stock-observations"><h3>{t("技术观察")}</h3>{data.technical_commentary.slice(0, 2).map(item => <p key={item}>{item}</p>)}</section>}
       <section className="stock-news"><h3>{locale === "en" ? "News & market context" : "新闻与市场背景"}</h3>{news.slice(0, 3).map(item => <article className="research-news-item" key={item.id}><SourceHeadline title={item.title} url={item.url}/><span>{item.source} · {item.published_at.slice(0, 10)}</span>{item.relation_type !== "direct" ? <small>{locale === "en" ? "Market context · company link unconfirmed" : "市场背景 · 公司关联未确认"}</small> : null}</article>)}{!news.length ? <p className="research-muted">{t("暂无相关新闻")}</p> : null}</section>
       <details className="stock-data-disclosure"><summary>{locale === "en" ? "Data & sources" : "数据与来源"}<span>{String(data.metadata?.source ?? "—")}</span></summary><div className="stock-source-meta"><span>{locale === "en" ? "Quote date" : "快照日期"}: {asOf}</span><span>{locale === "en" ? "Retrieved" : "获取时间"}: {String(data.metadata?.generated_at ?? "—")}</span><p>{locale === "en" ? "Historical / delayed prices. Retrieval time is not the exchange quote time. Indicators describe the full available daily series." : "历史／延迟价格；获取时间并非交易所报价时间。指标使用完整的可用日线数据。"}{quoteProvider ? (locale === "en" ? " The quote snapshot and daily history may come from different sources and times." : " 快照与日线可能来自不同来源、时间，成交量不宜直接对比。") : ""}</p></div>{series.length ? <table className="stock-data-table"><caption>{locale === "en" ? "Latest available trading days" : "最近可用交易日"}</caption><thead><tr><th>{locale === "en" ? "Date" : "日期"}</th><th>{locale === "en" ? "Close" : "收盘"} · {currency}</th><th>{locale === "en" ? "Volume" : "成交量"}</th></tr></thead><tbody>{series.slice(-5).reverse().map(point => <tr key={point.date}><td>{point.date.slice(0, 10)}</td><td>{point.close?.toFixed(2) ?? "—"}</td><td>{point.volume == null ? "—" : formatQuantity(point.volume, locale)}</td></tr>)}</tbody></table> : null}</details>
-      <button className="stock-refresh" type="button" onClick={() => onSelectStock(data.stock_code, data.stock_name)}>{locale === "en" ? "Refresh data" : "刷新数据"}<span aria-hidden="true">↻</span></button>
+      <div className="stock-refresh-row">
+        <button className="stock-refresh" type="button" disabled={loading} aria-busy={loading} onClick={() => onSelectStock(data.stock_code, data.stock_name)}>{loading ? (locale === "en" ? "Refreshing…" : "正在刷新…") : (locale === "en" ? "Refresh data" : "刷新数据")}<span aria-hidden="true">↻</span></button>
+        <span className="stock-refresh-status" role="status">{loading ? (locale === "en" ? "Fetching latest data…" : "正在获取最新数据…") : loadedAt ? (locale === "en" ? `Loaded ${loadedAt}` : `已更新 ${loadedAt}`) : ""}</span>
+      </div>
     </div>
   );
 }
@@ -1555,13 +1569,34 @@ function isUnknownStockName(value: string) {
   return /^未知股票(?:\s*[（(]|$)/.test(value.trim()) || /^unknown stock(?:\s*[(]|$)/i.test(value.trim());
 }
 
+const CHART_RANGE_MONTHS: Record<string, number> = { "1M": 1, "3M": 3, "6M": 6, "1Y": 12 };
+
 function filterChartRange(series: ChartPoint[], range: string) {
   if (range === "ALL" || !series.length) return series;
-  const monthCount = ({ "1M": 1, "3M": 3, "6M": 6, "1Y": 12 } as Record<string, number>)[range] ?? 12;
+  const monthCount = CHART_RANGE_MONTHS[range] ?? 12;
   const [year, month] = (series.at(-1)?.date.slice(0, 7) ?? "").split("-").map(Number);
   if (!year || !month) return series;
   const cutoff = new Date(Date.UTC(year, month - monthCount, 1)).toISOString().slice(0, 10);
   return series.filter(point => point.date.slice(0, 10) >= cutoff);
+}
+
+/**
+ * How much of the requested window the source actually covers.
+ *
+ * A provider can return fewer bars than the label promises (quota-limited
+ * history, a recently listed symbol, a suspended stock). Showing "1月" over ten
+ * days of data silently misstates the evidence, so the caller must say so.
+ */
+function chartRangeCoverage(series: ChartPoint[], range: string) {
+  const months = CHART_RANGE_MONTHS[range];
+  if (!months || series.length < 2) return null;
+  const requestedDays = months * 30.4;
+  const first = Date.parse(series[0].date.slice(0, 10));
+  const last = Date.parse(series.at(-1)!.date.slice(0, 10));
+  if (!Number.isFinite(first) || !Number.isFinite(last) || last <= first) return null;
+  const coveredDays = (last - first) / 86_400_000;
+  // Allow weekends/holidays: only flag a window that is materially short.
+  return coveredDays < requestedDays * 0.6 ? { coveredDays: Math.round(coveredDays), requestedDays: Math.round(requestedDays) } : null;
 }
 
 function buildChartSegmentContext(company: string, symbol: string, segment: ChartSegment, locale: "en" | "zh") {

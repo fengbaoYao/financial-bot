@@ -248,3 +248,30 @@ def test_a_share_falls_back_to_yfinance_after_existing_paths(monkeypatch):
         "provider": "yfinance_adapter(600519.SS)",
         "adjustment": "none",
     }
+
+
+def test_provider_label_is_cleared_after_each_fetch(monkeypatch):
+    """Provenance must be consumed by the fetch that produced it.
+
+    `_last_fetch_source` was a sticky instance field: it was reset only at the
+    start of a fetch, so any code path that read provenance after an early
+    return (cache hit, restored last-good frame, raised provider) saw the label
+    of whichever provider had run last -- e.g. DIA reporting QQQ's provider.
+    """
+    fetcher = DataFetcher()
+    monkeypatch.setattr(data_module, "is_hk_index", lambda code: False)
+    monkeypatch.setattr(data_module, "is_hk_stock", lambda code: False)
+    monkeypatch.setattr(data_module, "is_us_stock", lambda code: True)
+
+    def fake_us(code, count, frequency):
+        fetcher._mark_source(f"yfinance({code.split('.')[-1]})", "auto_adjust")
+        return price_frame()
+
+    monkeypatch.setattr(fetcher, "_fetch_stock_data_us", fake_us)
+    assert fetcher.fetch_stock_data("us.qqq") is not None
+
+    # After the fetch is attributed, the pending label must be gone so the next
+    # symbol cannot inherit it.
+    assert fetcher._last_fetch_source is None
+    assert fetcher._last_fetch_adjustment is None
+    assert fetcher.provider_info("us.qqq")["provider"] == "yfinance(QQQ)"

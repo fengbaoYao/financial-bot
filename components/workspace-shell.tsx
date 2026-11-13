@@ -1372,15 +1372,19 @@ function StockContext({
     setAnnotationOpen(false);
     setChartExpanded(false);
   }
-  const metrics = [
+  // Two groups, not one flat 3x2 grid: session flow and technical indicators
+  // answer different questions, and equal weight made the panel read as a wall.
+  const sessionMetrics = [
     [locale === "en" ? "Volume · shares" : "成交量 · 股", formatQuantity(data.quote.volume, locale)],
     [t("振幅"), `${data.quote.amplitude_pct.toFixed(2)}%`],
+  ];
+  if (data.market !== "us") sessionMetrics[0][0] = locale === "en" ? "Volume · source units" : "成交量 · 来源单位";
+  const indicatorMetrics = [
     ["MA20", formatIndicatorValue(data.technical_indicators.MA20)],
     ["MACD", formatIndicatorValue(data.technical_indicators.MACD)],
     ["RSI (14)", formatIndicatorValue(data.technical_indicators.RSI)],
     ["MA60", formatIndicatorValue(data.technical_indicators.MA60)],
   ];
-  if (data.market !== "us") metrics[0][0] = locale === "en" ? "Volume · source units" : "成交量 · 来源单位";
   return (
     <div className="research-context-content stock-research-content">
       <div className="stock-quote-header">
@@ -1426,7 +1430,14 @@ function StockContext({
           </form> : null}
         </div>
       </div>, document.body) : null}
-      <dl className="stock-metrics">{metrics.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>
+      <div className="stock-metric-groups">
+        <dl className="stock-metrics stock-metrics-secondary" aria-label={locale === "en" ? "Session data" : "当日数据"}>
+          {sessionMetrics.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}
+        </dl>
+        <dl className="stock-metrics stock-metrics-primary" aria-label={locale === "en" ? "Technical indicators" : "技术指标"}>
+          {indicatorMetrics.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}
+        </dl>
+      </div>
       {!!data.technical_commentary?.length && <section className="stock-observations"><h3>{t("技术观察")}</h3>{data.technical_commentary.slice(0, 2).map(item => <p key={item}>{item}</p>)}</section>}
       <section className="stock-news"><h3>{locale === "en" ? "News & market context" : "新闻与市场背景"}</h3>{news.slice(0, 3).map(item => <article className="research-news-item" key={item.id}><SourceHeadline title={item.title} url={item.url}/><span>{item.source} · {item.published_at.slice(0, 10)}</span>{item.relation_type !== "direct" ? <small>{locale === "en" ? "Market context · company link unconfirmed" : "市场背景 · 公司关联未确认"}</small> : null}</article>)}{!news.length ? <p className="research-muted">{t("暂无相关新闻")}</p> : null}</section>
       <details className="stock-data-disclosure"><summary>{locale === "en" ? "Data & sources" : "数据与来源"}<span>{String(data.metadata?.source ?? "—")}</span></summary><div className="stock-source-meta"><span>{locale === "en" ? "Quote date" : "快照日期"}: {asOf}</span><span>{locale === "en" ? "Retrieved" : "获取时间"}: {String(data.metadata?.generated_at ?? "—")}</span><p>{locale === "en" ? "Historical / delayed prices. Retrieval time is not the exchange quote time. Indicators describe the full available daily series." : "历史／延迟价格；获取时间并非交易所报价时间。指标使用完整的可用日线数据。"}{quoteProvider ? (locale === "en" ? " The quote snapshot and daily history may come from different sources and times." : " 快照与日线可能来自不同来源、时间，成交量不宜直接对比。") : ""}</p></div>{series.length ? <table className="stock-data-table"><caption>{locale === "en" ? "Latest available trading days" : "最近可用交易日"}</caption><thead><tr><th>{locale === "en" ? "Date" : "日期"}</th><th>{locale === "en" ? "Close" : "收盘"} · {currency}</th><th>{locale === "en" ? "Volume" : "成交量"}</th></tr></thead><tbody>{series.slice(-5).reverse().map(point => <tr key={point.date}><td>{point.date.slice(0, 10)}</td><td>{point.close?.toFixed(2) ?? "—"}</td><td>{point.volume == null ? "—" : formatQuantity(point.volume, locale)}</td></tr>)}</tbody></table> : null}</details>

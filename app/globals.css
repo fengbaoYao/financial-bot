@@ -8123,9 +8123,15 @@ html[lang=en] .workspace-v2 .gpt-welcome-card h3 { font-family: Georgia, "Times 
 .stock-chart-view button { font-size: 1rem; padding: 3px 5px; }
 .stock-chart-surface .candlestick-wrap { min-height: 260px !important; border: 0; border-radius: 0; background: transparent; }
 .stock-chart-caption { display: flex; justify-content: space-between; gap: 10px; margin: 9px 0 22px; font-size: .65rem; color: var(--muted); }
-.stock-metrics { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); column-gap: 12px; row-gap: 17px; margin: 0; padding: 18px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.stock-metric-groups { display: grid; gap: 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.stock-metrics { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); column-gap: 12px; row-gap: 17px; margin: 0; padding: 16px 0; }
+/* Session flow is supporting context: smaller and quieter than the indicators. */
+.stock-metrics-secondary { grid-template-columns: repeat(2,minmax(0,1fr)); padding: 14px 0 12px; border-bottom: 1px dotted var(--line); }
+.stock-metrics-secondary dd { font-size: .82rem; font-weight: 500; color: var(--muted); }
+.stock-metrics-primary { padding: 14px 0 16px; }
 .stock-metrics dt { color: var(--muted); font-size: .69rem; margin-bottom: 5px; }
 .stock-metrics dd { margin: 0; font-family: var(--font-numeric); font-size: .93rem; font-weight: 600; }
+.stock-metrics-primary dd { font-size: 1rem; }
 .stock-observations, .stock-news { padding: 22px 0 0; }
 .stock-research-content h3 { font-size: .77rem; font-weight: 600; margin: 0 0 10px; }
 .stock-observations p { font-size: .76rem; line-height: 1.65; color: var(--muted); margin: 0 0 8px; }

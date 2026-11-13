@@ -871,6 +871,14 @@ export function AgentChat({
                 <span className="research-welcome-eyebrow">financial-work</span>
                 <h3>{locale === "en" ? "Hi, I'm financial-work." : "你好，我是 financial-work。"}</h3>
                 <p className="muted">{locale === "en" ? "Ask about global news, themes, stocks and your portfolio." : "可以直接问全球新闻、热点、个股和持仓。"}</p>
+                {/* An empty first screen gave no hint of what the desk can do,
+                    so state the three entry points instead of leaving blank space. */}
+                <ul className="gpt-welcome-hints">
+                  {(locale === "en"
+                    ? ["Pick a saved stock on the left to see its chart and indicators", "Ask a question to get a sourced answer", "Type a ticker to research something new"]
+                    : ["左侧选一只自选股，右侧直接看 K 线与指标", "直接提问，回答会标注数据来源与时间", "输入代码或公司名，研究新的标的"]
+                  ).map((hint) => <li key={hint}>{hint}</li>)}
+                </ul>
               </section>
             ) : null}
             <div className="chat-log chat-log-full">
@@ -945,9 +953,18 @@ export function AgentChat({
               rows={3}
             />
             <div className="gpt-input-meta">
-              <div className="research-mode-switch" role="group" aria-label={locale === "en" ? "Research depth" : "研究深度"}>
-                <button type="button" aria-pressed={researchMode === "quick"} onClick={() => setResearchMode("quick")} disabled={busy}>{locale === "en" ? "Quick" : "快速"}</button>
-                <button type="button" aria-pressed={researchMode === "deep"} onClick={() => setResearchMode("deep")} disabled={busy || !deepResearchAvailable} title={!deepResearchAvailable ? (locale === "en" ? "Unavailable — use Quick research" : "暂不可用，请改用快速研究") : undefined}>{locale === "en" ? "Deep" : "深入"}</button>
+              {/* "快速 / 深入" alone does not tell a new user what changes, so the
+                  group carries a one-line explanation and per-button tooltips. */}
+              <div
+                className="research-mode-switch"
+                role="group"
+                aria-label={locale === "en" ? "Research depth" : "研究深度"}
+                title={locale === "en"
+                  ? "Quick uses the fewest sources for a fast answer. Deep adds cross-checks and a longer timeline."
+                  : "快速：用最少来源尽快回答。深入：补充独立来源与时间线交叉核对，耗时更长。"}
+              >
+                <button type="button" aria-pressed={researchMode === "quick"} onClick={() => setResearchMode("quick")} disabled={busy} title={locale === "en" ? "Fewest sources, fastest answer" : "最少来源，最快回答"}>{locale === "en" ? "Quick" : "快速"}</button>
+                <button type="button" aria-pressed={researchMode === "deep"} onClick={() => setResearchMode("deep")} disabled={busy || !deepResearchAvailable} title={!deepResearchAvailable ? (locale === "en" ? "Unavailable — use Quick research" : "暂不可用，请改用快速研究") : (locale === "en" ? "Cross-checks independent sources; slower" : "交叉核对独立来源，耗时更长")}>{locale === "en" ? "Deep" : "深入"}</button>
               </div>
               <button className="button ghost gpt-topbar-button research-clear" onClick={onClearChat} type="button" disabled={!currentSession}>{t("清空")}</button>
               {busy

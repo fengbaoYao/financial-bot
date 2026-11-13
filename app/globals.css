@@ -625,6 +625,16 @@ button, input, textarea { font: inherit; }
   margin: 0 0 6px;
   font-size: 1rem;
 }
+.gpt-welcome-hints {
+  margin: 12px 0 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.55;
+}
+.gpt-welcome-hints li::marker { color: var(--accent); }
 .memory-panel {
   margin: 0 0 14px;
   padding: 13px 14px;

@@ -2025,6 +2025,10 @@ async def _run_agent_request(
                 tool_results=tool_results,
             )
             if isinstance(deps, AgentDeps):
+                # Local import: the later except-branches import this name too,
+                # which made it a function-local that was unbound on the happy path.
+                from api.agent_pydantic import attach_work_plan_metadata
+
                 attach_work_plan_metadata(response, deps)
             return response
         except asyncio.CancelledError:

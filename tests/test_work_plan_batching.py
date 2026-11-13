@@ -1,0 +1,68 @@
+"""Work plan gating must not serialise independent evidence steps."""
+
+from types import SimpleNamespace
+
+from api.agent_pydantic import work_plan_tools_for_request
+
+
+def _step(kind, tools):
+    return SimpleNamespace(kind=kind, tools=tools, validation=SimpleNamespace(tools=tools), status="pending")
+
+
+def _deps(steps, attempted=()):
+    return SimpleNamespace(
+        plan_before_research=True,
+        bot_prompt=None,
+        research_plan=SimpleNamespace(steps=steps),
+        tool_results=[{"tool": name} for name in attempted],
+    )
+
+
+AVAILABLE = {"search_stocks", "get_financial_statements", "get_valuations",
+             "get_cninfo_announcements", "get_stock_analysis", "get_stock_news"}
+
+
+def test_resolution_is_a_barrier():
+    deps = _deps([
+        _step("resolve", ["search_stocks"]),
+        _step("filings", ["get_financial_statements"]),
+    ])
+    assert work_plan_tools_for_request(deps, AVAILABLE) == {"search_stocks"}
+
+
+def test_independent_steps_are_exposed_together():
+    deps = _deps([
+        _step("resolve", ["search_stocks"]),
+        _step("filings", ["get_financial_statements", "get_cninfo_announcements"]),
+        _step("market", ["get_stock_analysis"]),
+        _step("news", ["get_stock_news"]),
+    ], attempted={"search_stocks"})
+    exposed = work_plan_tools_for_request(deps, AVAILABLE)
+    # One batch, not one step per model round trip.
+    assert exposed == {"get_financial_statements", "get_cninfo_announcements",
+                       "get_stock_analysis", "get_stock_news"}
+
+
+def test_attempted_tools_are_not_offered_again():
+    deps = _deps([
+        _step("resolve", ["search_stocks"]),
+        _step("filings", ["get_financial_statements"]),
+        _step("market", ["get_stock_analysis"]),
+    ], attempted={"search_stocks", "get_financial_statements"})
+    assert work_plan_tools_for_request(deps, AVAILABLE) == {"get_stock_analysis"}
+
+
+def test_unknown_step_kind_keeps_sequential_gating():
+    deps = _deps([
+        _step("resolve", ["search_stocks"]),
+        _step("mystery", ["get_valuations"]),
+        _step("market", ["get_stock_analysis"]),
+    ], attempted={"search_stocks"})
+    # An unrecognised step must not silently gain parallel access.
+    assert work_plan_tools_for_request(deps, AVAILABLE) == {"get_valuations"}
+
+
+def test_bot_conversations_are_not_gated():
+    deps = _deps([_step("resolve", ["search_stocks"])])
+    deps.bot_prompt = "system"
+    assert work_plan_tools_for_request(deps, AVAILABLE) == AVAILABLE

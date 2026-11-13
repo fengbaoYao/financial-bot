@@ -683,6 +683,20 @@
   color: #f3e2d4;
 }
 
+.mausBubbleMd :global(h3),
+.mausBubbleMd :global(h4),
+.mausBubbleMd :global(h5) {
+  margin: 1.1em 0 0.45em;
+  font-weight: 650;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
+}
+.mausBubbleMd :global(h3) { font-size: 1.02em; }
+.mausBubbleMd :global(h4) { font-size: 0.97em; }
+.mausBubbleMd :global(h5) { font-size: 0.93em; color: var(--muted); }
+.mausBubbleMd :global(h3:first-child),
+.mausBubbleMd :global(h4:first-child),
+.mausBubbleMd :global(h5:first-child) { margin-top: 0; }
 .mausBubbleMd :global(p) { margin: 0 0 0.55em; }
 .mausBubbleMd :global(p:last-child) { margin-bottom: 0; }
 .mausBubbleMd :global(ul),

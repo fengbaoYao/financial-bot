@@ -652,7 +652,9 @@ export function WorkspaceShell({ labMode = false }: { labMode?: boolean }) {
             {locale === "en" ? "Enter bot" : "进入使用 bot"} <span aria-hidden="true">→</span>
           </a>
           <button className="workspace-icon-button workspace-panel-toggle" type="button" aria-expanded={rightPanelOpen} aria-controls="research-drawer" onClick={() => { const open = !rightPanelOpen; setRightPanelOpen(open); if (compactViewport) setLeftPanelOpen(false); else updatePreferences({showResearchPanel: open}); }}>
-            <span className="workspace-panel-toggle-label">{rightPanelOpen ? (locale === "en" ? "Hide panel" : "隐藏面板") : (locale === "en" ? "Show panel" : "显示面板")}</span>
+            {/* "Show panel" told the user nothing about what was behind it, so
+                the chart, quote and indicators went undiscovered on phones. */}
+            <span className="workspace-panel-toggle-label">{rightPanelOpen ? (locale === "en" ? "Hide research" : "隐藏研究") : (locale === "en" ? "Chart & data" : "K线与数据")}</span>
           </button>
         </div>
       </header>

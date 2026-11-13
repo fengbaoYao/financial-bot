@@ -1263,6 +1263,21 @@ function renderLightMarkdown(text: string): string {
       continue;
     }
 
+    // Headings: the assistant writes "## 结论" style sections, which used to be
+    // printed verbatim as paragraph text because only lists/tables were parsed.
+    const heading = line.match(/^\s*(#{1,6})\s+(.+?)\s*#*\s*$/);
+    if (heading) {
+      closeLists();
+      // Inside a chat bubble `##` is the common section marker, so 1-2 both map
+      // to the same visual weight rather than pushing `##` down to <h4>.
+      const hashes = heading[1].length;
+      const level = hashes <= 2 ? 3 : Math.min(5, hashes + 1);
+
+      html.push(`<h${level}>${inline(heading[2])}</h${level}>`);
+      i += 1;
+      continue;
+    }
+
     const ul = line.match(/^\s*[-*]\s+(.+)$/);
     if (ul) {
       if (inOl) {
@@ -2792,7 +2807,9 @@ export function MausbotShell() {
   const [routineRuns, setRoutineRuns] = useState<any[]>([]);
   const [config, setConfig] = useState<any>(null);
   const [health, setHealth] = useState<any>(null);
-  const [panelOpen, setPanelOpen] = useState(true);
+  // The rail opens on demand. It used to start open, which cost a quarter of a
+  // 1440px window on a desktop-screen iframe that is usually still black.
+  const [panelOpen, setPanelOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [inboxOnly, setInboxOnly] = useState(false);
   const [dictating, setDictating] = useState(false);
@@ -2836,6 +2853,7 @@ export function MausbotShell() {
   const previewTimerRef = useRef<number | null>(null);
 
   useLayoutEffect(() => {
+    // Narrow windows always start collapsed; wide ones keep the default above.
     if (window.matchMedia("(max-width: 1100px)").matches) setPanelOpen(false);
   }, []);
 

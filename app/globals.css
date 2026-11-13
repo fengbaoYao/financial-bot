@@ -8123,6 +8123,18 @@ html[lang=en] .workspace-v2 .gpt-welcome-card h3 { font-family: Georgia, "Times 
 .stock-quote-header .research-label { font-size: .74rem; }
 .stock-quote-header .research-change { font-size: .98rem; }
 .stock-quote-caption { display: flex; justify-content: flex-start; align-items: center; gap: 12px; margin-top: 10px; color: var(--muted); font-size: .69rem; }
+.stock-closed-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  margin-left: 3px;
+  border-radius: 999px;
+  background: rgba(38, 34, 26, 0.06);
+  color: var(--muted);
+  font-size: .62rem;
+  letter-spacing: .02em;
+  white-space: nowrap;
+}
 .stock-watch-button { display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0; padding: 5px 0 5px 7px; border: 0; background: transparent; color: var(--muted); font-size: .7rem; cursor: pointer; }
 .stock-watch-button span { font-size: 1rem; }
 .stock-watch-button[aria-pressed=true], .stock-watch-button:hover { color: var(--accent); }

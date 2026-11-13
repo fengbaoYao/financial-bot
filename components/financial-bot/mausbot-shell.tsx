@@ -1762,10 +1762,25 @@ function ActivityCapsule({ msgs, zh }: { msgs: ChatMsg[]; zh: boolean }) {
   );
 }
 
-function LiveLine({ text, zh }: { text: string; zh: boolean }) {
+function LiveLine({ text, zh, startedAt }: { text: string; zh: boolean; startedAt?: number | null }) {
   const [open, setOpen] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
   const display = localizeActivityPhrase(text, zh);
   const long = display.length > 96;
+  // A first turn takes tens of seconds. Showing elapsed time (and a rough
+  // expectation) stops the wait from reading as a hang.
+  useEffect(() => {
+    if (!startedAt) return;
+    const tick = () => setElapsed(Math.max(0, Math.round((Date.now() - startedAt) / 1000)));
+    tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => window.clearInterval(timer);
+  }, [startedAt]);
+  const elapsedLabel = startedAt
+    ? elapsed < 20
+      ? (zh ? `${elapsed}s · 通常需要 20–40 秒` : `${elapsed}s · usually 20–40s`)
+      : (zh ? `${elapsed}s · 仍在处理，可继续等待或停止` : `${elapsed}s · still working — wait or stop`)
+    : null;
   return (
     <div className={styles.liveStatus} data-open={open ? "true" : "false"} data-tone="think" role="status" aria-live="polite">
       <span className={styles.livePlane} aria-hidden="true">
@@ -1775,6 +1790,7 @@ function LiveLine({ text, zh }: { text: string; zh: boolean }) {
         </svg>
       </span>
       <span className={styles.liveText}>{display}</span>
+      {elapsedLabel ? <span className={styles.liveElapsed}>{elapsedLabel}</span> : null}
       {long ? (
         <button type="button" className={styles.textButton} aria-expanded={open} onClick={() => setOpen((v) => !v)}>
           {open ? (zh ? "收起" : "Hide") : (zh ? "展开" : "Show")}
@@ -2777,6 +2793,7 @@ export function MausbotShell() {
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [liveStatus, setLiveStatus] = useState<string | null>(null);
+  const [turnStartedAt, setTurnStartedAt] = useState<number | null>(null);
   const [turnEndNotice, setTurnEndNotice] = useState<string | null>(null);
   const [queued, setQueued] = useState<QueuedPrompt[]>([]);
   const [loadingBots, setLoadingBots] = useState(true);
@@ -3395,6 +3412,7 @@ export function MausbotShell() {
         const provisionalId = `stream-${Date.now()}`;
         streamingRef.current = true;
         setStreaming(true);
+        setTurnStartedAt(Date.now());
         setLiveStatus(zh ? "预览输出…" : "Preview…");
         setError(null);
         endNoticeShownRef.current = false;
@@ -3420,6 +3438,7 @@ export function MausbotShell() {
           );
           streamingRef.current = false;
           setStreaming(false);
+          setTurnStartedAt(null);
           setLiveStatus(null);
           showTurnEnd(zh ? "✓ 回合结束" : "✓ Turn ended");
           if (queueRef.current.length) drainQueue();
@@ -3429,6 +3448,7 @@ export function MausbotShell() {
 
       streamingRef.current = true;
       setStreaming(true);
+      setTurnStartedAt(Date.now());
       setLiveStatus(zh ? THINKING_ZH : THINKING_EN);
       setError(null);
       endNoticeShownRef.current = false;
@@ -3836,6 +3856,7 @@ if (kind === "turn") {
             if (ev.threadId && ev.threadId !== threadIdRef.current) setThreadId(String(ev.threadId));
             streamingRef.current = false;
             setStreaming(false);
+            setTurnStartedAt(null);
             setLiveStatus(null);
             liveTurnIdRef.current = null;
             markBotIdle();
@@ -3888,6 +3909,7 @@ if (kind === "turn") {
       } finally {
         streamingRef.current = false;
         setStreaming(false);
+        setTurnStartedAt(null);
         setLiveStatus(null);
         liveTurnIdRef.current = null;
         abortRef.current = null;
@@ -4642,13 +4664,13 @@ if (kind === "turn") {
           </div>
 
           <div className={styles.topActions}>
-            <button type="button" className={styles.topAction} data-active={inboxOnly ? "true" : "false"} title={zh ? "收件箱：只看未读" : "Inbox: unread only"} onClick={() => setInboxOnly((v) => !v)}>
+            <button type="button" className={styles.topAction} data-active={inboxOnly ? "true" : "false"} title={zh ? "收件箱：只看未读" : "Inbox: unread only"} aria-label={zh ? "收件箱：只看未读" : "Inbox: unread only"} aria-pressed={inboxOnly} onClick={() => setInboxOnly((v) => !v)}>
               <span aria-hidden="true">◔</span>
               {unreadCount > 0 ? <span className={styles.topBadge}>{unreadCount}</span> : null}
             </button>
-            <button type="button" className={styles.topAction} title={zh ? "应用设置" : "App settings"} onClick={() => setSettingsOpen(true)}><span aria-hidden="true">⚙</span></button>
-            <button type="button" className={styles.topAction} title={zh ? "搜索机器人和消息" : "Search bots and messages"} onClick={() => searchRef.current?.focus()}><span aria-hidden="true">⌕</span></button>
-            <button type="button" className={styles.topAction} title={zh ? "新建话题" : "New thread"} onClick={() => void onNewThread()} disabled={!botId || streaming}><span aria-hidden="true">＋</span></button>
+            <button type="button" className={styles.topAction} title={zh ? "应用设置" : "App settings"} aria-label={zh ? "应用设置" : "App settings"} onClick={() => setSettingsOpen(true)}><span aria-hidden="true">⚙</span></button>
+            <button type="button" className={styles.topAction} title={zh ? "搜索机器人和消息" : "Search bots and messages"} aria-label={zh ? "搜索机器人和消息" : "Search bots and messages"} onClick={() => searchRef.current?.focus()}><span aria-hidden="true">⌕</span></button>
+            <button type="button" className={styles.topAction} title={zh ? "新建话题" : "New thread"} aria-label={zh ? "新建话题" : "New thread"} onClick={() => void onNewThread()} disabled={!botId || streaming}><span aria-hidden="true">＋</span></button>
           </div>
 
           <label className={styles.search}>
@@ -4838,10 +4860,15 @@ if (kind === "turn") {
             </div>
           </header>
 
+          {/* No aria-live on the transcript: it made every streamed token, tool
+              progress row and "load earlier" button re-announce the whole thread.
+              Turn state is announced by the dedicated status nodes instead. */}
           <div
             ref={transcriptRef}
             className={styles.transcript}
-            aria-live="polite"
+            role="log"
+            aria-live="off"
+            aria-relevant="additions"
             onScroll={(event) => {
               shouldFollowTranscriptRef.current = isTranscriptNearBottom(event.currentTarget);
             }}
@@ -4979,7 +5006,7 @@ if (kind === "turn") {
                         </div>
                       );
                     })}
-                    {liveText ? <LiveLine text={liveText} zh={zh} /> : null}
+                    {liveText ? <LiveLine text={liveText} zh={zh} startedAt={turnStartedAt} /> : null}
                   </>
                 );
               })()}

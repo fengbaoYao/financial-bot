@@ -1325,6 +1325,12 @@ function StockContext({
   const currency = data.market === "us" ? "USD" : data.market === "hk" ? "HKD" : "CNY";
   const series = fullSeries;
   const asOf = String(data.metadata?.data_as_of ?? series.at(-1)?.date ?? (locale === "en" ? "Date unknown" : "日期未知"));
+  const closedReason = marketClosedReason(String(data.metadata?.data_as_of ?? series.at(-1)?.date ?? ""));
+  const closedLabel = closedReason === "weekend"
+    ? (locale === "en" ? "Market closed · weekend" : "休市中 · 周末")
+    : closedReason === "stale"
+      ? (locale === "en" ? "Last session data" : "最近一个交易日数据")
+      : null;
   const quoteProvider = typeof data.metadata?.quote_provider === "string" ? data.metadata.quote_provider : null;
   const chartData = filterChartRange(series, range);
   const rangeCoverage = chartRangeCoverage(chartData, range);
@@ -1392,7 +1398,7 @@ function StockContext({
           <div><span className="research-label">{t("最新价")} · {currency}</span><strong className="research-price">{data.quote.current_price.toFixed(2)}</strong></div>
           <div className={`research-change ${direction}`}>{data.quote.change_pct >= 0 ? "+" : ""}{data.quote.change_pct.toFixed(2)}%</div>
         </div>
-        <div className="stock-quote-caption"><button type="button" className="stock-watch-button" disabled={watchlistBusy} aria-pressed={watched} aria-label={watched ? (locale === "en" ? "Remove from watchlist" : "移出自选股") : (locale === "en" ? "Add to watchlist" : "加入自选股")} onClick={() => { void onToggleWatch(data.stock_code); }}><span aria-hidden="true">{watched ? "★" : "☆"}</span>{watched ? (locale === "en" ? "Watching" : "已关注") : (locale === "en" ? "Watch" : "关注")}</button><span>{quoteProvider ? (locale === "en" ? `Delayed snapshot · ${quoteProvider}` : `延迟快照 · ${quoteProvider}`) : (locale === "en" ? "Delayed daily data" : "延迟日线")} · {asOf}</span></div>
+        <div className="stock-quote-caption"><button type="button" className="stock-watch-button" disabled={watchlistBusy} aria-pressed={watched} aria-label={watched ? (locale === "en" ? "Remove from watchlist" : "移出自选股") : (locale === "en" ? "Add to watchlist" : "加入自选股")} onClick={() => { void onToggleWatch(data.stock_code); }}><span aria-hidden="true">{watched ? "★" : "☆"}</span>{watched ? (locale === "en" ? "Watching" : "已关注") : (locale === "en" ? "Watch" : "关注")}</button><span>{quoteProvider ? (locale === "en" ? `Delayed snapshot · ${quoteProvider}` : `延迟快照 · ${quoteProvider}`) : (locale === "en" ? "Delayed daily data" : "延迟日线")} · {asOf}</span>{closedLabel ? <span className="stock-closed-badge">{closedLabel}</span> : null}</div>
       </div>
       {series.length ? <section className="stock-chart-surface" aria-label={locale === "en" ? "Price chart" : "价格图表"}>
         <div className="stock-chart-toolbar">
@@ -1602,6 +1608,30 @@ function filterChartRange(series: ChartPoint[], range: string) {
  * history, a recently listed symbol, a suspended stock). Showing "1月" over ten
  * days of data silently misstates the evidence, so the caller must say so.
  */
+/**
+ * Whether the quote we have is a closed-session snapshot rather than live.
+ *
+ * The panel only ever shows daily bars, so on a weekend or a holiday the last
+ * bar is the previous session. Saying nothing made the page look stalled.
+ * Holiday tables live on the server; this stays to weekend + stale-date so it
+ * can never claim "closed" for a market that is actually trading.
+ */
+function marketClosedReason(asOf: string | null | undefined): "weekend" | "stale" | null {
+  if (!asOf) return null;
+  const sessionDate = asOf.slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(sessionDate)) return null;
+  const now = new Date();
+  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  if (sessionDate >= today) return null;
+  const weekday = now.getDay();
+  const days = Math.round((Date.parse(`${today}T00:00:00Z`) - Date.parse(`${sessionDate}T00:00:00Z`)) / 86_400_000);
+  // Saturday/Sunday: the market is shut, so the gap is expected, not stale data.
+  if (weekday === 0 || weekday === 6) return "weekend";
+  // On a weekday, only flag a gap that spans more than one session plus a
+  // weekend; a single missing day is normal publishing lag.
+  return days > 3 ? "stale" : null;
+}
+
 function chartRangeCoverage(series: ChartPoint[], range: string) {
   const months = CHART_RANGE_MONTHS[range];
   if (!months || series.length < 2) return null;
